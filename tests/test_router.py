@@ -1,5 +1,6 @@
 """Unit tests for command routing (pure logic, no execution)."""
 
+import dataclasses
 import unittest
 
 from core.app_launcher import APP_LAUNCH_INTENTS, TOOL_LAUNCH_APPLICATION
@@ -329,7 +330,7 @@ class TestCommandRequest(unittest.TestCase):
 
     def test_is_frozen(self):
         command = CommandRequest(CommandKind.EXIT)
-        with self.assertRaises(Exception):
+        with self.assertRaises(dataclasses.FrozenInstanceError):
             command.kind = CommandKind.TOOL
 
     def test_tool_request_carries_name_and_arguments(self):

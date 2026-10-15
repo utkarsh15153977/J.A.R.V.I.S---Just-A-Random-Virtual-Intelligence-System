@@ -89,6 +89,55 @@ startup (`ConfigError` collects every problem in one message):
 | `max_wait_seconds` | 30.0 | give up waiting for speech |
 | `pre_roll_blocks` | 3 | audio kept before speech start |
 
+## Speaker verification (optional)
+
+When enabled, voice-triggered activation is gated by a local speaker
+check. It sits **between** wake-word detection and the command-listening
+session:
+
+```
+wake phrase detected
+    │  (the wake detector keeps ~2 s of the just-fired audio in memory)
+    ▼
+speaker verification: embed the captured audio, cosine-compare to the
+enrolled centroid, accept when score >= threshold
+    │  accepted ──────────────────────► LISTENING (capture the command)
+    │  rejected / unusable / error ────► stay IDLE, wait for another wake
+    ▼
+command still goes through router → guarded ToolExecutor (unchanged)
+```
+
+Speaker verification only decides whether to *listen*. It never
+authorises a command: a match cannot approve a confirmation, pick a
+permission level or mint a ticket. The wake phrase and the speaker check
+are independent of each other and of tool permissions; none substitutes
+for another.
+
+The wake audio is read from the same detection session (no second
+microphone stream) and the buffer is cleared at the start of every
+session, so stale audio is never reused.
+
+All values live in `config.py` (`SpeakerVerificationConfig`, validated the
+same way):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `enabled` | `False` | verification off unless opted in |
+| `model` | `speechbrain-ecapa` | embedding backend identifier |
+| `model_path` | `""` | local model path (default source if empty) |
+| `threshold` | 0.5 | cosine-similarity acceptance (calibrate!) |
+| `sample_rate` | 16000 | audio rate for embedding |
+| `min_sample_seconds` | 0.6 | reject shorter captures |
+| `enrollment_sample_seconds` | 2.0 | clip length per enrolment sample |
+| `enrollment_samples` | 3 | samples requested |
+| `min_enrollment_samples` | 2 | minimum accepted before saving |
+| `min_rms` | 20.0 | reject near-silent samples (int16 scale) |
+| `data_dir` | `""` | enrolment location (per-user default if empty) |
+
+The threshold is a starting point, not a security guarantee: it must be
+calibrated for the chosen embedding model and enrolment. Verification is
+speaker matching, **not** liveness or anti-spoofing.
+
 ## Failure handling
 
 | Condition | Behaviour |
@@ -97,6 +146,11 @@ startup (`ConfigError` collects every problem in one message):
 | Whisper raises | logged with traceback, returns `""` |
 | Empty transcription | logged, returns `""` |
 | Short / noise-only capture | discarded before Whisper, returns `""` |
+| Verification mismatch / unusable / error | activation refused (stays `IDLE`); never bypassed |
+| Verification enabled but no enrolment / model | reported; wake-word activation disabled, manual fallback |
+| Stored enrolment missing | treated as "not enrolled" (manual fallback) |
+| Stored enrolment corrupt / model mismatch | `EnrollmentError`; treated as not enrolled (manual fallback) |
+| Enrolment sample too short / silent | rejected and re-prompted; never stored |
 | Ctrl+C | caught by the entry point, clean shutdown, exit code 0 |
 | Audio buffer overflow | warning logged, recording continues |
 
@@ -117,7 +171,9 @@ python -m unittest discover -s tests -v
 
 Covers threshold calculation and clamping, speech segmenter state
 machine (start/silence/reset/finish), capture acceptance gates, config
-validation, transcript joining, and the manual-test shutdown paths.
+validation, transcript joining, the manual-test shutdown paths, and
+speaker verification / enrolment against fake embedding backends (no
+microphone, no model files, no network).
 
 Manual (hardware):
 

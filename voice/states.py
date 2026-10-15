@@ -105,7 +105,7 @@ class ListeningStateMachine:
             )
         previous = self._state
         self._state = target
-        self._history = self._history + (target,)
+        self._history = (*self._history, target)
         if self._on_change is not None:
             self._on_change(previous, target)
         return target

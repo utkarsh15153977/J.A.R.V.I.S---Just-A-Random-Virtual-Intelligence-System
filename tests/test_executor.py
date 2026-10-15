@@ -292,7 +292,7 @@ class TestExecutorApproval(ExecutorTestCase):
         spec = make_spec(
             permission=PermissionLevel.CONFIRM, handler=make_handler(calls)
         )
-        executor, approvals, runtime, _ = self.build([spec])
+        executor, approvals, _, _ = self.build([spec])
         result = executor.execute("demo", {})
         self.assertIs(result.status, ExecutionStatus.OK)
         self.assertEqual(len(approvals.requests), 1)
@@ -408,7 +408,7 @@ class TestExecutorBlockedIsNonOverridable(ExecutorTestCase):
         approvals = RecordingApprovalProvider(
             result=ApprovalResult(ApprovalOutcome.APPROVED)
         )
-        executor, _, runtime, _ = self.build(
+        executor, _, _, _ = self.build(
             [spec], policy=policy, approvals=approvals
         )
         result = executor.execute("demo", {})

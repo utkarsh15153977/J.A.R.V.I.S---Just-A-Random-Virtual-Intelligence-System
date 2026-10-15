@@ -546,7 +546,6 @@ class TestSubprocessLauncher(unittest.TestCase):
 
         def fake_popen(argv, **kwargs):
             calls.append((argv, kwargs))
-            return None
 
         with patch.object(app_launcher.subprocess, "Popen", fake_popen):
             SubprocessLauncher().launch(CALCULATOR)
@@ -558,7 +557,6 @@ class TestSubprocessLauncher(unittest.TestCase):
 
         def fake_popen(argv, **kwargs):
             calls.append((argv, kwargs))
-            return None
 
         target = AppTarget(
             "notepad",

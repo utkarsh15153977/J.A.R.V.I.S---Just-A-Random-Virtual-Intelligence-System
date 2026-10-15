@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 import sounddevice as sd
 
@@ -171,8 +171,8 @@ def interpret(
 # ----------------------------------------------------------------------
 def measure_phase(config: VoiceConfig, seconds: float) -> List[float]:
     """Read RMS levels for `seconds`, printing one live line per second."""
-    blocks = max(1, int(round(seconds / config.block_duration)))
-    blocks_per_second = max(1, int(round(1.0 / config.block_duration)))
+    blocks = max(1, round(seconds / config.block_duration))
+    blocks_per_second = max(1, round(1.0 / config.block_duration))
     levels: List[float] = []
 
     with sd.InputStream(

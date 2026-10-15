@@ -11,13 +11,13 @@ from unittest.mock import patch
 import numpy as np
 
 from config import VoiceConfig
+from voice import test_voice
 from voice.listener import (
     Listener,
     MicrophoneError,
     ModelLoadError,
     join_segments,
 )
-from voice import test_voice
 
 
 class TestJoinSegments(unittest.TestCase):

@@ -20,12 +20,12 @@ SILENCE = 1.0
 
 
 def make_segmenter(**overrides):
-    params = dict(
-        threshold=THRESHOLD,
-        block_duration=BLOCK,
-        min_speech_seconds=MIN_SPEECH,
-        silence_seconds=SILENCE,
-    )
+    params = {
+        "threshold": THRESHOLD,
+        "block_duration": BLOCK,
+        "min_speech_seconds": MIN_SPEECH,
+        "silence_seconds": SILENCE,
+    }
     params.update(overrides)
     return SpeechSegmenter(**params)
 

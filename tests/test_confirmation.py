@@ -142,6 +142,28 @@ class RaisingProvider:
         raise self._exc
 
 
+class MalformedResultProvider:
+    """Returns something that is not an ApprovalResult at all."""
+
+    def __init__(self):
+        self.requests = []
+
+    def request(self, request):
+        self.requests.append(request)
+        return "yes"
+
+
+class MalformedOutcomeProvider:
+    """Returns a valid ApprovalResult carrying an invalid outcome value."""
+
+    def __init__(self):
+        self.requests = []
+
+    def request(self, request):
+        self.requests.append(request)
+        return ApprovalResult("yes", "ok", request.token)
+
+
 class FakeLogger:
     def __init__(self):
         self.records = []
@@ -384,6 +406,37 @@ class TestConfirmationRegistry(RegistryTestCase):
         registry.revoke_all()
         self.assertEqual(len(registry), 0)
 
+    def test_two_pending_tickets_for_same_action_are_independent(self):
+        registry, _ = self.build()
+        first = registry.issue("demo", "fp", PermissionLevel.CONFIRM)
+        second = registry.issue("demo", "fp", PermissionLevel.CONFIRM)
+        self.assertNotEqual(first.token, second.token)
+        # Revoking one pending ticket leaves the other redeemable.
+        registry.revoke(second.token)
+        self.assertTrue(
+            registry.consume(
+                first.token, tool_name="demo", args_fingerprint="fp"
+            )
+        )
+        self.assertFalse(
+            registry.consume(
+                second.token, tool_name="demo", args_fingerprint="fp"
+            )
+        )
+
+    def test_revoke_ignores_non_string_tokens(self):
+        registry, _ = self.build()
+        ticket = registry.issue("demo", "fp", PermissionLevel.CONFIRM)
+        for token in (None, 123, b"tok-0", ["tok-0"]):
+            with self.subTest(token=repr(token)):
+                registry.revoke(token)
+        # The genuinely pending ticket is untouched.
+        self.assertTrue(
+            registry.consume(
+                ticket.token, tool_name="demo", args_fingerprint="fp"
+            )
+        )
+
     def test_non_positive_ttl_is_rejected(self):
         for ttl in (0.0, -1.0):
             with self.subTest(ttl=ttl):
@@ -616,6 +669,82 @@ class TestExecutorInterruption(unittest.TestCase):
         result = executor.execute("demo", {})
         self.assertIs(result.status, ExecutionStatus.DENIED)
         self.assertEqual(calls, [])
+
+
+class TestApprovalAlwaysRevokesTicket(unittest.TestCase):
+    """No prompt outcome may leave a minted ticket pending.
+
+    Whenever approval does not end in a *consumed* ticket -- denied,
+    unavailable, interrupted, provider error, malformed result/outcome or
+    an unbound token -- the minted ticket must be revoked immediately, so
+    it can never linger until its TTL or be replayed.
+    """
+
+    def build(self, provider):
+        registry = ConfirmationRegistry(nonce_factory=counting_nonce())
+        spec = make_spec(handler=make_handler([]))
+        executor = build_executor(spec, provider, confirmations=registry)
+        return executor, registry
+
+    def test_declined_approval_revokes_ticket(self):
+        executor, registry = self.build(
+            EchoTokenProvider(ApprovalOutcome.DENIED)
+        )
+        self.assertIs(
+            executor.execute("demo", {}).status, ExecutionStatus.DENIED
+        )
+        self.assertEqual(len(registry), 0)
+
+    def test_unavailable_approval_revokes_ticket(self):
+        executor, registry = self.build(
+            EchoTokenProvider(ApprovalOutcome.UNAVAILABLE)
+        )
+        self.assertIs(
+            executor.execute("demo", {}).status, ExecutionStatus.DENIED
+        )
+        self.assertEqual(len(registry), 0)
+
+    def test_interrupted_approval_revokes_ticket(self):
+        executor, registry = self.build(RaisingProvider(KeyboardInterrupt()))
+        self.assertIs(
+            executor.execute("demo", {}).status, ExecutionStatus.DENIED
+        )
+        self.assertEqual(len(registry), 0)
+
+    def test_provider_error_revokes_ticket(self):
+        executor, registry = self.build(RaisingProvider(RuntimeError("boom")))
+        self.assertIs(
+            executor.execute("demo", {}).status, ExecutionStatus.DENIED
+        )
+        self.assertEqual(len(registry), 0)
+
+    def test_malformed_result_revokes_ticket(self):
+        executor, registry = self.build(MalformedResultProvider())
+        self.assertIs(
+            executor.execute("demo", {}).status, ExecutionStatus.DENIED
+        )
+        self.assertEqual(len(registry), 0)
+
+    def test_malformed_outcome_revokes_ticket(self):
+        executor, registry = self.build(MalformedOutcomeProvider())
+        self.assertIs(
+            executor.execute("demo", {}).status, ExecutionStatus.DENIED
+        )
+        self.assertEqual(len(registry), 0)
+
+    def test_unbound_token_revokes_ticket(self):
+        executor, registry = self.build(FixedTokenProvider("bogus"))
+        self.assertIs(
+            executor.execute("demo", {}).status, ExecutionStatus.DENIED
+        )
+        self.assertEqual(len(registry), 0)
+
+    def test_consumed_approval_leaves_nothing_pending(self):
+        executor, registry = self.build(EchoTokenProvider())
+        self.assertIs(
+            executor.execute("demo", {}).status, ExecutionStatus.OK
+        )
+        self.assertEqual(len(registry), 0)
 
 
 # ----------------------------------------------------------------------

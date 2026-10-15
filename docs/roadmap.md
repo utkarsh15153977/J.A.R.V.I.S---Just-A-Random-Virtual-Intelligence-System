@@ -9,12 +9,12 @@ unless it was actually tested.
 | 0 — Project foundation | environment, structure, config, logging | partial (config + logging done in Phase 1) |
 | 1 — Reliable voice input | calibration, detection, recording, Whisper | **complete** |
 | 2 — Text-to-speech | pyttsx3 voice output, fail-soft, text-only fallback | **complete (Batch 3)** |
-| 3 — Wake word | openwakeword "Hey Jarvis", command mode | **in progress — interface + fallback (Batch 4) and deterministic audio-session lifecycle (Batch 5); real engine unavailable (models not installed)** |
+| 3 — Wake word | openwakeword "Hey Jarvis", command mode | **in progress — interface + fallback (Batch 4), deterministic audio-session lifecycle (Batch 5) and optional local speaker verification (Batch 12); real engine unavailable (models not installed)** |
 | 4 — Browser foundation | Playwright controller, search, navigate | pending |
 | 5 — YouTube agent | search/play/pause/seek/volume tools | pending |
 | 6 — AI planner | structured tool calling, no if/else router | pending |
 | 7 — Tool registry | name, schema, permission, executor, verification | **in progress — read-only tools + integration verification (Batches 6–8); first side-effecting tool, allowlisted app launcher (Batch 10)** |
-| 8 — Permission & safety | SAFE / CONFIRM / HIGH RISK enforcement | **in progress — foundation landed (Batch 1); bound, single-use confirmation (Batch 9); confirmed CONFIRM tool + per-action summary (Batch 10)** |
+| 8 — Permission & safety | SAFE / CONFIRM / HIGH RISK enforcement | **in progress — foundation landed (Batch 1); bound, single-use confirmation (Batch 9); confirmed CONFIRM tool + per-action summary (Batch 10); speaker verification kept separate from permissions (Batch 12)** |
 | 9 — PC / filesystem agent | safe search and open of local files | pending |
 | 10 — Document agent | read/search/edit TXT, MD, DOCX, PDF | pending |
 | 11 — Email agent | search/read/draft/reply/send with confirmation | pending |
@@ -283,3 +283,79 @@ sourced from speech. Added 51 tests (launcher module, executor
 approval-binding for the new tool, router fixed arguments, config, and
 composition-root integration), all using a fake process launcher. See
 section P of [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 11 note (automated security, reliability and quality audit)
+
+Batch 11 is an audit-and-tooling pass — it adds no user-facing feature
+and weakens no existing control. It re-read the permission, confirmation,
+executor, router, app-launcher and app-lifecycle code paths, hardened one
+confirmation edge case, and added the project's first automated quality
+gates.
+
+- **Confirmation hardening (`core/executor.py`).** Every non-consuming
+  approval outcome now revokes the minted ticket. Previously a malformed
+  `ApprovalResult`, an invalid outcome value or an approval whose token
+  was not bound to the action returned `DENIED` but left the ticket
+  pending until its TTL or shutdown; it is now revoked immediately. This
+  is defence-in-depth — all those paths already failed closed.
+- **Regression tests (`tests/test_confirmation.py`).** +10 tests: each
+  non-consuming outcome (denied, unavailable, interrupted, provider
+  error, malformed result/outcome, unbound token) leaves no pending
+  ticket; a consumed approval leaves none either; two pending tickets for
+  the same action are independent; and `revoke` ignores non-string tokens.
+- **Lint + CI (PROC-001 resolved).** `pyproject.toml` configures Ruff
+  with a curated, non-reformatting rule set; `requirements-dev.txt` adds
+  Ruff as a development-only dependency; `.github/workflows/ci.yml` runs
+  `compileall`, `ruff check`, `unittest` and `pip check` on Python 3.12.
+  The genuine findings Ruff surfaced were fixed (unused imports, redundant
+  `int()` around `round()`, redundant `return None`, un-sorted imports,
+  un-used unpacked variables, a blind-`Exception` assertion, and two
+  simplifications) — no behaviour changed.
+
+See section Q of [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 12 note (local speaker verification)
+
+Batch 12 adds optional, local speaker verification so that a detected
+wake phrase only opens a command session when the speaker matches a
+voice the user has **explicitly enrolled**. It is off by default and
+never becomes an authority of its own.
+
+- **New `voice/speaker_verification.py`.** An `EmbeddingModel` interface
+  and a `SpeakerVerifier` gate. `verify` accepts only when the cosine
+  score is `>= threshold` and **never raises** — it returns a structured
+  reason (`match`/`below_threshold`/`unusable_audio`/`model_error`/
+  `incomparable`/`closed`), so a backend fault cannot skip the check.
+  `build_embedding_model` selects the backend (lazily).
+- **New `voice/enrollment.py`.** `EnrollmentStore` (atomic, owner-only
+  `speaker_enrollment.npz` holding only the centroid vector plus
+  metadata — never raw audio), a `microphone_capture` helper, and
+  `enroll_speaker` (confirm-before-overwrite, retries, rejects unusable
+  samples, aborts on backend error, enforces the minimum-sample gate).
+- **New `voice/speaker_backend.py`.** Optional SpeechBrain ECAPA adapter
+  (CPU, weights downloaded once on first use, never at startup). **Not a
+  core dependency**; if it or torch is missing the app falls back to
+  manual activation, honestly.
+- **`voice/wakeword.py`.** The detector keeps a rolling ~2 s buffer of
+  the just-fired wake audio and exposes it as `trigger_audio`, cleared on
+  `start()`/`close()`. Verification embeds this same-session audio, so no
+  second microphone stream is opened.
+- **`config.py`.** `SpeakerVerificationConfig(enabled=False, …)` with a
+  validated `threshold`, sample lengths, RMS floor and data directory.
+- **`app.py`.** New flags `--verify-speaker`, `--enroll-speaker`,
+  `--reset-speaker`, `--speaker-status`. Verification gates
+  `IDLE → LISTENING` only; a rejected/no-match activation keeps the loop
+  in `IDLE`. Enabled-but-unavailable (no backend or no enrolment) prints
+  a clear notice, disables wake-word activation and falls back to manual.
+  The verifier is closed on every exit path.
+
+Separation is preserved: wake word, speaker verification and the
+permission/confirmation gate are independent, and a speaker match cannot
+approve a command or mint a ticket. Speaker verification is **not**
+liveness/anti-spoofing — a recording of the enrolled voice could match —
+and the threshold is not a security guarantee. Real embeddings and
+matching have not been verified here (the backend is not installed).
+Added 80 tests across `tests/test_speaker_verification.py`,
+`tests/test_enrollment.py`, `tests/test_speaker_backend.py`,
+`tests/test_wakeword.py`, `tests/test_app.py` and `tests/test_config.py`.
+See section R of [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).

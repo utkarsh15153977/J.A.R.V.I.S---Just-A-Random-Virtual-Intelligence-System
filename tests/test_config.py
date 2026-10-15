@@ -2,7 +2,13 @@
 
 import unittest
 
-from config import AppsConfig, ConfigError, VoiceConfig, WakeConfig
+from config import (
+    AppsConfig,
+    ConfigError,
+    SpeakerVerificationConfig,
+    VoiceConfig,
+    WakeConfig,
+)
 
 
 class TestVoiceConfigDefaults(unittest.TestCase):
@@ -135,6 +141,54 @@ class TestAppsConfig(unittest.TestCase):
     def test_duplicate_allowed_rejected(self):
         with self.assertRaises(ConfigError):
             AppsConfig(allowed=("notepad", "notepad")).validate()
+
+
+class TestSpeakerVerificationConfig(unittest.TestCase):
+    def test_defaults_are_valid(self):
+        config = SpeakerVerificationConfig()
+        self.assertIs(config.validate(), config)
+
+    def test_disabled_by_default(self):
+        self.assertFalse(SpeakerVerificationConfig().enabled)
+
+    def assert_invalid(self, **overrides):
+        config = SpeakerVerificationConfig(**overrides)
+        with self.assertRaises(ConfigError):
+            config.validate()
+
+    def test_zero_threshold_rejected(self):
+        self.assert_invalid(threshold=0.0)
+
+    def test_threshold_above_one_rejected(self):
+        self.assert_invalid(threshold=1.5)
+
+    def test_empty_model_rejected(self):
+        self.assert_invalid(model="")
+
+    def test_zero_sample_rate_rejected(self):
+        self.assert_invalid(sample_rate=0)
+
+    def test_negative_min_sample_rejected(self):
+        self.assert_invalid(min_sample_seconds=-1.0)
+
+    def test_enrolment_shorter_than_minimum_rejected(self):
+        self.assert_invalid(
+            min_sample_seconds=2.0, enrollment_sample_seconds=1.0
+        )
+
+    def test_enrolment_samples_below_one_rejected(self):
+        self.assert_invalid(enrollment_samples=0)
+
+    def test_min_enrolment_samples_above_target_rejected(self):
+        self.assert_invalid(
+            enrollment_samples=2, min_enrollment_samples=3
+        )
+
+    def test_negative_min_rms_rejected(self):
+        self.assert_invalid(min_rms=-1.0)
+
+    def test_non_string_data_dir_rejected(self):
+        self.assert_invalid(data_dir=123)
 
 
 if __name__ == "__main__":

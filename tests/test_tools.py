@@ -20,13 +20,13 @@ def passthrough_validate(raw):
 
 
 def make_spec(name="demo", permission=PermissionLevel.SAFE, **overrides):
-    params = dict(
-        name=name,
-        description="demo tool",
-        permission=permission,
-        validate=passthrough_validate,
-        handler=noop_handler,
-    )
+    params = {
+        "name": name,
+        "description": "demo tool",
+        "permission": permission,
+        "validate": passthrough_validate,
+        "handler": noop_handler,
+    }
     params.update(overrides)
     return ToolSpec(**params)
 

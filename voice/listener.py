@@ -115,7 +115,7 @@ class Listener:
         """Measure ambient noise and derive the speech threshold."""
         cfg = self.config
         blocks_needed = max(
-            1, int(round(cfg.calibration_seconds / cfg.block_duration))
+            1, round(cfg.calibration_seconds / cfg.block_duration)
         )
         logger.info(
             "Calibrating microphone noise floor for %.1f s...", cfg.calibration_seconds

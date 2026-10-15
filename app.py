@@ -34,8 +34,17 @@ authorises an action. Every command still passes through the router and
 ``ToolExecutor.execute``. Wake-word mode is off by default and falls back
 to manual activation when no real engine is available.
 
+Speaker verification (``--verify-speaker``) is an optional extra gate on
+voice-triggered activation: when enabled, the captured voice must match an
+explicitly enrolled speaker (``--enroll-speaker``) before a command
+session starts. It also never authorises an action; a match only allows
+listening, and every command still passes through the router and the
+guarded executor. It is off by default, and manual activation remains
+available when it is disabled or unavailable.
+
 Privacy: transcripts are not logged unless ``--log-transcripts`` is
-given. Raw audio and handler return values are never logged.
+given. Raw audio and handler return values are never logged. Enrolment
+stores only a centroid embedding, never the raw recordings.
 """
 
 from __future__ import annotations
@@ -50,6 +59,7 @@ from typing import Any, Callable, List, Optional
 from config import (
     AppsConfig,
     ConfigError,
+    SpeakerVerificationConfig,
     SpeechConfig,
     ToolsConfig,
     VoiceConfig,
@@ -76,8 +86,19 @@ from core.router import (
     ToolCommandRouter,
 )
 from core.tools import ToolRegistry
+from voice.enrollment import (
+    EnrollmentError,
+    EnrollmentStore,
+    enroll_speaker,
+    microphone_capture,
+)
 from voice.listener import Listener, MicrophoneError, ModelLoadError
 from voice.speaker import Speaker, SpeechError
+from voice.speaker_verification import (
+    SpeakerVerificationError,
+    SpeakerVerifier,
+    build_embedding_model,
+)
 from voice.states import ListeningState, ListeningStateMachine
 from voice.wakeword import OpenWakeWordDetector, WakeWordUnavailableError
 
@@ -95,6 +116,16 @@ _USAGE = (
     "  --wake-word         Wait for the wake phrase before listening.\n"
     "                      OFF by default; falls back to manual activation\n"
     "                      if no wake-word engine is available.\n"
+    "  --verify-speaker    Accept a voice-triggered activation only when\n"
+    "                      the captured voice matches an enrolled speaker.\n"
+    "                      OFF by default. Requires --wake-word and a prior\n"
+    "                      --enroll-speaker; falls back to manual activation\n"
+    "                      if verification cannot start.\n"
+    "  --enroll-speaker    Record several samples and store your voice for\n"
+    "                      speaker verification, then exit. Deliberate and\n"
+    "                      never automatic; asks before replacing one.\n"
+    "  --reset-speaker     Delete the stored voice enrolment, then exit.\n"
+    "  --speaker-status    Print the stored enrolment status, then exit.\n"
     "  --tools             Enable the built-in read-only tools (for example\n"
     "                      the time, the date, system status, disk space or\n"
     "                      battery status).\n"
@@ -114,6 +145,10 @@ _USAGE = (
 @dataclass(frozen=True)
 class _Options:
     wake_word: bool = False
+    verify_speaker: bool = False
+    enroll_speaker: bool = False
+    reset_speaker: bool = False
+    speaker_status: bool = False
     tools: bool = False
     allow_apps: bool = False
     log_transcripts: bool = False
@@ -124,6 +159,10 @@ class _Options:
 def _parse_args(argv: List[str]) -> _Options:
     return _Options(
         wake_word="--wake-word" in argv,
+        verify_speaker="--verify-speaker" in argv,
+        enroll_speaker="--enroll-speaker" in argv,
+        reset_speaker="--reset-speaker" in argv,
+        speaker_status="--speaker-status" in argv,
         tools="--tools" in argv,
         allow_apps="--allow-apps" in argv,
         log_transcripts="--log-transcripts" in argv,
@@ -286,19 +325,28 @@ def _release_session(detector: Any) -> None:
 def _activate(
     machine: ListeningStateMachine,
     detector: Any,
-) -> None:
-    """Move IDLE -> LISTENING once the wake word (or manual mode) fires.
+    verifier: Any,
+    output: Callable[[str], None],
+) -> bool:
+    """Move IDLE -> LISTENING once activation is accepted.
 
     With no detector this is manual activation: we listen immediately,
     preserving the original always-listening behaviour. With a detector we
     stay in IDLE until it reports the wake phrase, then hand the micro-
-    phone back to the listener before capturing the command. The session
-    is released on every path (including failure and Ctrl+C) so the mic is
-    never held while Jarvis processes or speaks.
+    phone back to the listener before capturing the command.
+
+    When a verifier is present, the captured wake-phrase audio is checked
+    before the command-listening session starts; a non-match (including
+    missing, malformed or failed verification) rejects activation and
+    returns False so the caller can wait for another attempt. The session
+    is released on every path (including failure and Ctrl+C).
+
+    Returns True when the machine moved to LISTENING, False when the
+    attempt was rejected before listening.
     """
     if detector is None:
         machine.to(ListeningState.LISTENING)
-        return
+        return True
     start = getattr(detector, "start", None)
     if callable(start):
         start()
@@ -308,7 +356,23 @@ def _activate(
             pass
     finally:
         _release_session(detector)
+
+    if verifier is not None:
+        audio = getattr(detector, "trigger_audio", None)
+        result = verifier.verify(audio)
+        if not result.accepted:
+            logger.info(
+                "Speaker verification rejected an activation (%s).",
+                result.reason,
+            )
+            output(
+                "Voice did not match the enrolled speaker; "
+                "not starting a command."
+            )
+            return False
+
     machine.to(ListeningState.LISTENING)
+    return True
 
 
 def _run_loop(
@@ -319,14 +383,19 @@ def _run_loop(
     speaker: Any,
     machine: ListeningStateMachine,
     detector: Any,
+    verifier: Any,
 ) -> int:
     while True:
         try:
-            _activate(machine, detector)
+            activated = _activate(machine, detector, verifier, output)
         except (WakeWordUnavailableError, MicrophoneError) as exc:
             output(f"Wake-word detection failed: {exc}")
             machine.close()
             return EXIT_RUNTIME_ERROR
+
+        if not activated:
+            # Verification rejected this capture; wait for another one.
+            continue
 
         try:
             text = listener.transcribe()
@@ -438,30 +507,180 @@ def _build_wake_detector(
     return detector
 
 
+def _build_speaker_verifier(
+    config: SpeakerVerificationConfig,
+    model_factory: Callable[[SpeakerVerificationConfig], Any],
+    store: EnrollmentStore,
+    output: Callable[[str], None],
+) -> Any:
+    """Return a ready speaker verifier, or None if it cannot start.
+
+    Returning None is never a silent bypass: the caller must then disable
+    voice-triggered activation. Missing enrolment, an unavailable model
+    and unreadable stored data are all reported explicitly.
+    """
+    try:
+        model = model_factory(config)
+    except SpeakerVerificationError as exc:
+        output(f"Speaker verification is unavailable ({exc}).")
+        return None
+    except Exception:
+        output("Speaker verification could not start.")
+        return None
+    if model is None:
+        output("Speaker verification is unavailable.")
+        return None
+
+    try:
+        enrollment = store.load(expected_model_id=model.model_id)
+    except EnrollmentError as exc:
+        output(f"Could not read the stored voice enrolment ({exc}).")
+        _close_resource(model)
+        return None
+    if enrollment is None:
+        output(
+            "Speaker verification is enabled but no voice is enrolled; "
+            "run --enroll-speaker first."
+        )
+        _close_resource(model)
+        return None
+
+    return SpeakerVerifier(
+        model,
+        enrollment,
+        threshold=config.threshold,
+        sample_rate=config.sample_rate,
+        min_sample_seconds=config.min_sample_seconds,
+        min_rms=config.min_rms,
+    )
+
+
+def _speaker_status(
+    config: SpeakerVerificationConfig,
+    store: EnrollmentStore,
+    output: Callable[[str], None],
+) -> int:
+    output(f"Enrolment file: {store.path}")
+    try:
+        enrollment = store.load()
+    except EnrollmentError as exc:
+        output(f"Stored enrolment is unreadable: {exc}")
+        return EXIT_RUNTIME_ERROR
+    if enrollment is None:
+        output("No voice is enrolled.")
+        return EXIT_OK
+    output(
+        f"Enrolled voice: {enrollment.sample_count} sample(s), "
+        f"model {enrollment.model_id}."
+    )
+    output(f"Verification threshold: {config.threshold}.")
+    return EXIT_OK
+
+
+def _speaker_reset(
+    store: EnrollmentStore,
+    output: Callable[[str], None],
+) -> int:
+    try:
+        removed = store.clear()
+    except EnrollmentError as exc:
+        output(f"Could not reset the enrolment: {exc}")
+        return EXIT_RUNTIME_ERROR
+    output("Enrolment removed." if removed else "No enrolment to remove.")
+    return EXIT_OK
+
+
+def _speaker_enroll(
+    config: SpeakerVerificationConfig,
+    model_factory: Callable[[SpeakerVerificationConfig], Any],
+    store: EnrollmentStore,
+    output: Callable[[str], None],
+    input_fn: Callable[[str], str],
+    capture: Optional[Callable[[SpeakerVerificationConfig, float], Any]],
+) -> int:
+    try:
+        model = model_factory(config)
+    except SpeakerVerificationError as exc:
+        output(f"Speaker verification is unavailable ({exc}).")
+        return EXIT_RUNTIME_ERROR
+    except Exception:
+        output("Speaker verification could not start.")
+        return EXIT_RUNTIME_ERROR
+
+    def confirm(prompt: str) -> bool:
+        try:
+            answer = input_fn(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return answer.strip().lower() in ("y", "yes")
+
+    recorder = capture or microphone_capture
+    try:
+        saved = enroll_speaker(
+            config,
+            model,
+            store,
+            capture=lambda seconds: recorder(config, seconds),
+            confirm=confirm,
+            output=output,
+        )
+    finally:
+        _close_resource(model)
+    return EXIT_OK if saved else EXIT_RUNTIME_ERROR
+
+
+def _handle_speaker_command(
+    options: _Options,
+    config: SpeakerVerificationConfig,
+    output: Callable[[str], None],
+    input_fn: Callable[[str], str],
+    model_factory: Callable[[SpeakerVerificationConfig], Any],
+    capture: Optional[Callable[[SpeakerVerificationConfig, float], Any]],
+) -> int:
+    store = EnrollmentStore(config)
+    if options.speaker_status:
+        return _speaker_status(config, store, output)
+    if options.reset_speaker:
+        return _speaker_reset(store, output)
+    return _speaker_enroll(
+        config, model_factory, store, output, input_fn, capture
+    )
+
+
 def main(
     argv: Optional[List[str]] = None,
     *,
     listener_factory: Callable[[VoiceConfig], Any] = Listener,
     speaker_factory: Callable[[SpeechConfig], Any] = Speaker,
     wake_word_factory: Callable[[WakeConfig], Any] = OpenWakeWordDetector,
+    embedding_model_factory: Callable[
+        [SpeakerVerificationConfig], Any
+    ] = build_embedding_model,
     router: Optional[Router] = None,
     executor: Optional[ToolExecutor] = None,
     config: Optional[VoiceConfig] = None,
     speech_config: Optional[SpeechConfig] = None,
     wake_config: Optional[WakeConfig] = None,
+    speaker_verification_config: Optional[SpeakerVerificationConfig] = None,
     tools_config: Optional[ToolsConfig] = None,
     apps_config: Optional[AppsConfig] = None,
     app_launcher: Optional[ProcessLauncher] = None,
     app_allowlist: Optional[AppAllowlist] = None,
+    enrollment_store: Optional[EnrollmentStore] = None,
+    enrollment_capture: Optional[
+        Callable[[SpeakerVerificationConfig, float], Any]
+    ] = None,
     clock: Optional[Callable[[], datetime]] = None,
     state_machine: Optional[ListeningStateMachine] = None,
+    input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
 ) -> int:
     """Run Jarvis. Returns a process exit code.
 
     Dependencies are injected so tests can replace the microphone,
-    Whisper model, router, executor, speaker engine and wake-word engine
-    with fakes, and can inspect the listening state machine.
+    Whisper model, router, executor, speaker engine, wake-word engine and
+    speaker verifier with fakes, and can inspect the listening state
+    machine.
     """
     argv = list(sys.argv[1:]) if argv is None else list(argv)
     options = _parse_args(argv)
@@ -492,6 +711,15 @@ def main(
             active_wake = replace(active_wake, enabled=True)
         active_wake.validate()
 
+        active_speaker = (
+            speaker_verification_config
+            if speaker_verification_config is not None
+            else SpeakerVerificationConfig()
+        )
+        if options.verify_speaker:
+            active_speaker = replace(active_speaker, enabled=True)
+        active_speaker.validate()
+
         active_tools = (
             tools_config if tools_config is not None else ToolsConfig()
         )
@@ -508,6 +736,25 @@ def main(
     except ConfigError as exc:
         output(f"Invalid configuration: {exc}")
         return EXIT_CONFIG_ERROR
+
+    # One-shot speaker administration never starts the listening loop.
+    if options.enroll_speaker or options.reset_speaker or (
+        options.speaker_status
+    ):
+        return _handle_speaker_command(
+            options,
+            active_speaker,
+            output,
+            input_fn,
+            embedding_model_factory,
+            enrollment_capture,
+        )
+
+    if options.verify_speaker and not active_wake.enabled:
+        output(
+            "Speaker verification only affects voice-triggered activation; "
+            "enable --wake-word for it to have any effect."
+        )
 
     if options.allow_apps and not active_tools.enabled:
         output(
@@ -542,6 +789,7 @@ def main(
 
     listener = None
     detector = None
+    verifier = None
     try:
         _respond(_startup_message(active_config), output, speaker)
         detector = _build_wake_detector(
@@ -552,6 +800,28 @@ def main(
                 "Wake-word mode is ON. Say "
                 f"'{active_wake.phrase}' to start a command."
             )
+
+        if active_speaker.enabled:
+            store = enrollment_store or EnrollmentStore(active_speaker)
+            verifier = _build_speaker_verifier(
+                active_speaker, embedding_model_factory, store, output
+            )
+            if verifier is not None:
+                output(
+                    "Speaker verification is ON: only the enrolled voice "
+                    "can start a voice-triggered command."
+                )
+            elif detector is not None:
+                # Enabled but unusable: refuse voice-triggered activation
+                # rather than silently skipping verification. Manual
+                # activation remains available.
+                output(
+                    "Voice verification could not start; wake-word "
+                    "activation is disabled. Using manual activation "
+                    "instead."
+                )
+                _close_resource(detector)
+                detector = None
 
         if active_tools.enabled:
             output(
@@ -581,7 +851,14 @@ def main(
             return EXIT_RUNTIME_ERROR
 
         return _run_loop(
-            listener, router, executor, output, speaker, machine, detector
+            listener,
+            router,
+            executor,
+            output,
+            speaker,
+            machine,
+            detector,
+            verifier,
         )
     except KeyboardInterrupt:
         output("\nInterrupted. Shutting down.")
@@ -589,6 +866,7 @@ def main(
     finally:
         machine.close()
         _close_resource(detector)
+        _close_resource(verifier)
         _close_resource(listener)
         _close_resource(speaker)
         # Revokes any pending approval confirmation and refuses further

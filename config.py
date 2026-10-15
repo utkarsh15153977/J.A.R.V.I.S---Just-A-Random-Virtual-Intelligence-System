@@ -145,6 +145,92 @@ class WakeConfig:
 
 
 @dataclass(frozen=True)
+class SpeakerVerificationConfig:
+    """Settings for local speaker verification of voice activation.
+
+    Verification is **off by default**. When it is enabled, a
+    voice-triggered activation is accepted only if the captured speaker
+    matches the explicitly enrolled voice. It never authorises an action:
+    every command still goes through the router and the guarded executor.
+    """
+
+    enabled: bool = False
+
+    # Embedding backend identifier. The default uses SpeechBrain's
+    # ECAPA-TDNN speaker-embedding model; it is loaded lazily and
+    # locally, never downloaded at startup. Other backends can be
+    # plugged in by injecting a model factory.
+    model: str = "speechbrain-ecapa"
+
+    # Optional local model source/path for the embedding backend. Empty
+    # means the backend's own default pretrained model.
+    model_path: str = ""
+
+    # Cosine-similarity acceptance threshold in (0.0, 1.0]. This is a
+    # starting point only: the right value depends on the embedding
+    # model and the enrolled samples and must be calibrated. It is not a
+    # security guarantee and authorises nothing by itself.
+    threshold: float = 0.5
+
+    # Audio used for one verification / enrolment sample. The minimum
+    # usable length is deliberately small because a wake phrase is short;
+    # enrolment captures longer clips (see enrollment_sample_seconds).
+    sample_rate: int = 16000
+    min_sample_seconds: float = 0.6
+    enrollment_sample_seconds: float = 2.0
+
+    # Enrolment target and the minimum number of accepted samples.
+    enrollment_samples: int = 3
+    min_enrollment_samples: int = 2
+
+    # Reject samples whose RMS (on the int16 scale) is below this floor,
+    # so dead-silence or muted captures are never enrolled.
+    min_rms: float = 20.0
+
+    # Directory for the stored enrolment. Empty means a per-user default
+    # location; the file is written with owner-only permissions where the
+    # platform supports it.
+    data_dir: str = ""
+
+    def validate(self) -> "SpeakerVerificationConfig":
+        """Check every value and return self, or raise ConfigError."""
+        problems = []
+
+        if not isinstance(self.enabled, bool):
+            problems.append("enabled must be a boolean")
+        if not self.model or not self.model.strip():
+            problems.append("model cannot be empty")
+        if not 0.0 < self.threshold <= 1.0:
+            problems.append("threshold must be between 0.0 (exclusive) and 1.0")
+        if self.sample_rate <= 0:
+            problems.append("sample_rate must be positive")
+        if self.min_sample_seconds <= 0:
+            problems.append("min_sample_seconds must be positive")
+        if self.enrollment_sample_seconds < self.min_sample_seconds:
+            problems.append(
+                "enrollment_sample_seconds must be >= min_sample_seconds"
+            )
+        if self.enrollment_samples < 1:
+            problems.append("enrollment_samples must be at least 1")
+        if not 1 <= self.min_enrollment_samples <= self.enrollment_samples:
+            problems.append(
+                "min_enrollment_samples must be between 1 and "
+                "enrollment_samples"
+            )
+        if self.min_rms < 0:
+            problems.append("min_rms cannot be negative")
+        if not isinstance(self.model_path, str):
+            problems.append("model_path must be a string")
+        if not isinstance(self.data_dir, str):
+            problems.append("data_dir must be a string")
+
+        if problems:
+            raise ConfigError("; ".join(problems))
+
+        return self
+
+
+@dataclass(frozen=True)
 class ToolsConfig:
     """Settings for the built-in read-only tools.
 

@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from core.permissions import (
     ApprovalOutcome,
     ApprovalRequest,
-    ApprovalResult,
     ConsoleApprovalProvider,
     PathBoundaryRule,
     PermissionLevel,
@@ -158,12 +157,12 @@ class TestPathBoundaryRule(unittest.TestCase):
         self._other.cleanup()
 
     def make_rule(self, **overrides):
-        params = dict(
-            tool_names=["open_file"],
-            arg_keys=["path"],
-            allowed_roots=[str(self.base)],
-            forbidden_roots=[str(self.forbidden)],
-        )
+        params = {
+            "tool_names": ["open_file"],
+            "arg_keys": ["path"],
+            "allowed_roots": [str(self.base)],
+            "forbidden_roots": [str(self.forbidden)],
+        }
         params.update(overrides)
         return PathBoundaryRule(**params)
 

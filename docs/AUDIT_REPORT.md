@@ -280,6 +280,10 @@ the present code.
 - **Recommended fix:** Add `pyproject.toml` configuring Ruff (lint +
   format) and mypy, plus a GitHub Actions workflow running
   `compileall`, `unittest`, Ruff, mypy, and `bandit`.
+- **Resolved (Batch 11):** `pyproject.toml` configures Ruff (lint only —
+  no auto-format), and `.github/workflows/ci.yml` runs `compileall`,
+  `ruff check`, `unittest` and `pip check` on Python 3.12. mypy and
+  Bandit were **not** added (see section Q).
 
 ### ARCH-002 — Empty placeholder modules (Low)
 
@@ -907,3 +911,181 @@ ever taken from speech or arbitrary configuration.
 **Not performed:** launching a real application (tests use a fake
 launcher; only argv construction and `shell=False` are asserted).
 Ruff/mypy/Bandit were **not run** (not installed). No commit was made.
+
+---
+
+## Q. Batch 11 addendum — automated security, reliability and quality audit
+
+Batch 11 adds **no user-facing feature and weakens no control**. It
+re-audits the security-critical paths (confirmation, launching,
+execution/routing, lifecycle/logging), hardens one confirmation edge
+case, and lands the project's first automated quality gates (Ruff + CI).
+
+### Q.1 Findings
+
+| ID | Severity | Area | Finding | Action |
+|---|---|---|---|---|
+| CONF-002 | Low (defence-in-depth) | `core/executor.py` | A malformed `ApprovalResult`, an invalid `outcome` value, or an approval whose token was not bound to the action returned `DENIED` but left the freshly-minted confirmation ticket pending until its TTL or shutdown. | **Fixed** — every non-consuming path now revokes the minted ticket. It failed closed before and after; this only removes a lingering, unusable ticket. |
+| PROC-001 | Low | tooling | No lint config or CI existed. | **Resolved** — `pyproject.toml` (Ruff), `requirements-dev.txt`, `.github/workflows/ci.yml`. |
+
+Ruff 0.17.1 was installed as a **development-only** dependency. Note
+that Ruff 0.17's *default* rule set is broad: with no config the tree
+reports 177 findings. The curated `[tool.ruff.lint]` selection plus the
+fixes below bring it to **zero** without a mass reformat.
+
+Genuine findings fixed:
+
+- `core/executor.py` — revoke the minted ticket on malformed/unbound
+  approval (CONF-002).
+- `voice/diagnostics.py`, `voice/listener.py` — redundant `int()` around
+  `round()` (which already returns `int`).
+- `voice/diagnostics.py` — unused `Optional` import.
+- `core/log.py` — one over-length line wrapped.
+- `core/app_launcher.py` — `os.environ.get("SYSTEMROOT")` (Ruff SIM112);
+  Windows env lookup is case-insensitive, so behaviour is unchanged
+  (verified on the host).
+- `voice/states.py` — tuple built via unpacking instead of concatenation
+  (equivalent for tuples).
+- Tests — unused imports/variables, `dict()` → literal, explicit
+  `return None`, un-sorted imports, and a blind `assertRaises(Exception)`
+  narrowed to `dataclasses.FrozenInstanceError`.
+
+Deliberately **not** changed (churn or against intent):
+
+- `UP` (pyupgrade) annotation modernisation — 126 findings would rewrite
+  the project's `Optional[...]`/`typing.List` style across many reviewed
+  files.
+- `BLE001` (blind `except Exception`) — 19 sites; catching broadly to stay
+  alive and log is a deliberate choice for a voice assistant.
+- `SIM102`/`SIM103`/`SIM117` — ignored with documented reasons in
+  `pyproject.toml` (guard-clause clarity, test readability).
+- `ruff format` — available but **not** enforced (29 files would reformat;
+  out of scope).
+
+Audit confirmations (no change needed):
+
+- Every tool call still flows through `ToolExecutor.execute`; the router
+  only produces inert requests and cannot authorise anything; wake-word
+  activation carries no authority (assertions exist).
+- The launcher still resolves executables only from the trusted
+  `%SystemRoot%\System32` catalog, passes an argv list with
+  `shell=False`, and is doubly opt-in with an empty default allowlist.
+- Transcript/audio logging remains off by default; failures still fall
+  back to text (unchanged).
+
+### Q.2 Files changed
+
+| File | Change |
+|---|---|
+| `pyproject.toml` | **New** — Ruff config (curated `select`, documented `ignore`). |
+| `requirements-dev.txt` | **New** — `-r requirements.txt` + `ruff==0.17.1`. |
+| `.github/workflows/ci.yml` | **New** — compile, lint, test, `pip check` on Python 3.12. |
+| `core/executor.py` | Revoke the minted ticket on malformed result/outcome and unbound approval; docstring updated. |
+| `core/log.py` | Wrapped one over-length warning. |
+| `core/app_launcher.py` | `SystemRoot` → `SYSTEMROOT` (SIM112). |
+| `voice/diagnostics.py` | Removed unused `Optional` import; dropped redundant `int()`. |
+| `voice/listener.py` | Dropped redundant `int()`. |
+| `voice/states.py` | Tuple via unpacking (RUF005). |
+| `tests/test_confirmation.py` | +10 regression tests and two malformed-provider fakes. |
+| `tests/test_app_launcher.py`, `tests/test_permissions.py`, `tests/test_tools.py`, `tests/test_detection.py`, `tests/test_executor.py`, `tests/test_app.py`, `tests/test_listener.py`, `tests/test_router.py` | Lint fixes only. |
+| `README.md`, `docs/safety.md`, `docs/roadmap.md`, `docs/AUDIT_REPORT.md` | Documentation. |
+
+### Q.3 Batch 11 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py tests` | **PASS** (exit 0) |
+| Lint | `python -m ruff check .` | **PASS** — All checks passed! |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 468 tests, 0 failures, 1 skipped (symlink) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI usage | `python app.py --help` | **PASS** (exit 0) |
+
+**Test delta:** Batch 10 had 458 tests; Batch 11 adds 10 in
+`tests/test_confirmation.py` → 468.
+
+### Q.4 Not run / remaining limitations
+
+- **GitHub Actions was not executed** (no local runner); the workflow is
+  authored but must be validated by a real push. It installs
+  `requirements-dev.txt` and Ubuntu's `libportaudio2`.
+- **mypy and Bandit were not run** (not installed); they were in the
+  original PROC-001 recommendation and remain optional.
+- **`ruff format` is not enforced**; 29 files would reformat.
+- `ConfirmationRegistry` has no internal lock (single-threaded use only),
+  and a ticket's binding covers tool id + argument digest, not the
+  (deterministic) permission level — both noted in
+  [docs/safety.md](safety.md).
+- No commit was made.
+
+## R. Batch 12 addendum — local speaker verification
+
+Batch 12 adds an **optional, off-by-default** local speaker check that
+gates whether a detected wake phrase opens a command session. It is an
+*activation* gate only: it adds no authority, changes no permission rule,
+and leaves the single guarded execution path untouched.
+
+### R.1 Findings
+
+| ID | Severity | Area | Finding | Action |
+|---|---|---|---|---|
+| — | (feature) | `voice/` | The wake word was the only activation gate, so any voice (or a recording) that said the phrase started a command session. | **Addressed** — optional speaker verification between wake detection and `LISTENING`. |
+| SPK-001 | Low | design | A verification backend fault could otherwise be mistaken for a pass. | **Mitigated** — `SpeakerVerifier.verify` **never raises**; it returns a structured failure (`model_error`/`unusable_audio`/`incomparable`/`below_threshold`/`closed`) that never activates. |
+| SPK-002 | Low | design | Verification could be confused with the permission/confirmation gate. | **Mitigated** — kept strictly separate; a match only moves `IDLE → LISTENING` and a test proves it cannot approve a `CONFIRM` tool. |
+
+### R.2 Security separation (audited)
+
+- Wake word, speaker verification and the permission/confirmation gate
+  are **independent**; none substitutes for another.
+- A verified speaker gains **no** ability to authorise, mint or redeem a
+  ticket; every command still flows through the router and
+  `ToolExecutor.execute`.
+- Verification fails closed on every abnormal path, and if the backend or
+  enrolment is unavailable the app **disables** wake-word activation and
+  falls back to manual instead of bypassing the check.
+- Only the wake-session audio is embedded (no second microphone stream),
+  and the buffer is cleared each session.
+
+### R.3 Files changed
+
+| File | Change |
+|---|---|
+| `voice/speaker_verification.py` | **New** — embedding interface, math, `SpeakerVerifier`, `build_embedding_model`. |
+| `voice/enrollment.py` | **New** — `EnrollmentStore`, `microphone_capture`, `enroll_speaker`, `default_data_dir`. |
+| `voice/speaker_backend.py` | **New** — optional SpeechBrain ECAPA adapter (not a core dependency). |
+| `voice/wakeword.py` | Rolling trigger-audio buffer + `trigger_audio`/`sample_rate`; cleared on `start()`/`close()`. |
+| `config.py` | **New** `SpeakerVerificationConfig` (+ `validate()`). |
+| `app.py` | `--verify-speaker`/`--enroll-speaker`/`--reset-speaker`/`--speaker-status`; activation gate, fallback-to-manual, verifier lifecycle; docstring/usage. |
+| `tests/test_speaker_verification.py`, `tests/test_enrollment.py`, `tests/test_speaker_backend.py` | **New** test modules (fake backends, no mic/network). |
+| `tests/test_wakeword.py`, `tests/test_app.py`, `tests/test_config.py` | Trigger-audio, integration and config tests. |
+| `README.md`, `docs/safety.md`, `docs/roadmap.md`, `docs/voice-pipeline.md`, `docs/AUDIT_REPORT.md` | Documentation. |
+
+### R.4 Batch 12 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py tests` | **PASS** (exit 0) |
+| Lint | `python -m ruff check .` | **PASS** — All checks passed! |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 548 tests, 0 failures, 1 skipped (symlink) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI usage | `python app.py --help` | **PASS** (exit 0, new flags listed) |
+| Smoke | `--speaker-status` / `--reset-speaker` / `--enroll-speaker` | status/reset **exit 0** ("No voice is enrolled." / "No enrolment to remove."); enrol **exit 1** (backend unavailable — fail-closed) |
+
+**Test delta:** Batch 11 had 468 tests; Batch 12 adds 80 across the new
+and updated modules → 548.
+
+### R.5 Not run / remaining limitations
+
+- **Real speaker verification was not run.** The optional `speechbrain`
+  backend (and torch) is not installed, so enrolment and matching could
+  not be exercised on real audio; only the logic, the store and the
+  wake-audio hand-off are unit-tested (with fakes). `--enroll-speaker`
+  honestly reports the backend is unavailable and exits `1`.
+- **Not liveness / anti-spoofing.** A recording of the enrolled voice
+  could match; the default threshold (`0.5`) is an uncalibrated starting
+  point, not a security guarantee.
+- The enrolment file is unencrypted (owner-only permissions where
+  supported); `EnrollmentStore` has no internal lock (single-threaded
+  management paths only).
+- The optional backend adds no requirement to `requirements.txt`; it must
+  be installed deliberately. Weights download once on first use.
+- No commit was made.

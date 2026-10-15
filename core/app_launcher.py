@@ -110,7 +110,7 @@ def default_catalog() -> dict[str, AppTarget]:
     """
     if sys.platform != "win32":
         return {}
-    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    root = os.environ.get("SYSTEMROOT") or r"C:\Windows"
     system32 = os.path.join(root, "System32")
     catalog: dict[str, AppTarget] = {}
     for identifier, (display_name, exe_name) in _SYSTEM32_TARGETS.items():

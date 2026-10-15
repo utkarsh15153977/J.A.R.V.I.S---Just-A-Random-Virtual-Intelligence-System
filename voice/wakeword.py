@@ -26,6 +26,9 @@ speaking" invariant true.
 
 Privacy / safety:
 * No audio is written to disk and raw audio is never logged.
+* A short window of the just-fired wake phrase is kept in memory (and
+  cleared at the start of each session) only so an optional speaker
+  verifier can check the captured voice.
 * Detection only decides *when* to start listening. It carries no
   authority: every command still goes through the router and the guarded
   ``ToolExecutor``.
@@ -35,7 +38,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable, Dict, Optional, Protocol
+from collections import deque
+from typing import Any, Callable, Deque, Dict, Optional, Protocol
 
 import numpy as np
 
@@ -45,6 +49,12 @@ logger = logging.getLogger("jarvis.wakeword")
 
 # openWakeWord expects 16 kHz mono audio, preferably 80 ms frames.
 FRAME_SAMPLES = 1280
+
+# Raw audio kept for the just-fired wake phrase, so an optional speaker
+# verifier can check the *current* capture without opening a second
+# microphone stream. Only the most recent window is kept and it is cleared
+# at the start of every session.
+_TRIGGER_BUFFER_SECONDS = 2.0
 
 _UNAVAILABLE_MESSAGE = (
     "wake-word detection is unavailable: the openwakeword model files are "
@@ -160,6 +170,10 @@ class OpenWakeWordDetector:
         self._model: Optional[Any] = None
         self._stream: Optional[Any] = None
         self._closed = False
+        frame_seconds = FRAME_SAMPLES / float(self.config.sample_rate)
+        buffer_frames = max(1, round(_TRIGGER_BUFFER_SECONDS / frame_seconds))
+        self._buffer: Deque[np.ndarray] = deque(maxlen=buffer_frames)
+        self._trigger_audio: Optional[np.ndarray] = None
 
         factory = model_factory or _default_model_factory
         try:
@@ -177,6 +191,21 @@ class OpenWakeWordDetector:
 
     # -- lifecycle ------------------------------------------------------
     @property
+    def sample_rate(self) -> int:
+        """Sample rate of the frames this detector reads."""
+        return self.config.sample_rate
+
+    @property
+    def trigger_audio(self) -> Optional[np.ndarray]:
+        """int16 mono audio of the most recent wake phrase, or None.
+
+        Read after ``detect()`` returns True (and after ``stop()``) so an
+        optional speaker verifier can check the captured voice. Cleared at
+        the start of every session so stale audio is never reused.
+        """
+        return self._trigger_audio
+
+    @property
     def session_open(self) -> bool:
         """True while a detection session currently owns the microphone."""
         return self._stream is not None
@@ -186,10 +215,14 @@ class OpenWakeWordDetector:
 
         Any stream left over from a previous session is released first,
         so each session reads fresh audio and never reuses stale frames.
+        The trigger-audio buffer is cleared so a verifier can never see
+        audio from an earlier session.
         """
         if self._closed or self._model is None:
             return
         self.stop()
+        self._buffer.clear()
+        self._trigger_audio = None
         try:
             self._model.reset()
         except Exception:
@@ -221,6 +254,8 @@ class OpenWakeWordDetector:
         self._closed = True
         self.stop()
         self._model = None
+        self._buffer.clear()
+        self._trigger_audio = None
         logger.info("Wake-word detector released.")
 
     # -- detection ------------------------------------------------------
@@ -228,7 +263,9 @@ class OpenWakeWordDetector:
         """Return True as soon as the wake phrase score reaches threshold.
 
         Blocks for at most ``timeout`` seconds (or until the frame reader
-        signals end by returning ``None``). Never logs raw audio.
+        signals end by returning ``None``). Never logs raw audio. On a
+        successful detection the recent raw frames (the wake phrase) are
+        kept in memory for an optional speaker verifier.
         """
         if self._closed or self._model is None:
             return False
@@ -240,9 +277,18 @@ class OpenWakeWordDetector:
             frame = self._frame_reader(FRAME_SAMPLES)
             if frame is None:
                 return False
+            self._buffer.append(np.asarray(frame))
             score = self._score(self._model.predict(frame))
             if score >= self.config.threshold:
+                self._capture_trigger_audio()
                 return True
+
+    def _capture_trigger_audio(self) -> None:
+        """Snapshot the buffered wake-phrase frames for verification."""
+        if not self._buffer:
+            self._trigger_audio = None
+            return
+        self._trigger_audio = np.concatenate(list(self._buffer))
 
     @staticmethod
     def _score(predictions: Any) -> float:

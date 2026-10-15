@@ -6,8 +6,11 @@ perform no real computer-control actions.
 """
 
 import os
+import tempfile
 import unittest
 from datetime import datetime
+
+import numpy as np
 
 from app import (
     EXIT_CONFIG_ERROR,
@@ -19,6 +22,7 @@ from app import (
 )
 from config import (
     AppsConfig,
+    SpeakerVerificationConfig,
     SpeechConfig,
     ToolsConfig,
     VoiceConfig,
@@ -51,8 +55,14 @@ from core.router import (
     ToolCommandRouter,
 )
 from core.tools import ToolRegistry, ToolSpec, validate_mapping
+from voice.enrollment import EnrollmentStore
 from voice.listener import MicrophoneError, ModelLoadError
 from voice.speaker import SpeechError
+from voice.speaker_verification import (
+    Enrollment,
+    SpeakerVerificationError,
+    normalize_embedding,
+)
 from voice.states import ListeningState, ListeningStateMachine
 from voice.wakeword import WakeWordUnavailableError
 
@@ -110,7 +120,13 @@ class FakeWakeDetector:
     against the listener and other components.
     """
 
-    def __init__(self, results=(True,), fail=False, events=None):
+    def __init__(
+        self,
+        results=(True,),
+        fail=False,
+        events=None,
+        audio=None,
+    ):
         self.results = list(results)
         self.fail = fail
         self.started = 0
@@ -118,6 +134,7 @@ class FakeWakeDetector:
         self.closed = False
         self.detect_calls = 0
         self.session_open = False
+        self.trigger_audio = audio
         self.events = events if events is not None else []
 
     @property
@@ -150,6 +167,31 @@ class FakeWakeDetector:
     def close(self):
         self.closed = True
         self.events.append("detector.close")
+
+
+class FakeEmbeddingModel:
+    """Stand-in for a speaker-embedding backend with no model files.
+
+    Returns scripted embeddings in order; the last one is reused. This is
+    a *test* double only -- real verification uses a maintained embedding
+    model (see voice/speaker_backend.py).
+    """
+
+    def __init__(self, embeddings=None, model_id="fake"):
+        self.embeddings = [
+            np.asarray(value, dtype=np.float32)
+            for value in (embeddings or [[1.0, 0.0]])
+        ]
+        self.model_id = model_id
+        self.closed = False
+
+    def embed(self, audio, sample_rate):
+        if len(self.embeddings) > 1:
+            return self.embeddings.pop(0)
+        return self.embeddings[0]
+
+    def close(self):
+        self.closed = True
 
 
 class RecordingExecutor:
@@ -474,7 +516,7 @@ class TestSpeechIntegration(unittest.TestCase):
         def factory(config):
             raise AssertionError("speaker must not be created")
 
-        code, output, listener, _ = run_main(
+        code, output, _, _ = run_main(
             texts=["exit"], argv=["--no-speech"], speaker_factory=factory
         )
         self.assertEqual(code, EXIT_OK)
@@ -1477,7 +1519,7 @@ class TestAppLaunchingIntegration(unittest.TestCase):
         executor = ToolExecutor(
             registry, PermissionPolicy(), EchoApprovalProvider()
         )
-        code, output, _, _ = run_main(
+        code, _, _, _ = run_main(
             texts=["open calculator", "exit"],
             argv=["--tools"],
             apps_config=self._apps(),
@@ -1508,6 +1550,173 @@ class TestAppLaunchingIntegration(unittest.TestCase):
         )
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(launcher.targets, [])
+        self.assertTrue(any("approval denied" in line for line in output))
+
+
+class TestSpeakerVerification(unittest.TestCase):
+    """Voice-triggered activation is gated by the enrolled speaker.
+
+    A match only allows listening; it never authorises a command. All
+    audio and embedding work is faked, so these tests need no microphone
+    and no model files.
+    """
+
+    def _audio(self):
+        return np.full(16000, 1000, dtype=np.int16)
+
+    def _config(self, tmp):
+        return SpeakerVerificationConfig(enabled=True, data_dir=tmp)
+
+    def _store(self, tmp, embedding, model_id="fake"):
+        store = EnrollmentStore(self._config(tmp))
+        store.save(
+            Enrollment(
+                embedding=normalize_embedding(embedding),
+                sample_count=3,
+                model_id=model_id,
+                created_at=0.0,
+            )
+        )
+        return store
+
+    def test_verified_voice_reaches_listening(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            detector = FakeWakeDetector(results=[True], audio=self._audio())
+            model = FakeEmbeddingModel([[1.0, 0.0]])
+            listener = FakeListener(texts=["exit"])
+            code, _, _, _ = run_main(
+                listener_factory=lambda config: listener,
+                argv=["--wake-word", "--verify-speaker"],
+                wake_word_factory=lambda config: detector,
+                embedding_model_factory=lambda config: model,
+                enrollment_store=self._store(tmp, [1.0, 0.0]),
+                speaker_verification_config=self._config(tmp),
+            )
+        self.assertEqual(code, EXIT_OK)
+        self.assertGreaterEqual(listener.transcribe_calls, 1)
+        self.assertTrue(model.closed)
+
+    def test_unverified_voice_is_rejected_then_recovers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            detector = FakeWakeDetector(results=[True], audio=self._audio())
+            # First attempt is a mismatch; later ones match.
+            model = FakeEmbeddingModel([[0.0, 1.0], [1.0, 0.0]])
+            listener = FakeListener(texts=["exit"])
+            code, output, _, _ = run_main(
+                listener_factory=lambda config: listener,
+                argv=["--wake-word", "--verify-speaker"],
+                wake_word_factory=lambda config: detector,
+                embedding_model_factory=lambda config: model,
+                enrollment_store=self._store(tmp, [1.0, 0.0]),
+                speaker_verification_config=self._config(tmp),
+            )
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(any("did not match" in line for line in output))
+        self.assertEqual(listener.transcribe_calls, 1)
+
+    def test_missing_enrolment_disables_wake_and_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            detector = FakeWakeDetector(results=[True], audio=self._audio())
+            listener = FakeListener(texts=["exit"])
+            code, output, _, _ = run_main(
+                listener_factory=lambda config: listener,
+                argv=["--wake-word", "--verify-speaker"],
+                wake_word_factory=lambda config: detector,
+                embedding_model_factory=lambda config: FakeEmbeddingModel(),
+                enrollment_store=EnrollmentStore(self._config(tmp)),
+                speaker_verification_config=self._config(tmp),
+            )
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(any("manual activation" in line for line in output))
+        self.assertTrue(detector.closed)
+        self.assertGreaterEqual(listener.transcribe_calls, 1)
+
+    def test_unavailable_model_disables_wake_and_falls_back(self):
+        def factory(config):
+            raise SpeakerVerificationError("no backend")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            detector = FakeWakeDetector(results=[True], audio=self._audio())
+            listener = FakeListener(texts=["exit"])
+            code, output, _, _ = run_main(
+                listener_factory=lambda config: listener,
+                argv=["--wake-word", "--verify-speaker"],
+                wake_word_factory=lambda config: detector,
+                embedding_model_factory=factory,
+                enrollment_store=EnrollmentStore(self._config(tmp)),
+                speaker_verification_config=self._config(tmp),
+            )
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(any("manual activation" in line for line in output))
+        self.assertTrue(detector.closed)
+
+    def test_verification_without_wake_word_only_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            listener = FakeListener(texts=["exit"])
+            code, output, _, _ = run_main(
+                listener_factory=lambda config: listener,
+                argv=["--verify-speaker"],
+                embedding_model_factory=lambda config: FakeEmbeddingModel(),
+                enrollment_store=EnrollmentStore(self._config(tmp)),
+                speaker_verification_config=self._config(tmp),
+            )
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(
+            any("only affects voice-triggered" in line for line in output)
+        )
+
+    def test_speaker_match_cannot_bypass_permissions(self):
+        """A verified voice still cannot approve a CONFIRM tool."""
+        ran = []
+
+        def handler():
+            ran.append(True)
+            return {"text": "ran"}
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolSpec(
+                name="confirm_tool",
+                description="needs approval",
+                permission=PermissionLevel.CONFIRM,
+                validate=lambda raw: validate_mapping(
+                    raw, required={}, optional={}
+                ),
+                handler=handler,
+            )
+        )
+
+        class DenyAll:
+            def request(self, request):
+                return ApprovalResult(ApprovalOutcome.DENIED, "no")
+
+        executor = ToolExecutor(registry, PermissionPolicy(), DenyAll())
+        router = ScriptedRouter(
+            {
+                "go": CommandRequest(
+                    CommandKind.TOOL, tool_name="confirm_tool"
+                ),
+                "exit": CommandRequest(CommandKind.EXIT),
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            detector = FakeWakeDetector(
+                results=[True, True], audio=self._audio()
+            )
+            model = FakeEmbeddingModel([[1.0, 0.0]])
+            listener = FakeListener(texts=["go", "exit"])
+            code, output, _, _ = run_main(
+                listener_factory=lambda config: listener,
+                router=router,
+                executor=executor,
+                argv=["--wake-word", "--verify-speaker"],
+                wake_word_factory=lambda config: detector,
+                embedding_model_factory=lambda config: model,
+                enrollment_store=self._store(tmp, [1.0, 0.0]),
+                speaker_verification_config=self._config(tmp),
+            )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(ran, [])
         self.assertTrue(any("approval denied" in line for line in output))
 
 

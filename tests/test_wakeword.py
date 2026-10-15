@@ -11,6 +11,7 @@ import numpy as np
 
 from config import WakeConfig
 from voice.wakeword import (
+    FRAME_SAMPLES,
     NullWakeWordDetector,
     OpenWakeWordDetector,
     WakeWordUnavailableError,
@@ -329,6 +330,60 @@ class TestScoreHelper(unittest.TestCase):
         self.assertEqual(OpenWakeWordDetector._score({}), 0.0)
         self.assertEqual(OpenWakeWordDetector._score(None), 0.0)
         self.assertEqual(OpenWakeWordDetector._score("nope"), 0.0)
+
+
+class TestTriggerAudio(unittest.TestCase):
+    def test_none_before_detection(self):
+        detector = build(FakeModel([{"hey_jarvis": 0.9}]))
+        self.assertIsNone(detector.trigger_audio)
+        detector.close()
+
+    def test_captures_the_frames_just_before_detection(self):
+        detector = build(
+            FakeModel([{"hey_jarvis": 0.9}]), frame_reader_=frame_reader(1)
+        )
+        self.assertTrue(detector.detect(timeout=1.0))
+        self.assertIsNotNone(detector.trigger_audio)
+        self.assertEqual(detector.trigger_audio.shape[0], FRAME_SAMPLES)
+        np.testing.assert_array_equal(
+            detector.trigger_audio, np.zeros(FRAME_SAMPLES, dtype=np.int16)
+        )
+        detector.close()
+
+    def test_start_clears_stale_trigger_audio(self):
+        detector = build(
+            FakeModel([{"hey_jarvis": 0.9}]), frame_reader_=frame_reader(1)
+        )
+        self.assertTrue(detector.detect(timeout=1.0))
+        self.assertIsNotNone(detector.trigger_audio)
+        detector.start()
+        self.assertIsNone(detector.trigger_audio)
+        detector.close()
+
+    def test_close_clears_trigger_audio(self):
+        detector = build(
+            FakeModel([{"hey_jarvis": 0.9}]), frame_reader_=frame_reader(1)
+        )
+        self.assertTrue(detector.detect(timeout=1.0))
+        detector.close()
+        self.assertIsNone(detector.trigger_audio)
+
+    def test_trigger_buffer_is_capped_to_the_recent_window(self):
+        # 2.0 s of 80 ms frames is 25 frames; a longer history is dropped.
+        model = FakeModel(
+            [{"hey_jarvis": 0.1}] * 39 + [{"hey_jarvis": 0.9}]
+        )
+        detector = build(model, frame_reader_=frame_reader(40))
+        self.assertTrue(detector.detect(timeout=1.0))
+        self.assertEqual(detector.trigger_audio.shape[0], 25 * FRAME_SAMPLES)
+        detector.close()
+
+    def test_sample_rate_reflects_the_config(self):
+        detector = build(
+            FakeModel([]), config=WakeConfig(sample_rate=16000)
+        )
+        self.assertEqual(detector.sample_rate, 16000)
+        detector.close()
 
 
 if __name__ == "__main__":

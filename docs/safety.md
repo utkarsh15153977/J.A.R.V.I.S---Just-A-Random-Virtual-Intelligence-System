@@ -8,7 +8,9 @@ wake-word audio-session lifecycle), **Batch 6 landed** (first read-only
 tools), **Batch 8 landed** (integration verification + two more read-only
 tools: disk space and battery status) and **Batch 9 landed** (confirmation
 workflow safety: approval bound to the exact tool and validated
-arguments, single-use and expiring). The production registry
+arguments, single-use and expiring). **Batch 10 landed** (allowlisted,
+confirmed application launcher) and **Batch 12 landed** (optional local
+speaker verification for voice-triggered activation). The production registry
 is empty by default; with `--tools` it holds only approved,
 deterministic, read-only tools. This layer exists so that no tool can
 ever be executed without passing through a single guarded gate.
@@ -39,6 +41,12 @@ This document covers:
   the interaction loop.
 - `voice/wakeword.py` — the wake-word detector interface and its safe,
   never-activating fallback.
+- `voice/speaker_verification.py` — the local speaker-verification
+  interface, embedding math and the `SpeakerVerifier` gate.
+- `voice/enrollment.py` — explicit voice enrolment: capture helper,
+  on-disk `EnrollmentStore` and the `enroll_speaker` flow.
+- `voice/speaker_backend.py` — optional, lazily-loaded SpeechBrain ECAPA
+  embedding backend (not a core dependency).
 - `app.py` — the composition root: wiring, the loop and the process
   lifecycle.
 
@@ -450,6 +458,57 @@ Safety properties:
   never open at once and the device is never left held. The stream
   factory is injectable, so this lifecycle is unit-tested with fakes.
 
+## Speaker verification (Batch 12)
+
+`voice/speaker_verification.py` defines an `EmbeddingModel` interface and
+a `SpeakerVerifier` gate; `voice/enrollment.py` manages enrolment. The
+optional backend lives in `voice/speaker_backend.py`. Verification is
+**opt-in and separate from both the wake word and the permission gate**:
+
+- **Off by default.** Verification runs only with `--verify-speaker` or
+  `SpeakerVerificationConfig(enabled=True)`.
+- **Narrow authority.** Verification only decides whether a detected wake
+  phrase may move `IDLE → LISTENING`. It never produces a command, chooses
+  a tool or approves anything. A match cannot approve a confirmation,
+  select a permission level or mint a ticket; every command still passes
+  through the router and `ToolExecutor.execute`. A test proves a verified
+  speaker still cannot approve a `CONFIRM` tool.
+- **Same-session audio only.** Verification embeds the wake phrase
+  captured in the current detection session (a rolling ~2 s buffer, no
+  second microphone stream). The buffer is cleared at the start of every
+  session, so stale audio is never reused.
+- **Fails closed and honest.** Accept only when the cosine score is
+  `>= threshold`. Missing audio, unusable/too-short/silent samples, a
+  backend error, a missing/corrupt enrolment or a model mismatch all
+  result in **no activation**. If verification is requested but cannot
+  start (backend unavailable or no enrolment), the app prints a clear
+  notice, disables wake-word activation and falls back to **manual**
+  activation — it never silently bypasses the check.
+- **Verification never raises into the loop.** `SpeakerVerifier.verify`
+  returns a structured reason (`match`, `below_threshold`,
+  `unusable_audio`, `model_error`, `incomparable`, `closed`) instead of
+  throwing, so an unexpected backend fault cannot skip the gate.
+- **Explicit enrolment only.** `--enroll-speaker` captures samples only
+  after an interactive confirmation, rejects unusable samples, computes a
+  centroid embedding and stores only that vector plus metadata — never raw
+  audio. `--reset-speaker` and `--speaker-status` manage/inspect it; none
+  of these run inside the listening loop.
+- **Local-only backend.** `voice/speaker_backend.py` wraps SpeechBrain
+  ECAPA on CPU and downloads weights once on first use (never at startup).
+  The package is **not** a core dependency; if it (or torch) is missing,
+  the backend raises and the app falls back to manual activation.
+
+Storage: the enrolment file (`speaker_enrollment.npz`) lives in a
+per-user data directory (`%LOCALAPPDATA%\Jarvis` on Windows) and is
+written atomically with owner-only permissions where the platform
+supports it (`0o600` file, `0o700` directory).
+
+**Not a security guarantee.** Speaker verification is *speaker matching*,
+not liveness or anti-spoofing: a recording of the enrolled voice could
+match. The default threshold (`0.5`) is a starting point that must be
+calibrated for the chosen model and enrolment, and it is not a
+substitute for the permission/confirmation gate.
+
 ## Testing
 
 `tests/test_permissions.py` — levels, policy base levels, escalation and
@@ -481,7 +540,11 @@ shutdown (`close()` denies execution, revokes pending tickets,
 idempotent) and interruption (Ctrl+C / provider exception fail closed);
 and no-bypass proof that the router alone never executes, a routed
 `CONFIRM` command still needs a bound approval, and wake-word activation
-is not approval.
+is not approval. Batch 11 adds regression tests that every
+non-consuming outcome revokes the minted ticket (denied, unavailable,
+interrupted, provider error, malformed result/outcome, unbound token),
+that two pending tickets for the same action are independent, and that
+`revoke` ignores non-string tokens.
 
 `tests/test_router.py` — exit-word recognition (case/whitespace
 insensitive, multi-word), empty/`None` → clarify, unknown → unsupported,
@@ -535,6 +598,25 @@ idempotent `close()`, and transcript content not logged unless opted in.
 input ignored, whitespace stripping, long-text truncation, fail-soft
 runtime errors (no text in logs), `stop`, and idempotent `close`.
 
+`tests/test_speaker_verification.py` (Batch 12) — embedding helpers
+(int16 scaling, clipping, finite checks, normalisation, cosine
+similarity), `SpeakerVerifier` accept/reject at and around the
+threshold, unusable/short/silent samples, backend errors, incomparable
+and closed states, an idempotent `close`, and `build_embedding_model`
+selection (unknown model → error) against a fake embedding backend.
+
+`tests/test_enrollment.py` (Batch 12) — `default_data_dir` per platform,
+`microphone_capture` against a fake stream, `EnrollmentStore` round-trip,
+missing file → `None`, corrupt/malformed/non-finite/zero-sample files and
+model mismatch → `EnrollmentError`, atomic owner-only write, `clear`, and
+the `enroll_speaker` flow (confirm-before-overwrite, retries, unusable
+rejection, abort on backend error, minimum-sample gate, centroid stored).
+
+`tests/test_speaker_backend.py` (Batch 12) — the SpeechBrain ECAPA
+adapter against an injected loader (sample-rate validation, model-id
+composition, output shaping, and the missing-`torch` guard) without
+importing SpeechBrain or downloading weights.
+
 `tests/test_states.py` — initial state and history, the full happy-path
 cycle, every legal shortcut, same-state no-op, `STOPPED` terminal,
 illegal transitions raise and leave state unchanged, `can_transition`,
@@ -549,6 +631,9 @@ and the audio-session lifecycle — the stream opens on demand on `detect`,
 `stop()` releases it (idempotently), `start()` ends a previous session,
 `close()` releases an open session, a fresh stream opens after `stop()`,
 and stream factory/read failures raise `WakeWordUnavailableError`.
+Batch 12 adds the trigger-audio hand-off: the rolling buffer is empty at
+start, captures the just-fired frames on detection, is cleared on
+`start()`/`close()`, and never reuses stale audio.
 
 The app tests additionally cover wake-word gating (activation only after
 detection), manual fallback when unavailable, wake-word never authorising
@@ -557,7 +642,12 @@ integration (full cycle to `STOPPED`, cleanup from every state, and the
 invariant that the app is never `LISTENING` while `SPEAKING`), and the
 session hand-off (the session is released before listening, `start`/`stop`
 run once per activation, the session is released on detection failure and
-on Ctrl+C, and manual mode never opens a session).
+on Ctrl+C, and manual mode never opens a session). Batch 12 adds
+speaker-verification integration: a verified wake phrase activates while a
+rejected one stays `IDLE`, `--verify-speaker` without an enrolment or a
+backend falls back to manual activation and disables wake-word, the
+verifier is closed on every exit path, and a speaker match cannot bypass
+permissions or forge an approval.
 
 Run:
 
@@ -640,3 +730,32 @@ calls a handler directly.
   audio-session *lifecycle* are unit-tested (with fakes: models, frame
   readers, streams and clocks); real detection against a microphone has
   not been verified. Enabling it requires downloading the models.
+- `ConfirmationRegistry` is not internally synchronised. It is only
+  touched from the single listening loop today; a future design that
+  issued or consumed tickets from multiple threads would need a lock.
+- A confirmation ticket is bound to the tool id and the validated
+  argument digest; the permission level is recorded on the ticket but not
+  part of the binding. This is safe because the policy derives a tool's
+  level deterministically from its id and (validated) arguments, so the
+  level cannot differ between the prompt and the redemption.
+- Speaker verification is **not runnable** in this environment: the
+  optional `speechbrain` backend (and torch) is not installed, so
+  `--enroll-speaker` and `--verify-speaker` fall back to manual
+  activation. Only the verification *logic*, the enrolment *store* and the
+  wake-audio *hand-off* are unit-tested (with fake embedding backends and
+  samples); real embeddings and matching against a microphone have not
+  been verified.
+- Speaker verification is speaker matching, **not** liveness or
+  anti-spoofing: a recording of the enrolled voice could match. The
+  default threshold (`0.5`) is an uncalibrated starting point, not a
+  security guarantee, and it never replaces the permission/confirmation
+  gate.
+- Enrolment storage rejects corrupt, malformed or model-mismatched files
+  (treated as "not enrolled" → manual fallback), but the embedding vector
+  and metadata are stored unencrypted; owner-only permissions are applied
+  where the platform supports them.
+- `EnrollmentStore` and `ConfirmationRegistry` are not internally
+  synchronised; they are only touched from the single-threaded
+  management/loop paths today.
+- The GitHub Actions workflow (`.github/workflows/ci.yml`, Batch 11) was
+  authored but not executed locally; it must be validated by a real push.

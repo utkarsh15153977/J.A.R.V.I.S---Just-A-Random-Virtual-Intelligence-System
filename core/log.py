@@ -40,6 +40,9 @@ def setup_logging(
         file_handler.setFormatter(logging.Formatter(_FILE_FORMAT))
         logger.addHandler(file_handler)
     except OSError:
-        logger.warning("Could not open log file in '%s'; file logging disabled.", log_dir)
+        logger.warning(
+            "Could not open log file in '%s'; file logging disabled.",
+            log_dir,
+        )
 
     return logger

@@ -297,6 +297,11 @@ class ToolExecutor:
         redeemable (not expired, not already used, minted for this exact
         tool and argument digest). Anything else fails closed. An
         interrupted prompt (Ctrl+C) also fails closed.
+
+        The minted ticket is the only one left pending while the prompt is
+        in flight: every non-consuming outcome (denied, unavailable,
+        interrupted, provider error, malformed result or an unbound token)
+        revokes it, so it can never linger or be replayed.
         """
         if self._closed:
             return ApprovalOutcome.UNAVAILABLE
@@ -327,12 +332,14 @@ class ToolExecutor:
             )
             return ApprovalOutcome.UNAVAILABLE
         if not isinstance(result, ApprovalResult):
+            self._confirmations.revoke(ticket.token)
             self._logger.warning(
                 "Malformed approval result for tool %r; failing closed.",
                 spec.name,
             )
             return ApprovalOutcome.DENIED
         if not isinstance(result.outcome, ApprovalOutcome):
+            self._confirmations.revoke(ticket.token)
             self._logger.warning(
                 "Malformed approval outcome for tool %r; failing closed.",
                 spec.name,
@@ -345,6 +352,7 @@ class ToolExecutor:
         if not self._confirmations.consume(
             result.token, tool_name=spec.name, args_fingerprint=fingerprint
         ):
+            self._confirmations.revoke(ticket.token)
             self._logger.warning(
                 "Approval for tool %r was not bound to this action; "
                 "failing closed.",
