@@ -1,0 +1,111 @@
+"""Unit tests for config validation."""
+
+import unittest
+
+from config import ConfigError, VoiceConfig, WakeConfig
+
+
+class TestVoiceConfigDefaults(unittest.TestCase):
+    def test_defaults_are_valid(self):
+        config = VoiceConfig()
+        self.assertIs(config.validate(), config)
+
+    def test_block_size_matches_rate_and_duration(self):
+        config = VoiceConfig(sample_rate=16000, block_duration=0.1)
+        self.assertEqual(config.block_size, 1600)
+
+
+class TestVoiceConfigValidation(unittest.TestCase):
+    def assert_invalid(self, **overrides):
+        config = VoiceConfig(**overrides)
+        with self.assertRaises(ConfigError):
+            config.validate()
+
+    def test_config_error_is_value_error(self):
+        self.assertTrue(issubclass(ConfigError, ValueError))
+
+    def test_zero_sample_rate_rejected(self):
+        self.assert_invalid(sample_rate=0)
+
+    def test_zero_block_duration_rejected(self):
+        self.assert_invalid(block_duration=0)
+
+    def test_huge_block_duration_rejected(self):
+        self.assert_invalid(block_duration=2.0)
+
+    def test_multiplier_must_exceed_one(self):
+        self.assert_invalid(threshold_multiplier=1.0)
+        self.assert_invalid(threshold_multiplier=0.5)
+
+    def test_negative_floor_rejected(self):
+        self.assert_invalid(threshold_floor=-10)
+
+    def test_ceiling_must_exceed_floor(self):
+        self.assert_invalid(threshold_floor=500, threshold_ceiling=100)
+
+    def test_min_speech_must_be_positive(self):
+        self.assert_invalid(min_speech_seconds=0)
+
+    def test_min_recording_must_cover_min_speech(self):
+        self.assert_invalid(min_speech_seconds=0.5, min_recording_seconds=0.2)
+
+    def test_max_recording_must_exceed_min_recording(self):
+        self.assert_invalid(
+            min_recording_seconds=0.6, max_recording_seconds=0.5
+        )
+
+    def test_negative_pre_roll_rejected(self):
+        self.assert_invalid(pre_roll_blocks=-1)
+
+    def test_zero_beam_size_rejected(self):
+        self.assert_invalid(beam_size=0)
+
+    def test_empty_model_rejected(self):
+        self.assert_invalid(whisper_model="")
+
+    def test_multiple_problems_reported_together(self):
+        config = VoiceConfig(sample_rate=0, beam_size=0)
+        with self.assertRaises(ConfigError) as ctx:
+            config.validate()
+        self.assertIn("sample_rate", str(ctx.exception))
+        self.assertIn("beam_size", str(ctx.exception))
+
+
+class TestWakeConfig(unittest.TestCase):
+    def test_defaults_are_off_and_valid(self):
+        config = WakeConfig()
+        self.assertFalse(config.enabled)
+        self.assertIs(config.validate(), config)
+
+    def assert_invalid(self, **overrides):
+        config = WakeConfig(**overrides)
+        with self.assertRaises(ConfigError):
+            config.validate()
+
+    def test_empty_phrase_rejected(self):
+        self.assert_invalid(phrase="")
+        self.assert_invalid(phrase="   ")
+
+    def test_threshold_out_of_range_rejected(self):
+        self.assert_invalid(threshold=-0.1)
+        self.assert_invalid(threshold=1.1)
+
+    def test_unknown_framework_rejected(self):
+        self.assert_invalid(inference_framework="pytorch")
+
+    def test_non_positive_sample_rate_rejected(self):
+        self.assert_invalid(sample_rate=0)
+
+    def test_valid_values_accepted(self):
+        config = WakeConfig(
+            enabled=True,
+            phrase="hey_jarvis",
+            threshold=0.6,
+            inference_framework="tflite",
+            sample_rate=16000,
+        )
+        self.assertIs(config.validate(), config)
+
+
+if __name__ == "__main__":
+    unittest.main()

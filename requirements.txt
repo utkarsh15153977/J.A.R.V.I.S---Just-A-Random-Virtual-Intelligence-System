@@ -1,0 +1,7 @@
+faster-whisper
+av<19
+openwakeword
+sounddevice
+numpy
+pyttsx3
+playwright

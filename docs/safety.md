@@ -1,0 +1,576 @@
+# Permission & Safety Foundation
+
+Status: **Batch 1 landed** (permission and safety foundation),
+**Batch 2 landed** (entry point + routing skeleton), **Batch 3 landed**
+(text-to-speech output), **Batch 4 landed** (explicit listening states +
+optional wake-word activation hook), **Batch 5 landed** (deterministic
+wake-word audio-session lifecycle), **Batch 6 landed** (first read-only
+tools), **Batch 8 landed** (integration verification + two more read-only
+tools: disk space and battery status) and **Batch 9 landed** (confirmation
+workflow safety: approval bound to the exact tool and validated
+arguments, single-use and expiring). The production registry
+is empty by default; with `--tools` it holds only approved,
+deterministic, read-only tools. This layer exists so that no tool can
+ever be executed without passing through a single guarded gate.
+
+## Scope
+
+This document covers:
+
+- `core/permissions.py` — permission levels, decisions, risk rules,
+  approval providers.
+- `core/tools.py` — `ToolSpec`, the explicit `ToolRegistry`, and strict
+  argument validation.
+- `core/builtin_tools.py` — the read-only tools
+  (`get_current_time`, `get_current_date`, `get_system_status`,
+  `get_disk_space`, `get_battery_status`); SAFE, zero-argument, local
+  and side-effect free.
+- `core/executor.py` — `ToolExecutor`, the only component allowed to
+  call a tool handler.
+- `core/confirmation.py` — bound, single-use, expiring confirmation
+  tickets and the `ConfirmationRegistry` that mints and redeems them.
+- `core/router.py` — `CommandKind` / `CommandRequest` / `Router`, the
+  safe `PlaceholderRouter` and `ToolCommandRouter` (an explicit
+  phrase → tool map; produces structured, inert commands; never
+  executes).
+- `voice/speaker.py` — text-to-speech output (`pyttsx3`), fail-soft and
+  text-only by fallback.
+- `voice/states.py` — the explicit listening-state machine that governs
+  the interaction loop.
+- `voice/wakeword.py` — the wake-word detector interface and its safe,
+  never-activating fallback.
+- `app.py` — the composition root: wiring, the loop and the process
+  lifecycle.
+
+It does **not** cover the AI planner or any operating-system, browser,
+file or email action. The only tools that exist are the read-only ones in
+`core/builtin_tools.py`; anything with a side effect remains out of scope
+until this foundation is reviewed.
+
+## Trust model
+
+Everything that enters Jarvis from the outside is untrusted:
+
+- transcribed speech,
+- AI/planner output,
+- web page content,
+- file contents,
+- and the arguments derived from any of the above.
+
+Untrusted text is never executed as code or shell. It may only be
+turned into a call to a **registered** tool with **validated**
+arguments, and that call is always routed through `ToolExecutor`.
+
+## Permission levels
+
+Every `ToolSpec` declares exactly one level:
+
+| Level | Meaning | Approval |
+|---|---|---|
+| `SAFE` | Non-destructive, reversible, local. | none |
+| `CONFIRM` | Meaningful side effect (open, navigate, modify). | required (y/N) |
+| `HIGH_RISK` | Destructive, external, financial or hard to undo. | required (type the tool name) |
+| `BLOCKED` | Never allowed. | never; cannot be overridden |
+
+`BLOCKED` is terminal. The executor refuses a blocked tool **before**
+asking for approval, so confirmation can never override it.
+
+## The single execution gate
+
+`ToolExecutor.execute(name, raw_args)` runs these steps in a fixed
+order and cannot be reordered by a caller:
+
+```
+1. registry lookup        -> unknown tool?        -> UNKNOWN_TOOL
+2. spec.validate(raw)     -> invalid arguments?   -> INVALID
+3. policy.classify(...)   -> BLOCKED?             -> BLOCKED
+        (no approval is requested for a blocked tool)
+4. approval (if required) -> bound, unused, in time? -> DENIED if not
+5. runtime.run(handler)   -> finished / raised?   -> OK / ERROR / TIMEOUT
+```
+
+A handler is therefore invoked only when the tool is registered, its
+arguments validate, the policy does not block it, and — when required —
+approval is explicitly granted **for that exact tool id and those exact
+validated arguments**, at that moment, once.
+
+## Fail-closed guarantees
+
+Every abnormal path results in the *safer* outcome:
+
+- Unknown tool → not run.
+- Invalid / non-mapping / misbehaving validator → not run.
+- Validator or policy raising an unexpected exception → `INVALID` /
+  `BLOCKED`, never a crash and never execution.
+- Policy returning a malformed decision → `BLOCKED`.
+- Approval provider raising an exception → treated as `UNAVAILABLE`
+  (denied).
+- Malformed approval result or unknown outcome enum → denied.
+- Approval not bound to this exact tool/arguments, missing, empty,
+  expired, replayed or forged → denied.
+- KeyboardInterrupt while prompting → `UNAVAILABLE` (denied).
+- Executor shut down (`close()`), or a pending confirmation revoked →
+  denied; a closed executor refuses further execution.
+- Risk rule raising or returning a non-`PermissionLevel` value → the
+  policy fails closed to `BLOCKED`.
+
+There is no code path that runs a handler without steps 1–4 having
+succeeded.
+
+## Approval
+
+`ApprovalProvider` is a `Protocol`; `ConsoleApprovalProvider` is the
+default implementation:
+
+- `SAFE` → approved automatically.
+- `CONFIRM` → prompts `Allow ...? [y/N]`; only `y`/`yes` approves.
+- `HIGH_RISK` → requires typing the exact tool name.
+- EOF, Ctrl+C or prompt failure → `UNAVAILABLE` (fails closed).
+
+The prompt shows only the tool's developer-authored summary, never the
+raw arguments, so transcripts or secrets cannot leak through it. The
+provider is injectable, so a voice-based provider can replace it later
+without touching the executor.
+
+### Bound confirmation (Batch 9)
+
+A bare "yes" is not enough. Before prompting, the executor mints a
+`ConfirmationTicket` (`core/confirmation.py`) that is bound to:
+
+- the exact tool id,
+- a SHA-256 digest of the exact **validated** arguments
+  (`fingerprint_args` — a digest only, so it never leaks a value), and
+- a fresh, unguessable nonce, with a short monotonic deadline (default
+  60 s).
+
+The nonce is handed to the provider in the `ApprovalRequest.token`. A
+provider that approves **must** echo it back in `ApprovalResult.token`
+(the console provider does this automatically). The executor then
+redeems the ticket through `ConfirmationRegistry.consume`, which
+succeeds only if the nonce is still pending, was minted for this same
+tool id and argument digest, and has not expired. Redemption removes the
+ticket, so it is single-use. Anything else fails closed.
+
+This means an approval can never:
+
+- authorise a **different tool** (tool-id mismatch),
+- authorise **different arguments** (digest mismatch — even for the same
+  tool),
+- be **replayed** (a redeemed nonce is gone),
+- be **forged** (an unminted nonce is unknown), or
+- be **expired-in** (the deadline is enforced at redemption).
+
+The ticket deadline (the `ConfirmationRegistry` `ttl`, default 60 s) is
+the approval timeout. On shutdown, `app.py` calls
+`executor.close()`, which revokes any pending confirmation and refuses
+further execution. Interrupting a prompt (Ctrl+C) also fails closed.
+
+A spoken "yes" is deliberately **not** treated as approval yet: voice
+cannot be unambiguously attributed to one pending confirmation, so the
+console interface is the only confirmation source for now.
+
+## Risk rules
+
+`PermissionPolicy(escalations=[...])` accepts `RiskRule` objects. A rule
+receives the `ToolSpec` and the *validated* arguments and may only
+**raise** the level:
+
+- returning `None` leaves the level unchanged;
+- returning a higher level escalates;
+- returning a lower level is ignored (rules cannot downgrade);
+- raising or returning a non-level fails closed to `BLOCKED`.
+
+### Path boundary rule
+
+`PathBoundaryRule` is the first concrete rule. It inspects declared path
+argument keys on declared tools and:
+
+- resolves every path (expands `~`, makes it absolute, resolves
+  `..` traversal and symlinks);
+- returns `BLOCKED` for any path inside a **forbidden root** (a hard,
+  non-overridable boundary);
+- returns `outside_level` (default `HIGH_RISK`) for any path outside the
+  **allowed roots**, when allowed roots are configured — set
+  `outside_level=PermissionLevel.BLOCKED` to make that a hard boundary
+  too;
+- fails closed (`BLOCKED`) if a path cannot be resolved.
+
+Because boundary violations are `BLOCKED`, confirmation cannot be used
+to escape an explicit filesystem restriction.
+
+## Timeouts
+
+`ToolSpec.timeout` is enforced by the injected `ToolRuntime`
+(default `ThreadToolRuntime`). On timeout the executor returns
+`TIMEOUT`.
+
+**Limitation:** Python cannot forcibly stop a thread. A timed-out
+handler keeps running in the background (on a daemon thread, so it
+cannot block interpreter shutdown). Handlers must be cooperative and
+must not perform unsafe work after a timeout. A timed-out handler is
+**never retried automatically**. This will be revisited when real tools
+with subprocesses are added (controlled process termination belongs in
+those tools).
+
+## Privacy and logging
+
+- Transcript content is **not** logged by default. Speech can contain
+  passwords, names and other sensitive data, so the listener logs only
+  the character count instead of the text.
+- `app.py --log-transcripts` (or `VoiceConfig(log_transcripts=True)`)
+  opts in to logging full transcripts; it is off unless explicitly
+  enabled, and the startup message warns when it is on.
+- Raw arguments and handler return values are never logged.
+- Handler failures log the tool name and the exception **class** only;
+  the exception message (which may embed data) is not logged.
+- Approval prompts contain only developer-authored summaries.
+- Logged fields are limited to: tool name, decision level, outcome
+  status.
+
+## The router and the app
+
+- The router (`core/router.py`) converts text into a `CommandRequest`
+  and **never** executes. The only execution path is
+  `ToolExecutor.execute(...)`.
+- `PlaceholderRouter` recognises stop words (`exit`, `quit`, `stop`,
+  `goodbye`, `shutdown`) and reports everything else as
+  `UNSUPPORTED`/`CLARIFY`. Stop words are matched through the same
+  normalisation as tool phrases (lower-case, apostrophes dropped, edge
+  punctuation stripped, whitespace collapsed), so `stop.`, `QUIT!` and
+  `shut  down` all stop the loop. It does not echo the user's words back
+  and cannot produce a `TOOL` request, so speech cannot reach a handler.
+- `ToolCommandRouter` extends the placeholder with an explicit,
+  data-driven phrase → tool map (see "Read-only tools" below). Matching
+  is exact after normalisation, and a rule is honoured only for a tool
+  that is actually registered — so with the default empty registry it
+  behaves exactly like the placeholder.
+- `app.py` builds the executor with an **empty** registry unless tools
+  are opted into (`--tools` / `ToolsConfig(enabled=True)`), so a crafted
+  tool request resolves to `UNKNOWN_TOOL` by default.
+- Failures fail closed: model/microphone errors exit with a clear
+  message and code `1`, invalid configuration exits with code `2`, and
+  the listener is always released (`finally`) on shutdown.
+
+## Read-only tools
+
+`core/builtin_tools.py` holds the real tools. All are
+`PermissionLevel.SAFE`, accept **no arguments**, and are deterministic:
+
+| Tool ID | Reads | Never does |
+|---|---|---|
+| `get_current_time` | the local clock (injected) | touch files/network/shell |
+| `get_current_date` | the local clock (injected) | touch files/network/shell |
+| `get_system_status` | OS name + Python version | read env, user or host name |
+| `get_disk_space` | aggregate capacity of the home filesystem (`shutil.disk_usage`) | open/read files, traverse paths |
+| `get_battery_status` | power state via `ctypes`/`GetSystemPowerStatus` (Windows only; `None` elsewhere) | install packages, read env |
+
+Safety properties:
+
+- **Opt-in.** Tools are registered only when `--tools` (or
+  `ToolsConfig(enabled=True)`) is given. By default the registry is empty
+  and behaviour is unchanged.
+- **Zero arguments.** The validator rejects *any* supplied key, so a
+  transcript can never steer a tool. The router also copies no spoken text
+  into arguments.
+- **Single gate.** Every call still passes through
+  `ToolExecutor.execute`; SAFE tools need no approval but the
+  registered → validated → classified → run order is unchanged.
+- **No private data.** No tool reads file *contents*, the environment,
+  user/host name, or the network, and none runs a shell or process. The
+  disk tool reports only aggregate filesystem capacity for one fixed
+  target (the user's home directory / filesystem); the battery tool
+  reports only the power state. Both are read-only.
+- **Standard library only.** Disk uses `shutil`; battery uses `ctypes`.
+  No package is installed or changed.
+- **Safe output only.** A tool returns a structured mapping; only its
+  developer-authored `text` entry is shown or spoken. Raw values and
+  transcripts are never echoed, and a tool error is reported as the
+  executor's generic message, never a traceback.
+- **Deterministic mapping.** `DEFAULT_TOOL_INTENTS` is an explicit,
+  finite table. Unrecognised or ambiguous input falls back to
+  `UNSUPPORTED`/`CLARIFY`; there is no fuzzy or model-driven selection.
+
+## Speech output
+
+`voice/speaker.py` produces spoken replies with `pyttsx3` (SAPI5 on
+Windows; no new dependency). Safety properties:
+
+- **Only developer-authored text is spoken.** `app.py` speaks the same
+  fixed replies it prints ("Jarvis is ready…", "Goodbye.", "I can't do
+  that yet.", "Done.", executor messages). Transcribed speech, tool
+  arguments and handler return values are **never** read aloud, so
+  speech output cannot leak input or bypass a permission check.
+- **No bypass by routing.** Speech is strictly downstream of dispatch;
+  it cannot cause a tool to run. The registry stays empty and
+  `ToolExecutor.execute` remains the only execution path.
+- **Feedback mitigation.** `speak` is synchronous, so the loop is not
+  calling `listener.transcribe()` while Jarvis is talking. Jarvis
+  therefore does not hear its own voice as a new command while speaking.
+- **Fail-soft.** Initialisation failure raises `SpeechError`; `app.py`
+  logs a warning and continues in **text-only** mode. A runtime playback
+  failure is logged (without the spoken text) and disables further
+  speech rather than crashing.
+- **Bounded output.** Empty or whitespace-only text is ignored and text
+  longer than `SpeechConfig.max_chars` is truncated before speaking.
+- **Resource release.** `close()` stops speech and drops the engine on
+  every exit path; `stop()` is available for interrupting an utterance
+  where the engine supports it (SAPI5 is COM/STA, so interrupting a
+  blocking `speak` from another thread is engine-dependent and
+  documented, not assumed).
+- **Text-only mode.** `--no-speech` (or `SpeechConfig(enabled=False)`)
+  skips building the speaker entirely.
+
+## Listening states
+
+`voice/states.py` defines a small, pure state machine that governs the
+loop. The states are `IDLE` (waiting for activation), `LISTENING`
+(capturing a command), `PROCESSING` (routing/handling), `SPEAKING`
+(producing spoken output) and `STOPPED` (terminal).
+
+Legal moves:
+
+| From | Allowed to |
+|---|---|
+| `IDLE` | `LISTENING`, `STOPPED` |
+| `LISTENING` | `PROCESSING`, `IDLE`, `STOPPED` |
+| `PROCESSING` | `SPEAKING`, `IDLE`, `STOPPED` |
+| `SPEAKING` | `IDLE`, `STOPPED` |
+| `STOPPED` | — (terminal) |
+
+Properties:
+
+- **Illegal moves raise** `InvalidStateTransition` instead of being
+  silently ignored, so a future refactor cannot accidentally capture
+  audio while speaking or act before activation.
+- Moving to the *current* state is a deliberate no-op, which makes
+  cleanup idempotent.
+- `STOPPED` is terminal; `close()` reaches it from any state.
+
+The states are **not** a security boundary: they organise the loop so
+that listening and speaking cannot overlap (which also prevents Jarvis
+hearing its own voice). Authority still lives solely in `ToolExecutor`.
+
+## Wake-word activation
+
+`voice/wakeword.py` defines a tiny `WakeWordDetector` interface with two
+implementations:
+
+- `OpenWakeWordDetector` wraps the optional `openwakeword` package. Its
+  pretrained model files are **not** shipped with the pip package and are
+  **not installed in this environment**, so construction raises
+  `WakeWordUnavailableError`.
+- `NullWakeWordDetector` is an explicit, safe fallback that never
+  activates.
+
+Safety properties:
+
+- **Off by default.** Wake-word mode is enabled only by `--wake-word` or
+  `WakeConfig(enabled=True)`. Otherwise the app uses the original
+  manual/always-listening flow.
+- **No pretending.** If mode is requested but no real engine is
+  available — either the factory raises, returns `None`, or returns a
+  detector whose `available` is `False` — the app prints a clear notice,
+  releases the unused detector, and falls back to manual activation. It
+  never reports detection it did not perform, and an unavailable detector
+  cannot spin the activation loop.
+- **No authority.** The wake word only moves `IDLE → LISTENING`. It
+  cannot produce a command, choose a tool, or approve anything; every
+  command still passes through the router and `ToolExecutor.execute`.
+- **No audio retention.** Detection consumes in-memory frames only; raw
+  audio is never written to disk or logged.
+- **Fail-soft at runtime.** A microphone or engine failure during
+  detection is reported and stops the app with a runtime error code
+  rather than silently continuing.
+- **No overlap with speech.** Because activation and transcription happen
+  outside the `SPEAKING` state, the microphone is not polled while Jarvis
+  is talking.
+- **Deterministic microphone ownership.** A detection *session* owns the
+  input stream only between `start()` and `stop()`. `app.py` calls
+  `start()` before waiting for the wake phrase and releases the session in
+  a `finally`, so the listener gets the microphone back **before** the
+  command is captured and the stream is free during
+  `PROCESSING`/`SPEAKING`. This is released on every path — detection
+  failure, engine error and Ctrl+C included — so two input streams are
+  never open at once and the device is never left held. The stream
+  factory is injectable, so this lifecycle is unit-tested with fakes.
+
+## Testing
+
+`tests/test_permissions.py` — levels, policy base levels, escalation and
+downgrade rules, malformed/raising rules, path boundary (inside,
+outside, forbidden, `..` traversal, symlink, non-string, other tool),
+console approval (safe/confirm/high-risk/blocked, EOF, Ctrl+C, errors),
+and that a granted approval echoes the request's confirmation token
+(Batch 9).
+
+`tests/test_tools.py` — `ToolSpec` validation, registry behaviour,
+`validate_mapping` (required/optional/unknown/type/tuple/non-mapping,
+messages do not echo values).
+
+`tests/test_executor.py` — every rejection path, safe execution,
+approval approved/denied/unavailable, `BLOCKED` non-overridable even
+with an approving provider, policy failure → blocked, handler error and
+timeout, runtime injection, and logging-privacy assertions.
+
+`tests/test_confirmation.py` (Batch 9) — `fingerprint_args` stability and
+sensitivity (key order, value/type change, non-JSON values, no raw
+value in the digest); `ConfirmationRegistry` issue/consume, wrong
+tool/arguments, unknown/empty/non-string token, single-use,
+expiry (and validity up to the deadline), pruning, revoke/revoke-all and
+invalid TTL; executor integration through the real `ToolExecutor` —
+bound approval runs exactly once, missing/wrong/forged/replayed/expired
+approvals never run the handler, declined/unavailable fail closed,
+`SAFE`/`BLOCKED` never prompt, tokens/arguments never logged;
+shutdown (`close()` denies execution, revokes pending tickets,
+idempotent) and interruption (Ctrl+C / provider exception fail closed);
+and no-bypass proof that the router alone never executes, a routed
+`CONFIRM` command still needs a bound approval, and wake-word activation
+is not approval.
+
+`tests/test_router.py` — exit-word recognition (case/whitespace
+insensitive, multi-word), empty/`None` → clarify, unknown → unsupported,
+responses do not echo input, the router never emits a `TOOL` request,
+frozen `CommandRequest`, and custom exit words/responses; exit words
+tolerate trailing punctuation and extra whitespace (Batch 7 regression);
+`ToolCommandRouter` phrase matching (case/apostrophe/punctuation
+insensitive, only registered tools matched, empty registry degrades to
+the placeholder, spoken text never copied into arguments, and superset
+phrases such as "what time is it in paris" do **not** match).
+
+`tests/test_builtin_tools.py` — the built-in tool set is exactly the
+approved five and all `SAFE`; zero-argument validators reject any key
+without echoing values; time/date formatting against an injected clock
+(AM/PM, midnight/noon, leading-zero, deterministic); system status
+reports only OS name + Python version and leaks no private detail; disk
+and battery formatting against injected readers (including unavailable
+readers and the non-Windows battery guard); and a guarded end-to-end run
+(phrase → router → `ToolExecutor` → handler) with no approval requested,
+unknown-tool and extra-argument rejection, and the invariant that the
+phrase map references only built-in tools.
+
+`tests/test_app.py` — startup and clean shutdown, Ctrl+C during
+startup and during transcription, `--help`, model-load/microphone/config
+failures and their exit codes, unsupported/clarify handling, tool
+requests routed through the executor, unknown tool via the empty
+registry, router failure handling, transcript-logging default-off and
+opt-in, speech integration (startup/replies spoken, input never echoed
+into speech, `--no-speech`, init-failure text-only fallback, runtime
+failure surviving the loop), listener/speaker cleanup on every exit
+path, and read-only-tool integration (off by default, `--tools` answers
+the time/date/system status/disk/battery end to end and speaks them,
+config-only enable, unrecognised phrases stay unsupported, text-only with
+`--no-speech`, safe reporting of a tool failure with no traceback, and
+coexistence with wake-word gating). Batch 7 adds: a detector that reports
+`available=False` falls back to manual activation and is released; a
+**real** `ToolExecutor` handler failure is reported as "tool execution
+failed" with no exception message or traceback; and a malformed tool
+result is shown as a neutral "Done." without echoing its contents.
+Batch 8 adds: end-to-end unknown-tool, malformed-argument and
+permission-denial paths never run a handler and never echo input; a
+router that returns a non-`CommandRequest` is handled without crashing;
+and disk/battery phrases only resolve when those tools are registered.
+
+`tests/test_listener.py` — transcript joining, manual-test shutdown
+paths, Whisper import/construction failure → `ModelLoadError`, safe and
+idempotent `close()`, and transcript content not logged unless opted in.
+
+`tests/test_speaker.py` — engine factory forwarding, init failure →
+`SpeechError`, settings application (and non-fatal failure), empty/`None`
+input ignored, whitespace stripping, long-text truncation, fail-soft
+runtime errors (no text in logs), `stop`, and idempotent `close`.
+
+`tests/test_states.py` — initial state and history, the full happy-path
+cycle, every legal shortcut, same-state no-op, `STOPPED` terminal,
+illegal transitions raise and leave state unchanged, `can_transition`,
+and the `on_change` callback.
+
+`tests/test_wakeword.py` — null fallback never activates; construction
+fails closed when the engine is missing or returns no model; score
+thresholding, highest-score selection, end-of-stream and timeout;
+configurable threshold; `start` resets the model; `close` releases the
+stream and is idempotent; detect-after-close is safe; the score helper;
+and the audio-session lifecycle — the stream opens on demand on `detect`,
+`stop()` releases it (idempotently), `start()` ends a previous session,
+`close()` releases an open session, a fresh stream opens after `stop()`,
+and stream factory/read failures raise `WakeWordUnavailableError`.
+
+The app tests additionally cover wake-word gating (activation only after
+detection), manual fallback when unavailable, wake-word never authorising
+a tool, runtime detector failure, invalid wake config, the state-machine
+integration (full cycle to `STOPPED`, cleanup from every state, and the
+invariant that the app is never `LISTENING` while `SPEAKING`), and the
+session hand-off (the session is released before listening, `start`/`stop`
+run once per activation, the session is released on detection failure and
+on Ctrl+C, and manual mode never opens a session).
+
+Run:
+
+```powershell
+.\.venv\Scripts\python -m unittest discover -s tests -v
+```
+
+The symlink case is skipped on Windows hosts without symlink
+privileges; `..` traversal is covered unconditionally.
+
+## How future tools plug in
+
+```python
+spec = ToolSpec(
+    name="open_file",
+    description="open a local file for the user",
+    permission=PermissionLevel.CONFIRM,
+    validate=lambda raw: validate_mapping(raw, required={"path": str}),
+    handler=open_file_handler,
+    timeout=10.0,
+)
+registry.register(spec)
+
+policy = PermissionPolicy(escalations=[
+    PathBoundaryRule(
+        tool_names=["open_file"],
+        arg_keys=["path"],
+        allowed_roots=[r"~\Documents"],
+        forbidden_roots=[r"C:\Windows"],
+    )
+])
+```
+
+The router/planner only ever calls `executor.execute(...)`; it never
+calls a handler directly.
+
+## Known limitations
+
+- Only five read-only tools exist (`get_current_time`,
+  `get_current_date`, `get_system_status`, `get_disk_space`,
+  `get_battery_status`); the registry ships **empty by default** and holds
+  those five only when `--tools` is given. No tool with a side effect
+  exists yet.
+- Battery status is Windows-only (read through `ctypes`); on other
+  platforms the tool reports that battery status is unavailable. The
+  battery and disk values reported on this machine were read live and are
+  read-only, but no automated test asserts against real hardware.
+- The router is not the AI planner: it recognises stop words plus the
+  fixed `DEFAULT_TOOL_INTENTS` phrase table and rejects everything else.
+  There is no natural-language or model-driven tool selection.
+- Timeout cannot stop a running worker thread (documented above).
+- Approval is console-only for now; the provider seam is ready for voice.
+  Approvals are bound, single-use and expiring (Batch 9), but a spoken
+  "yes" is **not** accepted as approval yet — voice cannot be
+  unambiguously attributed to one pending confirmation, so only an
+  explicit console confirmation using the console provider is supported.
+  The ticket deadline is the `ConfirmationRegistry` `ttl` (default 60 s).
+- `PathBoundaryRule` currently inspects top-level string arguments only;
+  nested argument structures are out of scope until a real tool needs
+  them.
+- Transcript logging is off by default but, when enabled, writes full
+  spoken commands to the log file; the log file is not encrypted.
+- Speech is synchronous and console-configured; interrupting a blocking
+  utterance from another thread depends on the engine (SAPI5 is COM/STA)
+  and is not guaranteed. Real-device speech has not been auto-tested
+  (no audio hardware in the test environment).
+- Wake-word detection is **not runnable** in this environment: the
+  `openwakeword` model files are not installed, so `--wake-word` falls
+  back to manual activation. Only the detection *logic* and the
+  audio-session *lifecycle* are unit-tested (with fakes: models, frame
+  readers, streams and clocks); real detection against a microphone has
+  not been verified. Enabling it requires downloading the models.

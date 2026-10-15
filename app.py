@@ -1,0 +1,515 @@
+"""Jarvis application entry point (composition root).
+
+Wires the pieces together and owns the process lifecycle and the
+explicit listening states:
+
+    IDLE --(wake word / manual)--> LISTENING --> PROCESSING --> SPEAKING
+      ^                                              |              |
+      +----------------------------------------------+--------------+
+                            (loop, until exit / Ctrl+C)
+
+    logging + config
+        -> wake-word detector (optional; when should we start listening?)
+        -> voice listener (speech -> text)
+        -> router (text -> structured, inert command)
+        -> tool executor (the ONLY path that may run a registered tool)
+        -> speaker (developer-authored replies only)
+        -> repeat, until exit / Ctrl+C
+
+The production tool registry is empty by default. Passing ``--tools``
+registers a small, fixed set of approved, deterministic, read-only tools
+(the time, the date, system status, disk space, battery status). No
+operating system, shell, browser, filesystem contents, email or other
+real action is registered, and nothing dangerous is ever available.
+
+Wake-word detection only decides *when* to start listening; it never
+authorises an action. Every command still passes through the router and
+``ToolExecutor.execute``. Wake-word mode is off by default and falls back
+to manual activation when no real engine is available.
+
+Privacy: transcripts are not logged unless ``--log-transcripts`` is
+given. Raw audio and handler return values are never logged.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from datetime import datetime
+from typing import Any, Callable, List, Optional
+
+from config import (
+    ConfigError,
+    SpeechConfig,
+    ToolsConfig,
+    VoiceConfig,
+    WakeConfig,
+)
+from core.builtin_tools import build_builtin_registry
+from core.executor import ExecutionResult, ExecutionStatus, ToolExecutor
+from core.log import setup_logging
+from core.permissions import ConsoleApprovalProvider, PermissionPolicy
+from core.router import (
+    DEFAULT_TOOL_INTENTS,
+    CommandKind,
+    CommandRequest,
+    Router,
+    ToolCommandRouter,
+)
+from core.tools import ToolRegistry
+from voice.listener import Listener, MicrophoneError, ModelLoadError
+from voice.speaker import Speaker, SpeechError
+from voice.states import ListeningState, ListeningStateMachine
+from voice.wakeword import OpenWakeWordDetector, WakeWordUnavailableError
+
+logger = logging.getLogger("jarvis.app")
+
+EXIT_OK = 0
+EXIT_RUNTIME_ERROR = 1
+EXIT_CONFIG_ERROR = 2
+
+_USAGE = (
+    "Usage: python app.py [options]\n"
+    "\n"
+    "Jarvis voice assistant (voice input; spoken replies when available).\n"
+    "\n"
+    "  --wake-word         Wait for the wake phrase before listening.\n"
+    "                      OFF by default; falls back to manual activation\n"
+    "                      if no wake-word engine is available.\n"
+    "  --tools             Enable the built-in read-only tools (for example\n"
+    "                      the time, the date, system status, disk space or\n"
+    "                      battery status).\n"
+    "                      OFF by default: the tool registry stays empty.\n"
+    "  --log-transcripts   Write full voice transcripts to the log file.\n"
+    "                      OFF by default: spoken commands may contain\n"
+    "                      sensitive information.\n"
+    "  --no-speech         Text-only mode: never produce speech output.\n"
+    "  -h, --help          Show this message and exit.\n"
+)
+
+
+@dataclass(frozen=True)
+class _Options:
+    wake_word: bool = False
+    tools: bool = False
+    log_transcripts: bool = False
+    speak: bool = True
+    show_help: bool = False
+
+
+def _parse_args(argv: List[str]) -> _Options:
+    return _Options(
+        wake_word="--wake-word" in argv,
+        tools="--tools" in argv,
+        log_transcripts="--log-transcripts" in argv,
+        speak="--no-speech" not in argv,
+        show_help=any(arg in ("-h", "--help") for arg in argv),
+    )
+
+
+def _startup_message(config: VoiceConfig) -> str:
+    message = "Jarvis is ready. Say 'exit', 'quit' or 'stop' to stop."
+    if config.log_transcripts:
+        message += (
+            " Transcript logging is ON: spoken commands will be written "
+            "to the log file."
+        )
+    return message
+
+
+def _build_registry(
+    tools_config: ToolsConfig,
+    clock: Optional[Callable[[], datetime]],
+) -> ToolRegistry:
+    """Return the registry of approved tools (empty unless enabled).
+
+    The registry never contains anything but the explicitly approved,
+    read-only built-ins, and only when tools have been opted into.
+    """
+    if not tools_config.enabled:
+        logger.info("Tools disabled; the tool registry is empty.")
+        return ToolRegistry()
+    return build_builtin_registry(clock)
+
+
+def _build_executor(registry: ToolRegistry) -> ToolExecutor:
+    """Build the guarded executor around a registry of approved tools."""
+    return ToolExecutor(
+        registry,
+        PermissionPolicy(),
+        ConsoleApprovalProvider(),
+        logger=logging.getLogger("jarvis.executor"),
+    )
+
+
+def _build_router(registry: ToolRegistry) -> Router:
+    """Build the deterministic router for the registered tools.
+
+    With an empty registry this degrades to the placeholder behaviour
+    (only exit words are recognised).
+    """
+    return ToolCommandRouter(
+        DEFAULT_TOOL_INTENTS, available_tools=registry.names()
+    )
+
+
+def _format_tool_reply(value: Any) -> Optional[str]:
+    """Extract developer-authored reply text from a tool's result.
+
+    Only a ``text`` entry in a mapping is used; arbitrary handler values
+    and raw transcripts are never shown or spoken.
+    """
+    if isinstance(value, Mapping):
+        text = value.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return None
+
+
+def _describe_result(result: ExecutionResult) -> str:
+    if result.status is ExecutionStatus.OK:
+        return _format_tool_reply(result.value) or "Done."
+    # Executor/validator messages are developer-authored and contain no
+    # raw arguments or handler return values.
+    return result.message or "I couldn't complete that."
+
+
+def _respond(
+    text: str,
+    output: Callable[[str], None],
+    speaker: Any,
+) -> None:
+    """Show a developer-authored reply and optionally speak it.
+
+    ``text`` is always developer-authored (never a raw transcript or
+    argument), so speaking it cannot leak sensitive input or bypass a
+    permission check. Speech is best-effort: a failure to speak must
+    never stop the console output or the loop.
+    """
+    output(text)
+    if speaker is None:
+        return
+    try:
+        speaker.speak(text)
+    except Exception:
+        logger.warning(
+            "Speech output failed; continuing in text-only mode."
+        )
+
+
+def _resolve(
+    command: CommandRequest,
+    executor: ToolExecutor,
+) -> "tuple[Optional[int], str]":
+    """Turn one command into ``(exit_code_or_None, reply_text)``.
+
+    The reply text is always developer-authored; it never contains a raw
+    transcript or argument. This function performs no I/O so the caller
+    can drive the state machine around printing and speaking.
+    """
+    if not isinstance(command, CommandRequest):
+        # A router that returns something other than a CommandRequest must
+        # fail closed, not crash the loop (a buggy future planner, etc.).
+        return None, "Sorry, I had a problem understanding that."
+    if command.kind is CommandKind.EXIT:
+        return EXIT_OK, "Goodbye."
+    if command.kind is CommandKind.CLARIFY:
+        return None, command.response or "Sorry, I didn't catch that."
+    if command.kind is CommandKind.UNSUPPORTED:
+        return None, command.response or "I can't do that yet."
+    if command.kind is CommandKind.TOOL:
+        # The only execution path: never call a handler directly.
+        result = executor.execute(command.tool_name, command.arguments)
+        return None, _describe_result(result)
+    return None, "Sorry, I didn't understand that."
+
+
+def _release_session(detector: Any) -> None:
+    """Ask a detector to hand the microphone back (best effort)."""
+    stop = getattr(detector, "stop", None)
+    if not callable(stop):
+        return
+    try:
+        stop()
+    except Exception:
+        logger.warning("Wake-word detector failed to release the session.")
+
+
+def _activate(
+    machine: ListeningStateMachine,
+    detector: Any,
+) -> None:
+    """Move IDLE -> LISTENING once the wake word (or manual mode) fires.
+
+    With no detector this is manual activation: we listen immediately,
+    preserving the original always-listening behaviour. With a detector we
+    stay in IDLE until it reports the wake phrase, then hand the micro-
+    phone back to the listener before capturing the command. The session
+    is released on every path (including failure and Ctrl+C) so the mic is
+    never held while Jarvis processes or speaks.
+    """
+    if detector is None:
+        machine.to(ListeningState.LISTENING)
+        return
+    start = getattr(detector, "start", None)
+    if callable(start):
+        start()
+    try:
+        while not detector.detect():
+            # A real detector blocks per call; loop until it activates.
+            pass
+    finally:
+        _release_session(detector)
+    machine.to(ListeningState.LISTENING)
+
+
+def _run_loop(
+    listener: Any,
+    router: Router,
+    executor: ToolExecutor,
+    output: Callable[[str], None],
+    speaker: Any,
+    machine: ListeningStateMachine,
+    detector: Any,
+) -> int:
+    while True:
+        try:
+            _activate(machine, detector)
+        except (WakeWordUnavailableError, MicrophoneError) as exc:
+            output(f"Wake-word detection failed: {exc}")
+            machine.close()
+            return EXIT_RUNTIME_ERROR
+
+        try:
+            text = listener.transcribe()
+        except MicrophoneError as exc:
+            output(f"Microphone error: {exc}")
+            machine.close()
+            return EXIT_RUNTIME_ERROR
+
+        machine.to(ListeningState.PROCESSING)
+
+        try:
+            command = router.route(text)
+        except Exception:
+            output("Sorry, I had a problem understanding that.")
+            machine.to(ListeningState.IDLE)
+            continue
+
+        outcome, reply = _resolve(command, executor)
+
+        if speaker is not None:
+            machine.to(ListeningState.SPEAKING)
+        _respond(reply, output, speaker)
+
+        if outcome is not None:
+            machine.close()
+            return outcome
+        machine.to(ListeningState.IDLE)
+
+
+def _close_resource(resource: Any) -> None:
+    if resource is None:
+        return
+    close = getattr(resource, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            logger.warning("Error while releasing a resource.")
+
+
+def _build_speaker(
+    speech_config: SpeechConfig,
+    speaker_factory: Callable[[SpeechConfig], Any],
+) -> Any:
+    """Return a speaker, or None for text-only if it cannot start."""
+    if not speech_config.enabled:
+        logger.info("Speech output disabled; running in text-only mode.")
+        return None
+    try:
+        return speaker_factory(speech_config)
+    except SpeechError as exc:
+        logger.warning(
+            "Speech engine unavailable (%s); running in text-only mode.",
+            exc,
+        )
+        return None
+    except Exception:
+        logger.warning(
+            "Speech engine failed to start; running in text-only mode."
+        )
+        return None
+
+
+def _build_wake_detector(
+    wake_config: WakeConfig,
+    factory: Callable[[WakeConfig], Any],
+    output: Callable[[str], None],
+) -> Any:
+    """Return a wake-word detector, or None for manual activation.
+
+    Wake-word mode is never silently assumed: when it is requested but no
+    real engine is available, that is reported explicitly and the app
+    falls back to the manual/always-listening flow.
+    """
+    if not wake_config.enabled:
+        logger.info("Wake-word mode disabled; using manual activation.")
+        return None
+    try:
+        detector = factory(wake_config)
+    except WakeWordUnavailableError as exc:
+        output(
+            f"Wake-word mode is unavailable ({exc}). "
+            "Using manual activation instead."
+        )
+        return None
+    except Exception:
+        output(
+            "Wake-word mode could not start. "
+            "Using manual activation instead."
+        )
+        return None
+    if detector is None:
+        output(
+            "Wake-word mode is unavailable. "
+            "Using manual activation instead."
+        )
+        return None
+    if getattr(detector, "available", True) is False:
+        # A detector that reports itself unavailable cannot detect, and
+        # its non-blocking detect() would spin the activation loop. Fall
+        # back to manual activation and release anything it already holds.
+        output(
+            "Wake-word mode is unavailable. "
+            "Using manual activation instead."
+        )
+        _close_resource(detector)
+        return None
+    logger.info("Wake-word mode enabled ('%s').", wake_config.phrase)
+    return detector
+
+
+def main(
+    argv: Optional[List[str]] = None,
+    *,
+    listener_factory: Callable[[VoiceConfig], Any] = Listener,
+    speaker_factory: Callable[[SpeechConfig], Any] = Speaker,
+    wake_word_factory: Callable[[WakeConfig], Any] = OpenWakeWordDetector,
+    router: Optional[Router] = None,
+    executor: Optional[ToolExecutor] = None,
+    config: Optional[VoiceConfig] = None,
+    speech_config: Optional[SpeechConfig] = None,
+    wake_config: Optional[WakeConfig] = None,
+    tools_config: Optional[ToolsConfig] = None,
+    clock: Optional[Callable[[], datetime]] = None,
+    state_machine: Optional[ListeningStateMachine] = None,
+    output: Callable[[str], None] = print,
+) -> int:
+    """Run Jarvis. Returns a process exit code.
+
+    Dependencies are injected so tests can replace the microphone,
+    Whisper model, router, executor, speaker engine and wake-word engine
+    with fakes, and can inspect the listening state machine.
+    """
+    argv = list(sys.argv[1:]) if argv is None else list(argv)
+    options = _parse_args(argv)
+
+    if options.show_help:
+        output(_USAGE)
+        return EXIT_OK
+
+    setup_logging()
+
+    try:
+        active_config = config if config is not None else VoiceConfig()
+        if options.log_transcripts:
+            active_config = replace(active_config, log_transcripts=True)
+        active_config.validate()
+
+        active_speech = (
+            speech_config if speech_config is not None else SpeechConfig()
+        )
+        if not options.speak:
+            active_speech = replace(active_speech, enabled=False)
+        active_speech.validate()
+
+        active_wake = (
+            wake_config if wake_config is not None else WakeConfig()
+        )
+        if options.wake_word:
+            active_wake = replace(active_wake, enabled=True)
+        active_wake.validate()
+
+        active_tools = (
+            tools_config if tools_config is not None else ToolsConfig()
+        )
+        if options.tools:
+            active_tools = replace(active_tools, enabled=True)
+        active_tools.validate()
+    except ConfigError as exc:
+        output(f"Invalid configuration: {exc}")
+        return EXIT_CONFIG_ERROR
+
+    registry = _build_registry(active_tools, clock)
+    if router is None:
+        router = _build_router(registry)
+    if executor is None:
+        executor = _build_executor(registry)
+
+    machine = state_machine or ListeningStateMachine()
+    speaker = _build_speaker(active_speech, speaker_factory)
+
+    listener = None
+    detector = None
+    try:
+        _respond(_startup_message(active_config), output, speaker)
+        detector = _build_wake_detector(
+            active_wake, wake_word_factory, output
+        )
+        if detector is not None:
+            output(
+                "Wake-word mode is ON. Say "
+                f"'{active_wake.phrase}' to start a command."
+            )
+
+        if active_tools.enabled:
+            output(
+                "Read-only tools are ON. You can ask for the time, the "
+                "date, the system status, disk space or battery status."
+            )
+
+        try:
+            listener = listener_factory(active_config)
+        except ModelLoadError as exc:
+            output(f"Could not start Jarvis: {exc}")
+            output(
+                "Check that faster-whisper is installed and that the "
+                "Whisper model is available (the first run needs a "
+                "network connection to download it)."
+            )
+            return EXIT_RUNTIME_ERROR
+        except MicrophoneError as exc:
+            output(f"Microphone error: {exc}")
+            return EXIT_RUNTIME_ERROR
+
+        return _run_loop(
+            listener, router, executor, output, speaker, machine, detector
+        )
+    except KeyboardInterrupt:
+        output("\nInterrupted. Shutting down.")
+        return EXIT_OK
+    finally:
+        machine.close()
+        _close_resource(detector)
+        _close_resource(listener)
+        _close_resource(speaker)
+        # Revokes any pending approval confirmation and refuses further
+        # tool execution: shutdown fails closed.
+        _close_resource(executor)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

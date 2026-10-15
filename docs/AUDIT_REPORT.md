@@ -1,0 +1,849 @@
+# Jarvis — Codebase Audit Report
+
+- **Audit date:** 2026-10-15
+- **Repository:** `F:\Projects\Jarvis`
+- **Branch:** `master` (no commits yet; all files staged/untracked)
+- **Scope:** full repository as it exists on disk
+- **Method:** static inspection of every source file, safe dynamic checks
+  (byte-compile, unit tests, dependency consistency). No hardware test
+  was executed. No production settings were changed.
+
+---
+
+## A. Executive Summary
+
+**Overall health: good for its maturity.** The project is a small,
+well-structured Phase 1 implementation of a voice-input pipeline. The
+code is clean, typed, documented, and covered by 65 passing unit tests.
+There are no critical defects and, importantly, **no dangerous
+execution primitives are present yet** (`os.system`, `subprocess`,
+`eval`, `exec`, shell construction, secrets in source were all searched
+and not found).
+
+**Maturity:** early. Only Phase 1 (reliable voice input) is implemented.
+`app.py`, `core/router.py`, `voice/speaker.py`, and
+`browser/controller.py` are empty placeholders. There is no unified
+entry point, no text-to-speech, no command routing, no AI planner, and
+no permission layer. The README and roadmap correctly describe this.
+
+**Most important findings**
+
+1. No critical or high-severity vulnerabilities in the current code
+   (no computer-control execution paths exist yet).
+2. The largest *future* risk is architectural: the roadmap schedules PC,
+   file, browser, and email control **before** the permission/safety
+   layer (Phase 8). Because Jarvis is intended to control the computer,
+   the permission/allowlist/confirmation layer must be designed and in
+   place **before** any tool executor is written.
+3. Reliability gap: Whisper model-load failures are not handled at the
+   entry point, so a missing model, network problem, or ctranslate2
+   error produces a raw traceback (`voice/test_voice.py:38`).
+4. Privacy: transcribed speech is written verbatim to a plaintext log
+   file (`voice/listener.py:277`, `logs/jarvis.log`). Spoken commands
+   may contain sensitive data.
+5. Reproducibility: `requirements.txt` pins almost nothing (only
+   `av<19`).
+
+No defects were invented; every item below cites file/lines and, where
+relevant, the reasoning or the check that supports it.
+
+---
+
+## B. Architecture Overview
+
+### Directory structure (as audited)
+
+```
+Jarvis/
+├── app.py                 # OPEN: 0 bytes, no entry point
+├── config.py              # VoiceConfig dataclass + validation
+├── requirements.txt       # 7 deps, largely unpinned
+├── README.md
+├── core/
+│   ├── __init__.py        # empty
+│   ├── log.py             # setup_logging() (working)
+│   └── router.py          # EMPTY (planned)
+├── voice/
+│   ├── __init__.py        # empty
+│   ├── detection.py       # pure audio logic (working)
+│   ├── listener.py        # mic -> detection -> Whisper (working)
+│   ├── speaker.py         # EMPTY (planned TTS)
+│   ├── diagnostics.py     # mic measurement mode (working)
+│   └── test_voice.py      # manual hardware test / de-facto entry point
+├── browser/
+│   ├── __init__.py        # empty
+│   └── controller.py      # EMPTY (planned)
+├── tests/                 # 4 unittest modules, 65 tests, all pass
+├── docs/
+│   ├── roadmap.md
+│   └── voice-pipeline.md
+└── logs/                  # runtime logs (gitignored)
+```
+
+### Main execution flow (only runnable path today)
+
+```
+python -m voice.test_voice
+        │
+        ▼
+test_voice.main()
+        ├─ --diagnose? ──► diagnostics.run_diagnostics()   (no Whisper)
+        │
+        ▼
+Listener()  ──► imports faster_whisper, downloads/loads Whisper model
+        │
+        ▼ loop
+Listener.transcribe()
+        ├─ ensure_calibrated() ──► calibrate()  (1 s ambient -> threshold)
+        └─ record_until_silence()
+              mic stream -> RMS per 100 ms block -> SpeechSegmenter
+              SPEECH_START -> record (with pre-roll) -> SPEECH_END/max/timeout
+              gate (should_transcribe) -> np.concatenate -> float32
+        └─ model.transcribe(...) -> join_segments() -> lower-cased text
+        │
+        ▼
+"exit" / "quit" / "stop" -> return 0 ; else loop
+```
+
+### Module responsibilities and dependencies
+
+- `config.py` — no internal dependencies. Single source of tunables.
+- `voice/detection.py` — pure functions/state machine; depends only on
+  `numpy`. Fully unit-testable.
+- `voice/diagnostics.py` — pure helpers + one hardware loop; depends on
+  `config`, `voice.detection`, `sounddevice`.
+- `voice/listener.py` — orchestration; depends on `config`,
+  `voice.detection`, `sounddevice`, `numpy`, and lazily imports
+  `faster_whisper`.
+- `core/log.py` — logging only.
+- `voice/test_voice.py` — thin CLI; depends on `config`, `core.log`,
+  `voice.listener`, `voice.diagnostics`.
+
+**Dependency direction is clean and acyclic.** No circular imports were
+found. Hardware I/O is isolated from pure logic, which is the correct
+and testable design.
+
+### Coupling / duplication / complexity notes
+
+- No tightly coupled components or circular imports.
+- No unnecessary complexity detected; functions are small and focused.
+- Minor duplication: the `sd.InputStream` configuration block is
+  duplicated in `Listener.calibrate` and
+  `Listener.record_until_silence` (`voice/listener.py:89-94` and
+  `169-174`); the final `+ 1e-9` timing tolerance literal is duplicated
+  in `voice/listener.py:206,215` instead of reusing `detection._EPSILON`.
+
+---
+
+## C. Findings
+
+Severity key: **Critical** (RCE / data loss / secret exposure),
+**High**, **Medium**, **Low**. No Critical/High defects were found in
+the present code.
+
+| ID | Sev | Category | Location | Summary |
+|---|---|---|---|---|
+| ARCH-001 | Medium | Architecture | `app.py` | No unified entry point |
+| ARCH-002 | Low | Architecture | `core/router.py`, `voice/speaker.py`, `browser/controller.py`, `app.py` | Empty placeholder modules committed |
+| ERR-001 | Medium | Reliability | `voice/test_voice.py:38` | Whisper model-load failure not handled |
+| ERR-002 | Low | Error handling | `voice/listener.py:267` | Overly broad `except Exception` |
+| SEC-001 | Medium | Privacy | `voice/listener.py:277`, `core/log.py:37-39` | Transcribed speech persisted to plaintext log |
+| SEC-002 | Low | Supply chain | `voice/listener.py:67-71` | Model downloaded from HF without revision pinning |
+| SEC-003 | Medium (future) | Safety | roadmap Phases 4-11 | No permission/allowlist/confirmation layer exists yet |
+| DEP-001 | Medium | Reproducibility | `requirements.txt` | Dependencies almost entirely unpinned |
+| QUAL-001 | Low | Lint | `voice/diagnostics.py:18` | Unused import `Optional` |
+| QUAL-002 | Low | Style | 7 files, 19 lines | Lines exceed 79 chars (PEP 8 E501) |
+| QUAL-003 | Low | Duplication | `voice/listener.py:206,215` | Magic `1e-9` instead of shared constant |
+| QUAL-004 | Low | Duplication | `voice/listener.py` | Duplicated `InputStream` setup |
+| QUAL-005 | Low | Edge case | `voice/listener.py:147-148` | Falsy `0` for optional args silently uses default |
+| QUAL-006 | Low | Validation | `config.py:43-46,48` | `block_size >= 1` not validated |
+| REL-001 | Low | Logging | `voice/listener.py:176-178` | Overflow warning can spam the log |
+| REL-002 | Low | Resource | `voice/listener.py:67-71` | Whisper model never released/closed |
+| PROC-001 | Low | Process | repo root | No linter/formatter/type-check/security config or CI |
+
+---
+
+### ARCH-001 — No unified application entry point (Medium)
+
+- **Evidence:** `app.py` is 0 bytes. The only runnable path is
+  `python -m voice.test_voice`, which the README labels a *manual
+  hardware test*.
+- **Impact:** There is no production composition root to add TTS,
+  routing, wake word, or the planner to. Likelihood: certain.
+- **Recommended fix:** Add a real `app.py` that wires logging +
+  `Listener` + a command loop + (future) router/speaker. Keep
+  `test_voice` as a hardware test only.
+- **Verification:** `python app.py` should start the assistant and exit
+  cleanly on `exit`/Ctrl+C.
+
+### ERR-001 — Whisper model-load failure unhandled (Medium)
+
+- **Evidence:** `voice/test_voice.py:37-44` catches only
+  `KeyboardInterrupt` and `MicrophoneError` around `Listener()`, but
+  `Listener.__init__` calls `WhisperModel(...)`
+  (`voice/listener.py:67-71`), which can raise on missing/corrupt model,
+  download/network failure, or ctranslate2 errors. None are caught.
+- **Impact:** A first-run (model not yet downloaded) or offline start
+  crashes with a traceback instead of a friendly message. Likelihood:
+  medium (first run / offline).
+- **Recommended fix:** Wrap model load in a dedicated exception (e.g.
+  `ModelLoadError`) inside `Listener`, and handle it in the entry point
+  with a clear message and non-zero exit.
+- **Verification:** Unit test that patches `WhisperModel` to raise and
+  asserts `main()` returns 1 without a traceback.
+
+### SEC-001 — Sensitive speech persisted to plaintext logs (Medium / privacy)
+
+- **Evidence:** `voice/listener.py:277` logs the full transcription
+  (`"YOU: %s"`), and `core/log.py:37-39` writes a
+  `logs/jarvis.log` file handler with no redaction or retention policy.
+- **Impact:** Spoken commands (which may include names, addresses,
+  credentials spoken aloud, private messages) accumulate unencrypted on
+  disk. Likelihood: certain once used.
+- **Recommended fix:** Make transcript logging opt-in, log only command
+  *class* at INFO, add a `--no-log-transcripts` option, and document a
+  retention policy. Consider a rotating handler.
+- **Verification:** Code review + confirm log file contains no transcript
+  when the option is off.
+
+### SEC-003 — No permission/safety layer before planned automation (Medium, preventive)
+
+- **Evidence:** Roadmap rows 4-11 add browser control, YouTube control,
+  PC/filesystem automation, documents, email, and shopping. Roadmap
+  row 8 (permission & safety) is sequenced *after* tool execution
+  phases 4-7.
+- **Impact:** If implemented in that order, AI-generated or
+  mis-transcribed commands could drive real actions (send email, delete
+  files, purchase) before any confirmation/allowlist exists. This is the
+  single most consequential risk to the project's stated purpose.
+- **Recommended fix:** Implement the permission layer **first**:
+  SAFE/CONFIRM/HIGH-RISK classification, explicit confirmation for
+  destructive or high-impact actions, an allowlist of apps/domains/paths,
+  argument validation, subprocess timeouts, and a hard emergency stop.
+  Never execute AI output directly.
+- **Verification:** Each tool must declare a permission level and have a
+  test proving CONFIRM/HIGH-RISK tools cannot run without approval.
+
+### DEP-001 — Unpinned dependencies (Medium)
+
+- **Evidence:** `requirements.txt` lists seven packages with no version
+  constraints except `av<19`. Installed versions (e.g. `numpy 2.5.3`,
+  `faster-whisper 1.2.1`, `sounddevice 0.5.6`) are not recorded.
+- **Impact:** Non-reproducible builds; a future incompatible release can
+  break the pipeline without any code change. Likelihood: medium over
+  time.
+- **Recommended fix:** Pin versions (or use a lock file / constraint
+  file) and record the tested set.
+- **Verification:** `pip install -r requirements.txt` in a fresh venv
+  yields the audited versions; `pip check` passes.
+
+### QUAL-001 — Unused import (Low)
+
+- **Evidence:** `voice/diagnostics.py:18` imports `Optional`, but no
+  other occurrence of `Optional` exists in that file (verified by
+  search).
+- **Fix:** Remove `Optional` from the import. **Verification:** flake8
+  F401 clean.
+
+### QUAL-002 — Lines over 79 characters (Low)
+
+- **Evidence:** 19 lines exceed 79 chars in `config.py` (59, 67, 78),
+  `core/log.py` (43), `voice/listener.py` (72, 84, 178),
+  `voice/diagnostics.py` (88, 92, 156, 158, 229, 247, 253), and tests.
+  All are ≤88 chars, so Black-compatible, but not strict PEP 8.
+- **Fix:** Adopt one formatter (Black + Ruff) and enforce it; do not
+  hand-wrap.
+
+### QUAL-003/004/005/006, REL-001/002 — Minor (Low)
+
+- `voice/listener.py:206,215`: use `detection._EPSILON` instead of a
+  duplicated `1e-9` literal.
+- `voice/listener.py:89-94` vs `169-174`: extract a small
+  `_open_input_stream()` helper.
+- `voice/listener.py:147-148`: `max_seconds or cfg.max_recording_seconds`
+  and `silence_duration or cfg.silence_seconds` replace an explicit `0`
+  with the default; use `if x is None` for clarity.
+- `config.py:44-46`: `block_size` can be `0` when `sample_rate` is very
+  small (e.g. `sample_rate=1, block_duration=0.01`); add
+  `block_size >= 1` to `validate()`.
+- `voice/listener.py:176-178`: log overflow once (or rate-limit) to
+  avoid flooding the log.
+- `voice/listener.py:67-71`: `WhisperModel` is never released; provide a
+  `close()` or context-manager for clean shutdown.
+
+### PROC-001 — No quality tooling or CI (Low)
+
+- **Evidence:** No `pyproject.toml`, `setup.cfg`, `tox.ini`,
+  `.flake8`, or CI workflow exists (verified by search).
+- **Impact:** Quality checks currently depend on the developer running
+  tests manually.
+- **Recommended fix:** Add `pyproject.toml` configuring Ruff (lint +
+  format) and mypy, plus a GitHub Actions workflow running
+  `compileall`, `unittest`, Ruff, mypy, and `bandit`.
+
+### ARCH-002 — Empty placeholder modules (Low)
+
+- **Evidence:** `app.py`, `core/router.py`, `voice/speaker.py`,
+  `browser/controller.py` are 0 bytes.
+- **Impact:** Harmless now; they are documentation-by-stub. Keep or
+  remove, but ensure they don't get imported while empty.
+- **Verification:** `git ls-files` shows zero-byte files; confirm no
+  imports target them yet.
+
+---
+
+## D. Security Assessment
+
+**Current attack surface (verified):**
+
+- Input: microphone audio → Whisper text. The transcribed string is
+  currently only compared against `("exit","quit","stop")`, lower-cased,
+  and logged. There is **no** command execution, no shell, no
+  filesystem write, no network client in application code.
+- Search results: no `os.system`, `subprocess`, `eval`, `exec`,
+  `pickle`, `shell=True`, `__import__`, and no `api_key`/`password`/
+  `token`/`secret` strings anywhere in the repository.
+- No `.env` file, no committed credentials.
+
+**Confirmed dangerous paths:** none.
+
+**Risks / attack surfaces to manage before they are built:**
+
+1. **Untrusted transcription → executor.** Whisper output is
+   attacker-influenceable (misheard audio, background speech, music).
+   It must be treated as untrusted and never passed to a shell/eval.
+2. **Third-party model download.** `faster-whisper` fetches weights
+   from Hugging Face on first run (`voice/listener.py:67-71`) with no
+   revision pinning or integrity check (SEC-002). Pin a revision and
+   document the source.
+3. **Privacy of transcripts** (SEC-001) — see finding.
+4. **Absent permission layer** (SEC-003) — the top structural security
+   priority.
+
+**Recommended safeguards (to be built with the automation phases):**
+
+- Explicit confirmation for destructive/high-impact actions.
+- Allowlist of supported commands, applications, domains, and file
+  roots; deny-by-default.
+- Argument validation and safe subprocess usage (`shell=False`, argument
+  lists, timeouts, controlled termination).
+- Restricted filesystem access where practical (no arbitrary paths).
+- Clear emergency-stop mechanism (hotkey + spoken stop + Ctrl+C).
+- Strict separation between AI *suggestions* and *authorized* actions.
+
+---
+
+## E. Test Results
+
+Checks run (all non-destructive, in the repo's `.venv`, Python 3.12.7):
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile all sources | `python -m compileall -q app.py config.py core voice browser tests` | **PASS** (`COMPILE_OK`) |
+| Unit tests | `python -m unittest discover -s tests -v` | **PASS** — 65 tests, 0 failures |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+
+Checks **skipped** and why:
+
+| Check | Reason skipped |
+|---|---|
+| Ruff / Flake8 | Not installed in `.venv`; installing packages was avoided per rules of engagement. |
+| mypy | Not installed. |
+| Bandit | Not installed. |
+| pip-audit / dependency CVE scan | Not installed; would require network. |
+| Manual hardware voice test (`python -m voice.test_voice`) | Requires a live microphone and uses real audio; not run to avoid affecting the user's system/audio. Documented by the author. |
+| `--diagnose` mode | Same as above (hardware). |
+
+Test-coverage observation: `Listener.calibrate` and
+`Listener.record_until_silence` are not automatically tested because
+they are hardware-bound; `sounddevice.InputStream` could be mocked to
+add coverage for the recording state machine and rejection gates
+(see P2-3).
+
+---
+
+## F. Improvement Roadmap
+
+Complexity: **S** ≈ <½ day, **M** ≈ 1-3 days, **L** ≈ >3 days.
+
+### P0 — Critical security / data-loss (preventive; none in current code)
+
+1. **Design and land the permission/safety layer before any tool
+   executor.** Benefit: prevents AI/mis-transcribed commands from
+   acting on the PC. Files: new `core/permissions.py`,
+   `core/tools.py`; gate every future tool. Complexity: **L**.
+   Acceptance: every action classified SAFE/CONFIRM/HIGH-RISK;
+   CONFIRM/HIGH-RISK require explicit approval; tests prove bypass is
+   impossible.
+2. **Treat transcripts as untrusted input.** Benefit: closes the
+   injection path before it exists. Files: `core/router.py` (future),
+   design doc. Complexity: **S** (policy) → enforced during P1 work.
+
+### P1 — Major correctness and reliability
+
+1. **Handle Whisper model-load failure gracefully** (ERR-001).
+   Files: `voice/listener.py`, `voice/test_voice.py`. Complexity: **S**.
+   Acceptance: friendly error + exit 1; unit test with a patched
+   failing `WhisperModel`.
+2. **Add a real `app.py` entry point** (ARCH-001). Files: `app.py`.
+   Complexity: **M**. Acceptance: `python app.py` runs the assistant
+   loop; `test_voice` remains a hardware test.
+3. **Transcript logging privacy controls** (SEC-001). Files:
+   `voice/listener.py`, `core/log.py`. Complexity: **S**. Acceptance:
+   transcripts omitted by default/behind a flag; changelog documented.
+4. **Pin dependencies** (DEP-001). Files: `requirements.txt` /
+   lock file. Complexity: **S**. Acceptance: fresh install reproduces
+   the audited versions; `pip check` passes.
+
+### P2 — Maintainability / architecture / tests
+
+1. **Tooling + CI** (PROC-001): `pyproject.toml` (Ruff, mypy),
+   `.github/workflows/ci.yml` running compileall, unittest, Ruff, mypy,
+   Bandit. Complexity: **M**. Acceptance: CI green on a clean checkout.
+2. **Cleanups** (QUAL-001…006, REL-001/002): remove unused import,
+   dedupe `InputStream`/`_EPSILON`, `is None` checks, `block_size >= 1`
+   validation, rate-limit overflow warning, `Listener.close()`.
+   Complexity: **S**. Acceptance: Ruff/mypy clean; tests still pass.
+3. **Mock-based tests for recording/calibration.** Files:
+   `tests/test_listener.py`. Complexity: **M**. Acceptance: state
+   machine and rejection gates covered without hardware.
+
+### P3 — Optional enhancements / capability
+
+1. Phase 2 non-blocking TTS (`voice/speaker.py`) — must not block or
+   interrupt command capture. Complexity: **M**.
+2. Phase 3 wake word (`openwakeword`) to avoid always-listening.
+   Complexity: **M**.
+3. Phases 4-12 (browser/YouTube/planner/tools/PC/docs/email/shopping) —
+   only after P0-1. Complexity: **L** each.
+
+---
+
+## G. Recommended Next Steps
+
+Based on the evidence above, the three highest-value improvements are:
+
+1. **Build the permission/safety layer before any automation** (P0-1 /
+   SEC-003). The project's entire purpose is to control the computer,
+   and today there is no guardrail at all. Doing this first is far
+   cheaper than retrofitting it after browser/file/email executors
+   exist.
+2. **Handle model-load failure and add a real `app.py` entry point**
+   (ERR-001 / ARCH-001). This is the difference between "a hardware
+   test" and "an assistant a user can actually start," and it removes
+   the only crash-with-traceback path in the current code.
+3. **Pin dependencies and add lint/type/security tooling + CI**
+   (DEP-001 / PROC-001). Cheap, prevents silent breakage, and the
+   configured Bandit/audit checks become the ongoing safety net for the
+   automation phases.
+
+**No changes to source code have been made.** This report is the only
+file created. Awaiting explicit approval before implementing any of the
+recommendations above.
+
+---
+
+## H. Batch 2 addendum — findings resolved
+
+Batch 2 (entry point + routing skeleton) was implemented after this
+audit. The following findings are now addressed; everything else in the
+table above is unchanged.
+
+| ID | Status | What changed |
+|---|---|---|
+| ARCH-001 | **Resolved** | Real `app.py` added: wires logging + config + listener + router + guarded executor, runs the loop, handles Ctrl+C/startup errors with defined exit codes. `voice/test_voice.py` remains a hardware test. |
+| ERR-001 | **Resolved** | `Listener.__init__` wraps import and construction of `WhisperModel` in `ModelLoadError`; `app.py` and `voice/test_voice.py` catch it and print an actionable message with exit code 1. |
+| SEC-001 | **Resolved (mitigated)** | Transcript content is no longer logged by default; the listener logs only the character count. Full transcripts require explicit opt-in via `--log-transcripts` / `VoiceConfig(log_transcripts=True)`, and the startup message warns when on. Log file is still plaintext (documented limitation). |
+| ARCH-002 | **Resolved (partial)** | `app.py` and `core/router.py` are now implemented (not empty). `voice/speaker.py` and `browser/controller.py` remain intentional placeholders. |
+| REL-002 | **Resolved** | `Listener.close()` releases the model reference; `app.py` always calls it in `finally`. Safe and idempotent. |
+| SEC-003 | **Unchanged / still open** | The permission/safety foundation exists (Batch 1) and `app.py` wires it, but no real tools are registered. This remains the top structural priority for the automation phases. |
+| DEP-001, PROC-001, QUAL-00x | **Unchanged** | Out of scope for Batch 2. |
+
+Batch 2 also introduced `core/router.py` (`CommandKind`,
+`CommandRequest`, `Router`, safe `PlaceholderRouter`) so transcribed text
+is turned into a structured, inert command and never into code/shell. The
+production registry stays empty, so `app.py` can only listen and stop.
+
+### Batch 2 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py` | **PASS** (`COMPILE_OK`) |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 192 tests, 0 failures, 1 skipped (symlink test) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+
+Ruff/mypy/Bandit were again **not run** (not installed; installing was
+avoided). The manual hardware voice test was not run.
+
+---
+
+## I. Batch 3 addendum — text-to-speech
+
+Batch 3 added `voice/speaker.py` (text-to-speech via `pyttsx3`, already
+pinned in `requirements.txt`; no new dependency) and wired it into
+`app.py` with dependency injection.
+
+No entry in the original findings table is a TTS defect; this batch
+implements roadmap Phase 2 while preserving the safety posture:
+
+- Only developer-authored replies are spoken; transcripts, tool
+  arguments and handler return values are never read aloud.
+- Speech is synchronous, so the loop does not record audio while
+  talking (feedback mitigation).
+- Initialisation failure → text-only fallback (`SpeechError`); runtime
+  failure → logged and speech disabled, loop continues.
+- `--no-speech` / `SpeechConfig(enabled=False)` forces text-only.
+- The engine is released on every exit path.
+
+### Batch 3 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py tests` | **PASS** (`COMPILE_OK`) |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 219 tests, 0 failures, 1 skipped (symlink test) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+
+Ruff/mypy/Bandit were **not run** (not installed). Speech on real audio
+hardware was **not** manually verified; the speaker is tested against a
+fake engine only.
+
+## J. Batch 4 addendum — listening states + wake-word hook
+
+Batch 4 added `voice/states.py` (explicit `ListeningState` machine) and
+`voice/wakeword.py` (`WakeWordDetector` interface, `OpenWakeWordDetector`,
+`NullWakeWordDetector`), plus `WakeConfig` and a `--wake-word` flag, and
+refactored `app.py` so the loop runs through the state machine.
+
+No entry in the original findings table is a defect of this batch; it
+implements the Phase 3 interface while preserving the safety posture:
+
+- The state machine validates transitions (`InvalidStateTransition`),
+  makes `STOPPED` terminal, and makes same-state moves idempotent, so the
+  loop cannot capture audio while speaking or act before activation.
+- Wake-word mode is off by default. The wake word only moves
+  `IDLE → LISTENING`; it never produces a command, chooses a tool, or
+  approves an action.
+- `openwakeword`'s pretrained models are **not installed** in this
+  environment, so requesting wake-word mode raises
+  `WakeWordUnavailableError`, the app prints a clear unavailable notice,
+  and falls back to manual activation. Detection is never faked.
+- Raw audio is never written to disk or logged; only in-memory frames are
+  used, and only developer-authored text is spoken.
+- Runtime detector/microphone failures are reported and stop the app with
+  a runtime exit code; resources are released on every exit path.
+
+### Batch 4 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py tests` | **PASS** (`COMPILE_OK`) |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 275 tests, 0 failures, 1 skipped (symlink test) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI usage | `python app.py --help` | **PASS** — prints usage incl. `--wake-word` (no hardware) |
+
+Ruff/mypy/Bandit were **not run** (not installed). Real wake-word
+detection was **not** verified: the engine's model files are absent, so
+the detector reports unavailable. Only the detection logic is unit-tested
+(with fake models, frame readers and clocks).
+
+## K. Batch 5 addendum — wake-word audio-session lifecycle
+
+Batch 5 addresses a lifecycle defect introduced with the Batch 4 wake-word
+integration. `OpenWakeWordDetector` lazily opened an input stream and
+held it until `close()`, so after the wake phrase fired the `Listener`
+opened a *second* input stream while the detector's stream remained open
+(and stayed open through `PROCESSING`/`SPEAKING`). That contradicted the
+"never capture audio while speaking" invariant and kept the device hot.
+
+Fix:
+
+- `voice/wakeword.py` gains a `stop()` on the `WakeWordDetector` interface
+  and a real session on `OpenWakeWordDetector`: `start()` resets the model
+  and frees any previous stream, the stream opens on demand, and `stop()`
+  releases it (idempotent, safe after `close()`). A `session_open`
+  property exposes the state and `stream_factory` is injectable so the
+  lifecycle is testable without hardware. `NullWakeWordDetector.stop()` is
+  a no-op.
+- `app.py` `_activate` releases the session in a `finally`, guaranteeing
+  the microphone is handed back to the listener before capture and is
+  free during processing/speaking — on every path, including detection
+  failure and Ctrl+C.
+
+No entry in the original findings table is affected. Security posture is
+unchanged: the wake word still only gates `IDLE → LISTENING`, carries no
+authority, and never bypasses the router or `ToolExecutor`.
+
+### Batch 5 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py tests` | **PASS** (`COMPILE_OK`) |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 288 tests, 0 failures, 1 skipped (symlink test) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI usage | `python app.py --help` | **PASS** — prints usage incl. `--wake-word` (no hardware) |
+
+Ruff/mypy/Bandit were **not run** (not installed). The audio-session
+lifecycle is verified with injected fake streams; real microphone capture
+and wake-word detection remain unverified (no model files, no audio
+hardware in this environment).
+
+## L. Batch 6 addendum — first read-only tools
+
+Batch 6 registers the first real tools and connects them end to end. It is
+the deliberate, minimal step that opens the (previously empty) production
+registry — but only with deterministic, local, read-only tools that need no
+approval. `core/builtin_tools.py` (new) declares:
+
+| Tool ID | Permission | Reads |
+|---|---|---|
+| `get_current_time` | `SAFE` | the local clock (injected) |
+| `get_current_date` | `SAFE` | the local clock (injected) |
+| `get_system_status` | `SAFE` | `platform.system()` + `sys.version_info` |
+
+Each handler returns a small structured mapping with a developer-authored
+`text` field; the app shows that text and speaks it. The tools take **no
+arguments** (a strict validator rejects any supplied key), read no files, no
+environment, no user/host name, and touch no network, shell or process.
+
+Routing:
+- `core/router.py` adds `IntentRule`, `DEFAULT_TOOL_INTENTS` (an explicit,
+  data-driven phrase → tool map) and `ToolCommandRouter` (a
+  `PlaceholderRouter` subclass). Matching is exact after normalisation
+  (case, apostrophes, edge punctuation, whitespace). It never executes,
+  never treats text as code/shell/paths/URLs, and never copies spoken text
+  into arguments.
+- A rule is honoured **only** when its tool is present in the registry, so
+  an empty registry degrades to the placeholder exactly.
+
+App wiring (`app.py`):
+- `ToolsConfig` (new) plus `--tools`, **off by default**: the registry
+  stays empty unless tools are explicitly enabled, preserving the
+  conservative default and full backward compatibility.
+- `_build_registry` / `_build_executor` / `_build_router` build the
+  registry, the guarded `ToolExecutor` and the deterministic router
+  consistently; a `clock` can be injected for deterministic tests.
+- Tool replies are formatted only from a structured `text` value; raw
+  values/transcripts are never shown or spoken. A tool error is reported
+  as the executor's developer-authored message, never a traceback.
+- Every invocation still passes through `ToolExecutor.execute`; SAFE tools
+  trigger no approval. Unknown tool IDs, extra arguments, and phrase
+  misses all fail safe.
+
+Security posture: no shell, arbitrary Python, filesystem, browser, network,
+process, or messaging capability is added. The wake word still carries no
+authority, speech still cannot trigger a tool, and the audio session is
+still released on every path.
+
+### Batch 6 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py tests` | **PASS** (`COMPILE_OK`) |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 333 tests, 0 failures, 1 skipped (symlink test) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI usage | `python app.py --help` | **PASS** — prints usage incl. `--tools` (no hardware) |
+
+No dependency was added or changed. Ruff/mypy/Bandit were **not run** (not
+installed). Tools are unit-tested with an injected clock; no real
+microphone, speaker or audio hardware is used.
+
+## M. Batch 7 addendum — audit and hardening
+
+Batch 7 is an audit-and-harden pass over the Batch 6 tool layer. No new
+user-facing feature was added; the scope was correctness, safety,
+backward compatibility and regression testing. Two defects were
+reproduced before fixing, and one minor consistency issue was corrected.
+
+### M.1 Findings
+
+| ID | Severity | Finding | Resolution |
+|---|---|---|---|
+| DEF-1 | Medium (functional) | Exit words ignored punctuation and extra whitespace. `PlaceholderRouter` compared `text.strip().lower()` against exit words, while tool phrases were normalised. Speech-to-text commonly emits `stop.` / `quit!`, so variants fell through to `UNSUPPORTED` and did not stop the loop. | Exit words are now matched through the same `_normalize_phrase` as tool phrases. `stop.`, `QUIT!`, `shut  down` all stop. Punctuation-only input (`?`) now normalises to empty and yields `CLARIFY`. |
+| DEF-2 | Medium/High (hang) | `_build_wake_detector` returned an `available=False` detector (e.g. `NullWakeWordDetector`) instead of falling back, contradicting its docstring. `_activate`'s `while not detector.detect()` then spun forever (tight loop / hang). Reachable via an injected `wake_word_factory`. | The helper now treats `available is False` as unavailable, prints the existing notice, releases the detector via `_close_resource`, and returns `None` so the app uses manual activation. |
+| DEF-3 | Low (docs/UX) | `app.py`'s module docstring still claimed the registry is "intentionally empty", and the startup tools hint listed only the time and date (not system status). | Docstring updated to describe the opt-in read-only set; hint now lists "the time, the date or the system status". |
+
+Verified as already-safe (no change needed): superset/extra-word/embedded
+phrases (`what time is it in paris`, `hey jarvis what is the date`) do
+**not** match a tool; `ToolsConfig().enabled` defaults to `False`;
+`ToolsConfig(enabled=1).validate()` raises `ConfigError`; malformed tool
+results without a `text` field render as a neutral "Done." and are never
+echoed.
+
+### M.2 Files changed
+
+| File | Change |
+|---|---|
+| `core/router.py` | Moved `_normalize_phrase` above `PlaceholderRouter`; normalise exit-word matching and emptiness; `_match_intent` hook now receives already-normalised text; `ToolCommandRouter._match_intent` uses it directly. |
+| `app.py` | `_build_wake_detector` falls back to manual when `available is False` and releases the detector; startup hint adds system status; module docstring corrected. |
+| `tests/test_router.py` | +4 tests: exit punctuation, exit extra whitespace, superset phrases don't match, punctuation-only → `CLARIFY`. |
+| `tests/test_builtin_tools.py` | +2 tests: default intents have no duplicate normalised phrases; every default phrase routes to its own tool. |
+| `tests/test_app.py` | +4 tests: unavailable-detector fallback (helper + end-to-end via `main`), real-`ToolExecutor` failure reported without leaking details, malformed result not echoed. |
+| `docs/safety.md`, `docs/AUDIT_REPORT.md`, `docs/roadmap.md`, `README.md` | Documented the normalisation, the fallback and the new regression coverage. |
+
+### M.3 Constraints preserved
+
+- Dependency injection is intact (`clock`, factories, router/executor
+  injection unchanged); `main`'s signature is unchanged.
+- No new tool, planner, cloud API, dependency or real system action was
+  added. Tools remain opt-in via `--tools` and off by default.
+- Every invocation still flows through `ToolExecutor.execute`; the router
+  still never executes and never copies spoken text into arguments.
+
+### M.4 Batch 7 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py tests` | **PASS** (`COMPILE_OK`) |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 343 tests, 0 failures, 1 skipped (symlink test) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI usage | `python app.py --help` | **PASS** — prints usage incl. `--tools` (no hardware) |
+
+Ruff/mypy/Bandit were **not run** (not installed). No real microphone,
+speaker or wake-word hardware was exercised; the wake fallback and tool
+error paths are covered with injected fakes and a real `ToolExecutor`.
+
+## N. Batch 8 addendum — integration verification + safe tools
+
+Batch 8 audited the complete path end to end —
+Router → `ToolRegistry` → `PermissionPolicy` → `ToolExecutor.execute` →
+handler → structured result → application response → speaker — fixed two
+fail-closed defects, and added two standard-library read-only tools.
+
+### N.1 Findings
+
+| ID | Severity | Finding | Resolution |
+|---|---|---|---|
+| DEF-4 | Medium (crash) | A router returning a non-`CommandRequest` (e.g. `None`) crashed the loop with an uncaught `AttributeError` in `_resolve`; the existing guard only covered a router that *raises*. | `_resolve` now rejects a non-`CommandRequest` with a safe developer-authored reply and the loop continues. |
+| DEF-5 | Medium (crash) | A non-string tool id crashed the guarded path: `ToolRegistry.get(["x"])` raised `TypeError: unhashable type`. | `ToolExecutor.execute` returns `UNKNOWN_TOOL` for any non-string id; `ToolRegistry.get`/`__contains__` tolerate non-string keys. |
+
+Verified as already-safe (no change needed): unknown (string) tool ids,
+missing/extra/malformed arguments, permission denial (handler never runs),
+handler exceptions (generic message, no traceback), malformed handler
+results (neutral "Done."), speech-disabled and speech-init-failure paths,
+wake gating without authorizing actions, and audio-session cleanup on
+every path.
+
+### N.2 Tools added (optional, standard library only)
+
+| Tool ID | Permission | Reads | Notes |
+|---|---|---|---|
+| `get_disk_space` | `SAFE` | aggregate free/total/used bytes of the home filesystem (`shutil.disk_usage`) | no file contents, no traversal |
+| `get_battery_status` | `SAFE` | power state (`ctypes` → `GetSystemPowerStatus`) | Windows only; `None`/unavailable elsewhere |
+
+Both take **no arguments**, are registered only via the existing opt-in
+(`--tools`), and run through the same `ToolExecutor` gate. No dependency
+was added or changed (no `psutil`; battery uses `ctypes`, disk uses
+`shutil`).
+
+### N.3 Files changed
+
+| File | Change |
+|---|---|
+| `app.py` | `_resolve` rejects a non-`CommandRequest`; `_USAGE`, module docstring and startup hint list disk/battery. |
+| `core/executor.py` | `execute` rejects a non-string tool id as `UNKNOWN_TOOL`. |
+| `core/tools.py` | `ToolRegistry.get`/`__contains__` tolerate non-string keys. |
+| `core/builtin_tools.py` | Added `get_disk_space` + `get_battery_status` with injectable readers; registry builders take optional `disk_reader`/`battery_reader`. |
+| `core/router.py` | Added unambiguous disk/battery phrases to `DEFAULT_TOOL_INTENTS`. |
+| `tests/test_executor.py`, `tests/test_builtin_tools.py`, `tests/test_app.py` | +19 tests. |
+| `README.md`, `docs/safety.md`, `docs/roadmap.md`, `docs/AUDIT_REPORT.md` | Documented the tools, the guards and the verification. |
+
+### N.4 Batch 8 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py tests` | **PASS** (`COMPILE_OK`) |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 362 tests, 0 failures, 1 skipped (symlink test) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI usage | `python app.py --help` | **PASS** — prints usage incl. `--tools` (no hardware) |
+
+**Software checks actually performed (no microphone/speaker):** the default
+readers were run on this Windows machine through the real `ToolExecutor`
+and end to end via `main(["--tools"], listener_fake)`;
+`get_disk_space` returned live capacity ("Disk space: 21.4 GB free of
+183.6 GB.") and `get_battery_status` returned a live reading
+("Battery is at 31% (on battery)."). Both are read-only.
+
+**Not performed:** the interactive `python app.py` run with the real
+Whisper model and microphone, real wake-word detection, and real speech
+playback (hardware/model required). Ruff/mypy/Bandit were **not run**
+(not installed).
+
+## O. Batch 9 addendum — confirmation workflow safety
+
+Batch 9 audited the `CONFIRM` / `HIGH_RISK` path. The base enforcement
+was already correct and was **not** weakened: `SAFE` runs with no
+approval, `CONFIRM`/`HIGH_RISK` require approval, `BLOCKED`
+short-circuits before any prompt and can never be overridden, and
+unknown tool ids / invalid arguments fail closed. The audit found that
+the approval itself carried no evidence of *what* had been approved.
+
+### O.1 Findings
+
+| ID | Severity | Finding | Resolution |
+|---|---|---|---|
+| DEF-6 | High | `ApprovalRequest`/`ApprovalResult` carried only `tool_name`/`summary`/`level`; the executor never bound an approval to the validated arguments, so a provider that replayed a cached approval — or approved a different tool/arguments — would have been honoured. | Mint a single-use `ConfirmationTicket` per invocation, bound to the tool id + argument digest + nonce; honour `APPROVED` only when the provider echoes the matching token. |
+| DEF-7 | Medium | No confirmation expiry and no shutdown invalidation. | Tickets carry a monotonic deadline (the `ConfirmationRegistry` `ttl`, default 60 s); `ToolExecutor.close()` revokes pending tickets and refuses further execution; `app.py` calls it in its shutdown `finally`. |
+| DEF-8 | Low | `_request_approval` caught only `Exception`; a `KeyboardInterrupt` raised by a provider escaped the guarded path. | `KeyboardInterrupt` during approval now fails closed (`UNAVAILABLE`). |
+
+### O.2 The confirmation workflow
+
+- **`core/confirmation.py` (new).** `fingerprint_args(args)` is a stable
+  SHA-256 digest of the validated arguments (key order independent, no
+  raw value in the digest). `ConfirmationRegistry` mints
+  `ConfirmationTicket`s (tool id, argument digest, level, nonce, issued/
+  expiry times) with an injectable clock and nonce source, and redeems
+  them via `consume(token, tool_name, args_fingerprint)` — success only
+  when the nonce is still pending, matches this tool id and digest, and
+  is unexpired; redemption removes the ticket (single-use). Expired
+  tickets are pruned on issue; `revoke`/`revoke_all` discard tickets.
+- **`core/permissions.py`.** `ApprovalRequest.token` and
+  `ApprovalResult.token` added (empty defaults keep positional
+  construction compatible); `ConsoleApprovalProvider` echoes the request
+  token on every result.
+- **`core/executor.py`.** `_request_approval(spec, args, level)` mints a
+  ticket, passes its nonce to the provider, and only honours `APPROVED`
+  when `consume` redeems the echoed token; otherwise it denies. A new
+  `close()` sets a closed flag and revokes pending tickets.
+- **`app.py`.** The shutdown `finally` releases the executor via the
+  existing `_close_resource` helper.
+
+Guarantees: an approval cannot authorise a different tool (tool-id
+mismatch), different arguments (digest mismatch), a replay (redeemed
+nonce is gone), a forgery (unminted nonce is unknown), or an expired
+invocation (deadline enforced at redemption). A spoken "yes" is **not**
+accepted as approval — voice cannot be attributed to one pending
+confirmation — so only the console provider is supported.
+
+### O.3 Files changed
+
+| File | Change |
+|---|---|
+| `core/confirmation.py` | **New** — `ConfirmationTicket`, `ConfirmationRegistry`, `fingerprint_args`. |
+| `core/permissions.py` | `ApprovalRequest`/`ApprovalResult` gained a `token`; `ConsoleApprovalProvider` echoes it. |
+| `core/executor.py` | Bound confirmation (mint/consume), `KeyboardInterrupt` fail-closed, `close()`; module/class docs updated. |
+| `app.py` | Executor released (and thus closed) on shutdown. |
+| `tests/test_confirmation.py` | **New** — +43 tests. |
+| `tests/test_permissions.py` | +2 token-echo tests. |
+| `tests/test_executor.py`, `tests/test_builtin_tools.py` | Approvals usable fakes echo the request token. |
+| `docs/safety.md`, `docs/roadmap.md`, `docs/AUDIT_REPORT.md` (this section) | Documentation. |
+
+### O.4 Batch 9 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py tests` | **PASS** (`COMPILE_OK`) |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 407 tests, 0 failures, 1 skipped (symlink test) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI usage | `python app.py --help` | **PASS** — prints usage (no hardware) |
+
+**Test delta:** Batch 8 had 362 tests; Batch 9 adds 45 (43 in
+`tests/test_confirmation.py`, 2 in `tests/test_permissions.py`) → 407.
+
+**Not weakened:** no permission classification changed; `SAFE` still
+runs without approval; `BLOCKED` still never prompts and never runs; the
+default registry is still empty and no side-effecting tool was added.
+
+**Not performed:** real hardware/end-to-end confirmation against the
+console (behavior is proven with injected fake providers, a fake clock
+and a deterministic nonce source instead). Ruff/mypy/Bandit were **not
+run** (not installed). No commit was made.
