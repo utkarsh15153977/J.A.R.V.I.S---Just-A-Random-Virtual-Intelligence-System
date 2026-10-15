@@ -137,10 +137,16 @@ class IntentRule:
 
     This is plain data, not branching logic: the router builds a lookup
     table from these rules and never inspects the meaning of a phrase.
+
+    ``arguments`` are **developer-authored and fixed**: they are copied
+    verbatim into the request for every matching phrase. The spoken text
+    is never copied into arguments, so speech can never choose a target,
+    a path or an option beyond the fixed set declared here.
     """
 
     tool_name: str
     phrases: FrozenSet[str]
+    arguments: Mapping[str, Any] = field(default_factory=dict)
 
 
 # The explicit command map: spoken phrase -> tool name. Kept small and
@@ -237,7 +243,8 @@ class ToolCommandRouter(PlaceholderRouter):
     :class:`PlaceholderRouter`. Matching is by exact normalised phrase,
     so unrecognised or ambiguous input falls back to the placeholder's
     unsupported/clarify behaviour. It never executes a tool and never
-    copies the spoken text into tool arguments.
+    copies the spoken text into tool arguments; a matched rule's fixed,
+    developer-authored ``arguments`` are used unchanged.
     """
 
     def __init__(
@@ -255,18 +262,22 @@ class ToolCommandRouter(PlaceholderRouter):
             unsupported_response=unsupported_response,
         )
         available = frozenset(available_tools)
-        intents: dict[str, str] = {}
+        intents: dict[str, tuple[str, Mapping[str, Any]]] = {}
         for rule in rules:
             if rule.tool_name not in available:
                 continue
+            arguments = dict(rule.arguments)
             for phrase in rule.phrases:
                 normalized = _normalize_phrase(phrase)
                 if normalized:
-                    intents[normalized] = rule.tool_name
+                    intents[normalized] = (rule.tool_name, dict(arguments))
         self._intents = intents
 
     def _match_intent(self, normalized: str) -> Optional[CommandRequest]:
-        tool_name = self._intents.get(normalized)
-        if tool_name is None:
+        entry = self._intents.get(normalized)
+        if entry is None:
             return None
-        return CommandRequest(CommandKind.TOOL, tool_name=tool_name)
+        tool_name, arguments = entry
+        return CommandRequest(
+            CommandKind.TOOL, tool_name=tool_name, arguments=dict(arguments)
+        )

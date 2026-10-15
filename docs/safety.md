@@ -128,7 +128,11 @@ default implementation:
 - EOF, Ctrl+C or prompt failure → `UNAVAILABLE` (fails closed).
 
 The prompt shows only the tool's developer-authored summary, never the
-raw arguments, so transcripts or secrets cannot leak through it. The
+raw arguments, so transcripts or secrets cannot leak through it. A tool
+may supply an optional `ToolSpec.describe(validated_args)` hook to make
+that summary name its exact target from trusted data (the application
+launcher does this); the executor falls back to the tool description if
+the hook is absent or misbehaves. The
 provider is injectable, so a voice-based provider can replace it later
 without touching the executor.
 
@@ -289,6 +293,58 @@ Safety properties:
 - **Deterministic mapping.** `DEFAULT_TOOL_INTENTS` is an explicit,
   finite table. Unrecognised or ambiguous input falls back to
   `UNSUPPORTED`/`CLARIFY`; there is no fuzzy or model-driven selection.
+
+## Application launching (Batch 10)
+
+`core/app_launcher.py` adds the first tool with a real side effect:
+opening one of a **small, trusted catalog** of Windows applications
+(Notepad, Calculator). It is deliberately the narrowest possible action
+tool.
+
+**Trusted targets only.** An `AppTarget` holds an identifier, a
+developer-authored display name, an **absolute** executable path and
+fixed arguments. The catalog (`default_catalog()`) builds each path from
+`%SystemRoot%\\System32` joined to a bare file name — never from speech,
+configuration or arguments. The catalog is empty on non-Windows
+platforms. A configured identifier is only accepted if it (a) matches the
+token pattern `[a-z][a-z0-9_-]{0,31}` and (b) exists in the catalog;
+anything else raises `AppLaunchConfigError` and exits with the
+configuration-error code, and **never** launches.
+
+**Doubly opt-in and empty by default.** Launching requires **both**
+`--tools` and `--allow-apps`, *and* at least one allowlisted identifier
+in `AppsConfig.allowed` (empty by default). `--allow-apps` without
+`--tools` prints a clear notice and stays disabled. The
+`launch_application` tool is registered only when tools are enabled, apps
+are enabled and the resolved allowlist is non-empty; otherwise no launch
+tool exists at all.
+
+**One `CONFIRM` tool, one validated identifier.** The tool takes exactly
+one argument, `app` (a string), and its validator rejects anything that
+is not an allowlisted identifier — so a path, a command line, a shell
+metacharacter or an extra key is `INVALID` before any prompt. The router's
+`APP_LAUNCH_INTENTS` carry **fixed** `arguments` (`{"app": "notepad"}` /
+`{"app": "calculator"}`); spoken text is never copied into them, so
+speech can only ever select one of the known identifiers.
+
+**Fresh, bound confirmation every time.** Because it is `CONFIRM`, each
+launch goes through the Batch 9 ticket workflow: a single-use ticket
+bound to this exact tool id and validated-argument digest, expiring after
+the registry TTL. Denied, interrupted, expired, replayed or borrowed
+approvals never launch. The prompt summary is `spec.describe(args)`, a
+**developer-authored** string that names the exact application from
+trusted catalog data (e.g. `launch Notepad`); raw arguments are never
+shown. When a tool has no `describe`, the executor falls back to its
+description.
+
+**Fire-and-forget process.** `SubprocessLauncher` calls
+`subprocess.Popen` with an **argument list** built only from the catalog
+target and `shell=False`; standard streams go to `DEVNULL`. There is no
+shell, no arbitrary arguments, no browser automation and no unrestricted
+process execution. The child is never waited for, tracked or terminated.
+
+**Tested with a fake launcher.** All automated tests inject a fake
+`ProcessLauncher`; no real application is ever started in a test.
 
 ## Speech output
 
@@ -540,17 +596,27 @@ calls a handler directly.
 
 ## Known limitations
 
-- Only five read-only tools exist (`get_current_time`,
+- Five read-only tools exist (`get_current_time`,
   `get_current_date`, `get_system_status`, `get_disk_space`,
   `get_battery_status`); the registry ships **empty by default** and holds
-  those five only when `--tools` is given. No tool with a side effect
-  exists yet.
+  those five only when `--tools` is given. The only side-effecting tool is
+  the application launcher (`launch_application`), which is additionally
+  gated behind `--allow-apps` plus a non-empty configured allowlist and
+  always requires a fresh confirmation.
+- The application catalog is tiny and Windows-only (Notepad and
+  Calculator), and its active allowlist is empty by default. Launching is
+  fire-and-forget: Jarvis does not know whether the app opened, and it
+  never waits for, tracks or closes it. `SubprocessLauncher` is not
+  exercised against a real process in automated tests (an injected fake
+  launcher is used instead); only its argv construction and `shell=False`
+  are asserted.
 - Battery status is Windows-only (read through `ctypes`); on other
   platforms the tool reports that battery status is unavailable. The
   battery and disk values reported on this machine were read live and are
   read-only, but no automated test asserts against real hardware.
 - The router is not the AI planner: it recognises stop words plus the
-  fixed `DEFAULT_TOOL_INTENTS` phrase table and rejects everything else.
+  fixed `DEFAULT_TOOL_INTENTS` and `APP_LAUNCH_INTENTS` phrase tables and
+  rejects everything else.
   There is no natural-language or model-driven tool selection.
 - Timeout cannot stop a running worker thread (documented above).
 - Approval is console-only for now; the provider seam is ready for voice.

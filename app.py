@@ -22,6 +22,13 @@ registers a small, fixed set of approved, deterministic, read-only tools
 operating system, shell, browser, filesystem contents, email or other
 real action is registered, and nothing dangerous is ever available.
 
+Application launching is a separate, doubly opt-in ability: it requires
+**both** ``--tools`` and ``--allow-apps``, and even then only identifiers
+explicitly selected in configuration may be launched. It is a single
+``CONFIRM`` tool whose executable comes only from a trusted catalog; it
+never accepts a path, command or argument from speech. Each launch needs
+a fresh confirmation. It is disabled by default.
+
 Wake-word detection only decides *when* to start listening; it never
 authorises an action. Every command still passes through the router and
 ``ToolExecutor.execute``. Wake-word mode is off by default and falls back
@@ -41,11 +48,21 @@ from datetime import datetime
 from typing import Any, Callable, List, Optional
 
 from config import (
+    AppsConfig,
     ConfigError,
     SpeechConfig,
     ToolsConfig,
     VoiceConfig,
     WakeConfig,
+)
+from core.app_launcher import (
+    APP_LAUNCH_INTENTS,
+    AppAllowlist,
+    AppLaunchConfigError,
+    ProcessLauncher,
+    SubprocessLauncher,
+    build_allowlist,
+    register_launch_tool,
 )
 from core.builtin_tools import build_builtin_registry
 from core.executor import ExecutionResult, ExecutionStatus, ToolExecutor
@@ -82,6 +99,10 @@ _USAGE = (
     "                      the time, the date, system status, disk space or\n"
     "                      battery status).\n"
     "                      OFF by default: the tool registry stays empty.\n"
+    "  --allow-apps        Enable launching allowlisted applications (for\n"
+    "                      example Notepad or Calculator). Requires --tools\n"
+    "                      AND an explicit allowlist in configuration; OFF\n"
+    "                      by default, and every launch needs confirmation.\n"
     "  --log-transcripts   Write full voice transcripts to the log file.\n"
     "                      OFF by default: spoken commands may contain\n"
     "                      sensitive information.\n"
@@ -94,6 +115,7 @@ _USAGE = (
 class _Options:
     wake_word: bool = False
     tools: bool = False
+    allow_apps: bool = False
     log_transcripts: bool = False
     speak: bool = True
     show_help: bool = False
@@ -103,6 +125,7 @@ def _parse_args(argv: List[str]) -> _Options:
     return _Options(
         wake_word="--wake-word" in argv,
         tools="--tools" in argv,
+        allow_apps="--allow-apps" in argv,
         log_transcripts="--log-transcripts" in argv,
         speak="--no-speech" not in argv,
         show_help=any(arg in ("-h", "--help") for arg in argv),
@@ -122,16 +145,37 @@ def _startup_message(config: VoiceConfig) -> str:
 def _build_registry(
     tools_config: ToolsConfig,
     clock: Optional[Callable[[], datetime]],
+    *,
+    apps_config: Optional[AppsConfig] = None,
+    allowlist: Optional[AppAllowlist] = None,
+    launcher: Optional[ProcessLauncher] = None,
 ) -> ToolRegistry:
     """Return the registry of approved tools (empty unless enabled).
 
     The registry never contains anything but the explicitly approved,
-    read-only built-ins, and only when tools have been opted into.
+    read-only built-ins, and only when tools have been opted into. The
+    ``launch_application`` tool is added only when apps are enabled too
+    **and** a non-empty allowlist was resolved; otherwise no launch tool
+    exists at all.
     """
     if not tools_config.enabled:
         logger.info("Tools disabled; the tool registry is empty.")
         return ToolRegistry()
-    return build_builtin_registry(clock)
+    registry = build_builtin_registry(clock)
+    if (
+        apps_config is not None
+        and apps_config.enabled
+        and allowlist is not None
+        and len(allowlist) > 0
+    ):
+        register_launch_tool(
+            registry,
+            allowlist=allowlist,
+            launcher=(
+                launcher if launcher is not None else SubprocessLauncher()
+            ),
+        )
+    return registry
 
 
 def _build_executor(registry: ToolRegistry) -> ToolExecutor:
@@ -148,10 +192,12 @@ def _build_router(registry: ToolRegistry) -> Router:
     """Build the deterministic router for the registered tools.
 
     With an empty registry this degrades to the placeholder behaviour
-    (only exit words are recognised).
+    (only exit words are recognised). Application-launch phrases are
+    inert unless the launch tool is actually registered.
     """
     return ToolCommandRouter(
-        DEFAULT_TOOL_INTENTS, available_tools=registry.names()
+        DEFAULT_TOOL_INTENTS + APP_LAUNCH_INTENTS,
+        available_tools=registry.names(),
     )
 
 
@@ -404,6 +450,9 @@ def main(
     speech_config: Optional[SpeechConfig] = None,
     wake_config: Optional[WakeConfig] = None,
     tools_config: Optional[ToolsConfig] = None,
+    apps_config: Optional[AppsConfig] = None,
+    app_launcher: Optional[ProcessLauncher] = None,
+    app_allowlist: Optional[AppAllowlist] = None,
     clock: Optional[Callable[[], datetime]] = None,
     state_machine: Optional[ListeningStateMachine] = None,
     output: Callable[[str], None] = print,
@@ -449,11 +498,40 @@ def main(
         if options.tools:
             active_tools = replace(active_tools, enabled=True)
         active_tools.validate()
+
+        active_apps = (
+            apps_config if apps_config is not None else AppsConfig()
+        )
+        if options.allow_apps and active_tools.enabled:
+            active_apps = replace(active_apps, enabled=True)
+        active_apps.validate()
     except ConfigError as exc:
         output(f"Invalid configuration: {exc}")
         return EXIT_CONFIG_ERROR
 
-    registry = _build_registry(active_tools, clock)
+    if options.allow_apps and not active_tools.enabled:
+        output(
+            "App launching requires --tools; keeping it disabled."
+        )
+
+    allowlist: Optional[AppAllowlist] = None
+    if active_tools.enabled and active_apps.enabled:
+        if app_allowlist is not None:
+            allowlist = app_allowlist
+        else:
+            try:
+                allowlist = build_allowlist(active_apps.allowed)
+            except AppLaunchConfigError as exc:
+                output(f"Invalid configuration: {exc}")
+                return EXIT_CONFIG_ERROR
+
+    registry = _build_registry(
+        active_tools,
+        clock,
+        apps_config=active_apps,
+        allowlist=allowlist,
+        launcher=app_launcher,
+    )
     if router is None:
         router = _build_router(registry)
     if executor is None:
@@ -479,6 +557,13 @@ def main(
             output(
                 "Read-only tools are ON. You can ask for the time, the "
                 "date, the system status, disk space or battery status."
+            )
+
+        if allowlist is not None and len(allowlist) > 0:
+            names = ", ".join(allowlist.display_names())
+            output(
+                f"Application launching is ON for {names}. "
+                "Each launch will ask for confirmation."
             )
 
         try:

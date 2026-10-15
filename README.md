@@ -6,16 +6,21 @@ input, understands natural language, and over time will operate the PC
 tool-based planner with a permission/safety layer.
 
 **Current status: voice input, spoken replies, explicit listening
-states, and a first set of safe read-only tools.** Voice input is
+states, a first set of safe read-only tools, and an opt-in, confirmed
+application launcher.** Voice input is
 reliable (Phase 1), text-to-speech output is wired in (Phase 2), the
 permission/safety foundation is in place, and the interaction loop runs
 through an explicit listening state machine with an optional wake-word
 activation hook. `app.py` wires the pipeline end to end. The tool
 registry ships **empty by default**; passing `--tools` registers a small
 set of deterministic, read-only tools (the time, the date, system
-status, disk space, battery status) that need no approval. Jarvis can
-listen, reply out loud, answer those questions, and stop — nothing more,
-and nothing dangerous. See
+status, disk space, battery status) that need no approval. Passing
+`--tools --allow-apps` additionally allows launching a small, fixed set
+of allowlisted applications (Notepad, Calculator) — each launch requires
+a fresh confirmation and the executable comes only from a trusted
+catalog. Jarvis can
+listen, reply out loud, answer those questions, optionally open one of
+those two apps, and stop — nothing more, and nothing dangerous. See
 [docs/roadmap.md](docs/roadmap.md) for the phase plan.
 
 ## Requirements
@@ -54,6 +59,11 @@ with PyAV 19.
 # time", "the date", "system status", "disk space" or "battery status".
 .\.venv\Scripts\python app.py --tools
 
+# Additionally allow launching allowlisted applications (OFF by default;
+# requires --tools AND an explicit allowlist in configuration). Say "open
+# notepad" or "open calculator"; each launch asks for confirmation.
+.\.venv\Scripts\python app.py --tools --allow-apps
+
 # Opt in to writing full voice transcripts to the log (OFF by default,
 # because spoken commands may contain sensitive information)
 .\.venv\Scripts\python app.py --log-transcripts
@@ -86,6 +96,19 @@ source (a spoken "yes" is not accepted yet). Startup problems exit with a
 clear message and a
 status code (`1` runtime/microphone/model error, `2` invalid
 configuration).
+
+Application launching is a separate, **doubly opt-in** ability that
+requires **both** `--tools` and `--allow-apps`, plus at least one
+identifier selected in `AppsConfig.allowed` (empty by default, so
+nothing is launchable out of the box). `--allow-apps` without `--tools`
+is reported and stays disabled. The only known applications are Notepad
+and Calculator; the executable target is always an absolute path under
+the real Windows system directory and is **never** taken from speech,
+configuration or tool arguments. The tool is a single `CONFIRM` action:
+every launch needs a fresh, single-use confirmation whose prompt names
+the exact application, and the process is started fire-and-forget with
+an argument list and `shell=False` (no shell, no arbitrary arguments,
+never waited for or terminated).
 
 By default Jarvis listens immediately (manual/always-listening mode).
 With `--wake-word` it waits in `IDLE` until a wake-word engine reports
@@ -132,7 +155,10 @@ wake-word model or network (threshold calculation, speech segmenter,
 config validation, transcript joining, routing and permission logic,
 speech output against a fake engine, listening-state transitions,
 wake-word detection logic against a fake model, the built-in read-only
-tools with injected clocks and disk/battery readers, clean-shutdown
+tools with injected clocks and disk/battery readers, the application
+launcher against a fake process launcher (approval binding, denial,
+expiry, replay, identifier validation and configuration errors), and
+clean-shutdown
 paths).
 The microphone test above is a manual hardware test; speech and
 wake-word detection on a real device are likewise manual and are **not**
@@ -160,6 +186,15 @@ the automated verification and must be checked by hand.
    ```powershell
    .\.venv\Scripts\python app.py --tools --no-speech
    ```
+3b. App launching opt-in (software + real action): requires both flags
+   and a configured allowlist; `--allow-apps` alone explains that it
+   needs `--tools`. Without an allowlist, launching stays disabled.
+   Actually opening an application is a real side effect and is
+   *(not run in CI)* — it is verified with a fake launcher in the unit
+   tests.
+   ```powershell
+   .\.venv\Scripts\python app.py --tools --allow-apps --no-speech
+   ```
 4. Current time/date (hardware, microphone): say "what time is it" and
    "what's the date"; expect the spoken/printed time and date.
 5. Speech output and `--no-speech` (hardware, speaker):
@@ -183,7 +218,7 @@ and battery status ("Battery is at N% (…).").
 ```
 Jarvis/
 ├── app.py                 # main entry point (composition root)
-├── config.py              # validated config (VoiceConfig, SpeechConfig, WakeConfig, ToolsConfig)
+├── config.py              # validated config (VoiceConfig, SpeechConfig, WakeConfig, ToolsConfig, AppsConfig)
 ├── requirements.txt
 ├── core/
 │   ├── log.py             # shared console + file logging
@@ -191,6 +226,7 @@ Jarvis/
 │   ├── confirmation.py    # bound, single-use confirmation tickets
 │   ├── tools.py           # ToolSpec, ToolRegistry, validation
 │   ├── builtin_tools.py   # read-only tools (time, date, status, disk, battery)
+│   ├── app_launcher.py    # allowlisted, confirmed application launcher
 │   ├── executor.py        # the single guarded execution gate
 │   └── router.py          # text -> structured command (no execution)
 ├── voice/

@@ -170,6 +170,45 @@ class ToolsConfig:
 
 
 @dataclass(frozen=True)
+class AppsConfig:
+    """Settings for the allowlisted application launcher.
+
+    Application launching is **off by default** and **requires**
+    :class:`ToolsConfig` to be enabled too. ``allowed`` selects a subset
+    of the trusted, built-in application catalog by identifier; it is
+    empty by default, so nothing can be launched. Identifiers are checked
+    against the catalog when the allowlist is built, and an unknown or
+    malformed identifier is a configuration error — never a launch.
+    """
+
+    enabled: bool = False
+    allowed: tuple[str, ...] = ()
+
+    def validate(self) -> "AppsConfig":
+        """Check every value and return self, or raise ConfigError."""
+        problems = []
+
+        if not isinstance(self.enabled, bool):
+            problems.append("enabled must be a boolean")
+        if not isinstance(self.allowed, tuple):
+            problems.append("allowed must be a tuple of identifiers")
+        else:
+            for item in self.allowed:
+                if not isinstance(item, str) or not item.strip():
+                    problems.append(
+                        "allowed entries must be non-empty strings"
+                    )
+                    break
+            if len(set(self.allowed)) != len(self.allowed):
+                problems.append("allowed entries must be unique")
+
+        if problems:
+            raise ConfigError("; ".join(problems))
+
+        return self
+
+
+@dataclass(frozen=True)
 class SpeechConfig:
     """Settings for the text-to-speech output pipeline."""
 

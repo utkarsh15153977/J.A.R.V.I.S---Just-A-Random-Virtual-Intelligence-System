@@ -2,6 +2,7 @@
 
 import unittest
 
+from core.app_launcher import APP_LAUNCH_INTENTS, TOOL_LAUNCH_APPLICATION
 from core.router import (
     CommandKind,
     CommandRequest,
@@ -224,6 +225,98 @@ class TestToolCommandRouter(unittest.TestCase):
         )
         self.assertIs(router.route("fire").kind, CommandKind.UNSUPPORTED)
         self.assertIs(router.route("time").kind, CommandKind.TOOL)
+
+    def test_fixed_rule_arguments_are_carried_into_the_request(self):
+        router = ToolCommandRouter(
+            (
+                IntentRule(
+                    "demo",
+                    frozenset({"do the thing"}),
+                    {"mode": "a"},
+                ),
+            ),
+            available_tools=("demo",),
+        )
+        command = router.route("do the thing")
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(dict(command.arguments), {"mode": "a"})
+
+    def test_spoken_text_is_never_copied_into_fixed_arguments(self):
+        router = ToolCommandRouter(
+            (
+                IntentRule(
+                    "demo",
+                    frozenset({"do the thing"}),
+                    {"key": "value"},
+                ),
+            ),
+            available_tools=("demo",),
+        )
+        # Extra spoken words do not route at all (exact match only)...
+        spoken = router.route("do the thing with secret hunter2")
+        self.assertIs(spoken.kind, CommandKind.UNSUPPORTED)
+        # ...and a matching phrase carries only the fixed arguments.
+        command = router.route("do the thing")
+        self.assertEqual(dict(command.arguments), {"key": "value"})
+        self.assertEqual(command.text, "")
+
+    def test_rule_arguments_are_copied_not_shared(self):
+        router = ToolCommandRouter(
+            (
+                IntentRule(
+                    "demo",
+                    frozenset({"go"}),
+                    {"key": "value"},
+                ),
+            ),
+            available_tools=("demo",),
+        )
+        first = router.route("go")
+        dict(first.arguments)["key"] = "changed"
+        second = router.route("go")
+        self.assertEqual(dict(second.arguments), {"key": "value"})
+
+
+class TestAppLaunchIntents(unittest.TestCase):
+    def _router(self):
+        return ToolCommandRouter(
+            APP_LAUNCH_INTENTS,
+            available_tools=(TOOL_LAUNCH_APPLICATION,),
+        )
+
+    def test_phrases_route_to_fixed_identifiers(self):
+        router = self._router()
+        for phrase in ("open notepad", "launch notepad", "start notepad"):
+            with self.subTest(phrase=phrase):
+                command = router.route(phrase)
+                self.assertIs(command.kind, CommandKind.TOOL)
+                self.assertEqual(command.tool_name, TOOL_LAUNCH_APPLICATION)
+                self.assertEqual(dict(command.arguments), {"app": "notepad"})
+        for phrase in ("open calculator", "launch calculator"):
+            with self.subTest(phrase=phrase):
+                command = router.route(phrase)
+                self.assertEqual(
+                    dict(command.arguments), {"app": "calculator"}
+                )
+
+    def test_launch_phrases_are_inert_without_the_tool(self):
+        router = ToolCommandRouter(APP_LAUNCH_INTENTS, available_tools=())
+        self.assertIs(
+            router.route("open notepad").kind, CommandKind.UNSUPPORTED
+        )
+
+    def test_arbitrary_application_names_do_not_route(self):
+        router = self._router()
+        for spoken in (
+            "open minesweeper",
+            "launch notepad with admin rights",
+            "start cmd.exe",
+        ):
+            with self.subTest(spoken=spoken):
+                self.assertIs(
+                    router.route(spoken).kind, CommandKind.UNSUPPORTED
+                )
+
 
 
 class TestCommandRequest(unittest.TestCase):

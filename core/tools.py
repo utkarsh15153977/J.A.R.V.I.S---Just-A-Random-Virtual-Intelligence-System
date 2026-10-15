@@ -36,6 +36,12 @@ class ToolSpec:
     normalised mapping (or raises :class:`ToolInputError`). ``handler``
     is called with the validated keyword arguments. ``timeout`` is the
     optional per-call wall-clock limit enforced by the executor.
+
+    ``describe`` is an optional hook that turns the *validated* arguments
+    into a developer-authored summary for the approval prompt (for
+    example, naming the exact target from trusted data). It must never
+    return raw user input; the executor falls back to ``description``
+    when it is absent or misbehaves.
     """
 
     name: str
@@ -44,6 +50,7 @@ class ToolSpec:
     validate: Callable[[Mapping[str, Any]], dict]
     handler: Callable[..., Any]
     timeout: Optional[float] = None
+    describe: Optional[Callable[[Mapping[str, Any]], str]] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -58,6 +65,8 @@ class ToolSpec:
             not isinstance(self.timeout, (int, float)) or self.timeout <= 0
         ):
             raise ValueError("timeout must be a positive number or None")
+        if self.describe is not None and not callable(self.describe):
+            raise TypeError("describe must be callable or None")
 
 
 class ToolRegistry:

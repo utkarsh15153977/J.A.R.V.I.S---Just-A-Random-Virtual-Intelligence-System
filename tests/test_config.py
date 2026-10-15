@@ -2,7 +2,7 @@
 
 import unittest
 
-from config import ConfigError, VoiceConfig, WakeConfig
+from config import AppsConfig, ConfigError, VoiceConfig, WakeConfig
 
 
 class TestVoiceConfigDefaults(unittest.TestCase):
@@ -105,6 +105,36 @@ class TestWakeConfig(unittest.TestCase):
             sample_rate=16000,
         )
         self.assertIs(config.validate(), config)
+
+
+class TestAppsConfig(unittest.TestCase):
+    def test_defaults_are_disabled_and_valid(self):
+        config = AppsConfig()
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.allowed, ())
+        self.assertIs(config.validate(), config)
+
+    def test_enabled_with_allowlist_is_valid(self):
+        config = AppsConfig(enabled=True, allowed=("notepad", "calculator"))
+        self.assertIs(config.validate(), config)
+
+    def test_non_bool_enabled_rejected(self):
+        with self.assertRaises(ConfigError):
+            AppsConfig(enabled="yes").validate()
+
+    def test_non_tuple_allowed_rejected(self):
+        with self.assertRaises(ConfigError):
+            AppsConfig(allowed=["notepad"]).validate()
+
+    def test_empty_or_non_string_allowed_rejected(self):
+        with self.assertRaises(ConfigError):
+            AppsConfig(allowed=("",)).validate()
+        with self.assertRaises(ConfigError):
+            AppsConfig(allowed=("notepad", 1)).validate()
+
+    def test_duplicate_allowed_rejected(self):
+        with self.assertRaises(ConfigError):
+            AppsConfig(allowed=("notepad", "notepad")).validate()
 
 
 if __name__ == "__main__":

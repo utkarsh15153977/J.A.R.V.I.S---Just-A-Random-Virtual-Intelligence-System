@@ -13,8 +13,8 @@ unless it was actually tested.
 | 4 — Browser foundation | Playwright controller, search, navigate | pending |
 | 5 — YouTube agent | search/play/pause/seek/volume tools | pending |
 | 6 — AI planner | structured tool calling, no if/else router | pending |
-| 7 — Tool registry | name, schema, permission, executor, verification | **in progress — read-only tools + integration verification (Batches 6–8)** |
-| 8 — Permission & safety | SAFE / CONFIRM / HIGH RISK enforcement | **in progress — foundation landed (Batch 1); bound, single-use confirmation (Batch 9)** |
+| 7 — Tool registry | name, schema, permission, executor, verification | **in progress — read-only tools + integration verification (Batches 6–8); first side-effecting tool, allowlisted app launcher (Batch 10)** |
+| 8 — Permission & safety | SAFE / CONFIRM / HIGH RISK enforcement | **in progress — foundation landed (Batch 1); bound, single-use confirmation (Batch 9); confirmed CONFIRM tool + per-action summary (Batch 10)** |
 | 9 — PC / filesystem agent | safe search and open of local files | pending |
 | 10 — Document agent | read/search/edit TXT, MD, DOCX, PDF | pending |
 | 11 — Email agent | search/read/draft/reply/send with confirmation | pending |
@@ -248,3 +248,38 @@ prompts, and no real side-effecting tool was added. Added 45 tests: 43
 in `tests/test_confirmation.py` plus two token-echo cases in
 `tests/test_permissions.py`. See section O of
 [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 10 note (allowlisted, confirmed application launching)
+
+Batch 10 adds the first tool with a real side effect — opening a local
+application — while keeping the blast radius as small as possible.
+
+- **New `core/app_launcher.py`.** A tiny, trusted, developer-authored
+  Windows catalog (Notepad, Calculator). `AppTarget` holds an absolute
+  executable path built from `%SystemRoot%\\System32` and fixed
+  arguments; `AppAllowlist` is the closed set of selectable identifiers;
+  `build_allowlist` resolves selected identifiers against the catalog and
+  raises `AppLaunchConfigError` for anything unknown or malformed.
+  `SubprocessLauncher` starts the process fire-and-forget with an
+  argument list and `shell=False`. The `launch_application` tool is
+  `PermissionLevel.CONFIRM` and takes exactly one validated, allowlisted
+  `app` identifier. `APP_LAUNCH_INTENTS` is the fixed phrase table.
+- **`core/tools.py`.** `ToolSpec` gains an optional `describe(args)`
+  hook; **`core/executor.py`** uses it (falling back to the description)
+  so the approval prompt can name the exact application from trusted
+  catalog data without ever showing raw arguments.
+- **`core/router.py`.** `IntentRule` gained developer-authored, fixed
+  `arguments`, which the router copies verbatim into the request; spoken
+  text is never copied into arguments.
+- **`config.py`.** `AppsConfig(enabled=False, allowed=())` — off by
+  default, empty allowlist, validated.
+- **`app.py`.** `--allow-apps` requires `--tools` (otherwise a clear
+  notice and disabled); the launch tool is registered only when tools and
+  apps are both enabled and the allowlist is non-empty; startup announces
+  the active applications.
+
+Disabled by default, doubly opt-in, confirmed per launch, and never
+sourced from speech. Added 51 tests (launcher module, executor
+approval-binding for the new tool, router fixed arguments, config, and
+composition-root integration), all using a fake process launcher. See
+section P of [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).

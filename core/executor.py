@@ -265,6 +265,27 @@ class ToolExecutor:
             return _BLOCKED_DECISION
         return decision
 
+    def _approval_summary(
+        self, spec: ToolSpec, args: Mapping[str, Any]
+    ) -> str:
+        """Developer-authored prompt text for one concrete action.
+
+        Uses ``spec.describe`` when the tool provides one (so an action
+        can name its exact, allowlisted target from trusted data), and
+        falls back to ``spec.description`` otherwise or if the hook
+        misbehaves. Raw argument values are never returned, so a
+        transcript or secret cannot leak through the prompt or its log.
+        """
+        describe = spec.describe
+        if callable(describe):
+            try:
+                text = describe(dict(args))
+            except Exception:
+                text = None
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+        return spec.description
+
     def _request_approval(
         self, spec: ToolSpec, args: Mapping[str, Any], level: PermissionLevel
     ) -> ApprovalOutcome:
@@ -285,7 +306,7 @@ class ToolExecutor:
         )
         request = ApprovalRequest(
             tool_name=spec.name,
-            summary=spec.description,
+            summary=self._approval_summary(spec, args),
             level=level,
             token=ticket.token,
         )

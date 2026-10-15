@@ -847,3 +847,63 @@ default registry is still empty and no side-effecting tool was added.
 console (behavior is proven with injected fake providers, a fake clock
 and a deterministic nonce source instead). Ruff/mypy/Bandit were **not
 run** (not installed). No commit was made.
+
+## P. Batch 10 addendum — allowlisted, confirmed application launching
+
+Batch 10 adds the **first tool with a real side effect**: opening one of
+a tiny, trusted catalog of Windows applications (Notepad, Calculator).
+The design goal was to make the blast radius as small as possible while
+proving the Batch 9 confirmation workflow on a real action. No existing
+classification or invariant was changed or weakened.
+
+### P.1 Security review
+
+| Risk | Mitigation |
+|---|---|
+| A path, command or executable taken from speech, configuration or arguments | Executables are resolved **only** from a trusted catalog built under `%SystemRoot%\\System32`; a configured identifier must match `[a-z][a-z0-9_-]{0,31}` and exist in the catalog. Non-Windows yields an empty catalog. |
+| Arbitrary launch arguments, shell commands or injection | `argv = [catalog executable, *fixed catalog arguments]` and `subprocess.Popen(argv, shell=False, ...)`; the validator accepts exactly one allowlisted `app` identifier and rejects every other key/shape as `INVALID` before any prompt. |
+| A launch without a fresh approval | `launch_application` is a single `CONFIRM` tool; every call goes through `ToolExecutor.execute` and needs a Batch 9 ticket bound to this tool id and argument digest. Denied, interrupted, expired, replayed or borrowed approvals never launch. |
+| The approval prompt leaking raw arguments or naming the wrong app | The prompt summary comes from `spec.describe(validated_args)` using the **trusted** catalog display name (`launch Notepad`); raw arguments are never shown. Falls back to the tool description if the hook is absent or misbehaves. |
+| Launching enabled by accident | Off by default. Requires **both** `--tools` and `--allow-apps`, plus a non-empty `AppsConfig.allowed`. `--allow-apps` without `--tools` prints a clear notice and stays disabled; the tool is not registered unless the resolved allowlist is non-empty. |
+| Unknown or malformed configured identifier | `build_allowlist` raises `AppLaunchConfigError`, which `app.py` turns into the configuration-error exit code — never a launch. |
+| Tests starting real applications | Every automated test injects a fake `ProcessLauncher`; no test starts a real process. |
+| Unrestricted process execution | Fire-and-forget only: no shell, no waiting, no tracking, no termination, no browser automation. |
+
+### P.2 Files changed
+
+| File | Change |
+|---|---|
+| `core/app_launcher.py` | **New** — `AppTarget`, `default_catalog`, `AppAllowlist`, `build_allowlist`, `ProcessLauncher`, `SubprocessLauncher`, `build_launch_spec`, `register_launch_tool`, `APP_LAUNCH_INTENTS`, `AppLaunchConfigError`. |
+| `core/tools.py` | `ToolSpec` gained an optional `describe(args)` hook. |
+| `core/executor.py` | `_approval_summary` uses `spec.describe` (falling back to the description) for the approval prompt. |
+| `core/router.py` | `IntentRule` gained fixed, developer-authored `arguments`, copied into the request; spoken text is never copied. |
+| `config.py` | Added `AppsConfig(enabled=False, allowed=())` with validation. |
+| `app.py` | `--allow-apps` (requires `--tools`); `_build_registry`/`_build_router` wiring; allowlist build with a clear configuration-error path; startup announcement; injection seams for tests. |
+| `tests/test_app_launcher.py` | **New** — +31 tests. |
+| `tests/test_router.py` | +6 tests (fixed rule arguments, app-launch intents, non-routing of arbitrary names). |
+| `tests/test_config.py` | +6 tests for `AppsConfig`. |
+| `tests/test_app.py` | +8 integration tests (disabled by default, `--allow-apps` requires `--tools`, config error, registry gating, approved/denied/end-to-end). |
+| `README.md`, `docs/safety.md`, `docs/roadmap.md`, `docs/AUDIT_REPORT.md` | Documentation. |
+
+### P.3 Batch 10 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py tests` | **PASS** (`COMPILE_OK`) |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 458 tests, 0 failures, 1 skipped (symlink test) |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI usage | `python app.py --help` | **PASS** — prints usage incl. `--tools` and `--allow-apps` (no hardware) |
+
+**Test delta:** Batch 9 had 407 tests; Batch 10 adds 51 (31 in
+`tests/test_app_launcher.py`, 6 in `tests/test_router.py`, 6 in
+`tests/test_config.py`, 8 in `tests/test_app.py`) `->` 458.
+
+**Not weakened:** no permission classification changed; `SAFE` still runs
+without approval; `BLOCKED` still never prompts and never runs; the
+default registry is still empty; the app catalog is Windows-only and its
+active allowlist is empty by default; and no path, command or target is
+ever taken from speech or arbitrary configuration.
+
+**Not performed:** launching a real application (tests use a fake
+launcher; only argv construction and `shell=False` are asserted).
+Ruff/mypy/Bandit were **not run** (not installed). No commit was made.

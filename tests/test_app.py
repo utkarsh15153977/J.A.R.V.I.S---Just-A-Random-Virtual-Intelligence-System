@@ -5,6 +5,7 @@ engine) are faked or injected, so these tests need no audio hardware and
 perform no real computer-control actions.
 """
 
+import os
 import unittest
 from datetime import datetime
 
@@ -16,7 +17,18 @@ from app import (
     _build_wake_detector,
     main,
 )
-from config import SpeechConfig, ToolsConfig, VoiceConfig, WakeConfig
+from config import (
+    AppsConfig,
+    SpeechConfig,
+    ToolsConfig,
+    VoiceConfig,
+    WakeConfig,
+)
+from core.app_launcher import (
+    TOOL_LAUNCH_APPLICATION,
+    AppTarget,
+    build_allowlist,
+)
 from core.builtin_tools import (
     BUILTIN_TOOL_NAMES,
     TOOL_GET_BATTERY_STATUS,
@@ -152,6 +164,28 @@ class RecordingExecutor:
     def execute(self, name, raw_args=None):
         self.calls.append((name, dict(raw_args or {})))
         return self.result
+
+
+class FakeLauncher:
+    """Stand-in for the application launcher; never starts a process."""
+
+    def __init__(self):
+        self.targets = []
+
+    def launch(self, target):
+        self.targets.append(target)
+
+
+class EchoApprovalProvider:
+    """Approval provider that echoes the request token (a correct one)."""
+
+    def __init__(self, outcome=ApprovalOutcome.APPROVED):
+        self.outcome = outcome
+        self.requests = []
+
+    def request(self, request):
+        self.requests.append(request)
+        return ApprovalResult(self.outcome, "ok", request.token)
 
 
 class ScriptedRouter:
@@ -1299,6 +1333,182 @@ class TestWakeSessionHandoff(unittest.TestCase):
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(detector.started, 0)
         self.assertEqual(detector.stopped, 0)
+
+
+class TestAppLaunchingIntegration(unittest.TestCase):
+    """Batch 10: composition-root wiring for application launching.
+
+    No real application is ever started: the launcher is a fake and all
+    approvals are injected fakes.
+    """
+
+    def _target(self, identifier, display):
+        return AppTarget(
+            identifier=identifier,
+            display_name=display,
+            executable=os.path.abspath(
+                os.path.join("fake", identifier + ".exe")
+            ),
+        )
+
+    def _allowlist(self):
+        catalog = {
+            "notepad": self._target("notepad", "Notepad"),
+            "calculator": self._target("calculator", "Calculator"),
+        }
+        return build_allowlist(
+            ("notepad", "calculator"), catalog=catalog
+        )
+
+    def _apps(self, allowed=("notepad", "calculator")):
+        return AppsConfig(enabled=True, allowed=allowed)
+
+    def _registry(self, allowlist, launcher, apps=None):
+        return _build_registry(
+            ToolsConfig(enabled=True),
+            None,
+            apps_config=apps if apps is not None else self._apps(),
+            allowlist=allowlist,
+            launcher=launcher,
+        )
+
+    def test_apps_disabled_by_default_even_with_tools(self):
+        code, output, _, _ = run_main(
+            texts=["open notepad", "exit"], argv=["--tools"]
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(
+            any("can't do that yet" in line for line in output)
+        )
+        self.assertFalse(
+            any("Application launching is ON" in line for line in output)
+        )
+
+    def test_allow_apps_without_tools_explains_and_stays_disabled(self):
+        code, output, _, _ = run_main(
+            texts=["open notepad", "exit"],
+            argv=["--allow-apps"],
+            apps_config=self._apps(),
+            app_allowlist=self._allowlist(),
+            app_launcher=FakeLauncher(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(
+            any("requires --tools" in line for line in output)
+        )
+        self.assertTrue(
+            any("can't do that yet" in line for line in output)
+        )
+
+    def test_unknown_identifier_is_a_config_error(self):
+        code, output, _, _ = run_main(
+            texts=[],
+            argv=["--tools", "--allow-apps"],
+            apps_config=self._apps(allowed=("minesweeper",)),
+        )
+        self.assertEqual(code, EXIT_CONFIG_ERROR)
+        self.assertTrue(
+            any("Invalid configuration" in line for line in output)
+        )
+
+    def test_registry_gains_launch_tool_only_when_enabled(self):
+        allowlist = self._allowlist()
+        launcher = FakeLauncher()
+        disabled = _build_registry(
+            ToolsConfig(enabled=True),
+            None,
+            apps_config=AppsConfig(),
+            allowlist=allowlist,
+            launcher=launcher,
+        )
+        self.assertNotIn(TOOL_LAUNCH_APPLICATION, disabled)
+
+        enabled = self._registry(allowlist, launcher)
+        self.assertIn(TOOL_LAUNCH_APPLICATION, enabled)
+
+        empty = self._registry(
+            build_allowlist((), catalog={}), launcher
+        )
+        self.assertNotIn(TOOL_LAUNCH_APPLICATION, empty)
+
+    def test_tools_disabled_never_registers_launch_tool(self):
+        allowlist = self._allowlist()
+        registry = _build_registry(
+            ToolsConfig(),
+            None,
+            apps_config=self._apps(),
+            allowlist=allowlist,
+            launcher=FakeLauncher(),
+        )
+        self.assertEqual(len(registry), 0)
+
+    def test_approved_launch_end_to_end(self):
+        allowlist = self._allowlist()
+        launcher = FakeLauncher()
+        registry = self._registry(allowlist, launcher)
+        executor = ToolExecutor(
+            registry, PermissionPolicy(), EchoApprovalProvider()
+        )
+        code, output, _, speaker = run_main(
+            texts=["open notepad", "exit"],
+            argv=["--tools", "--allow-apps"],
+            apps_config=self._apps(),
+            app_allowlist=allowlist,
+            app_launcher=launcher,
+            executor=executor,
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(len(launcher.targets), 1)
+        self.assertEqual(launcher.targets[0].display_name, "Notepad")
+        self.assertTrue(
+            any("Opening Notepad." in line for line in output)
+        )
+        self.assertTrue(
+            any("Application launching is ON" in line for line in output)
+        )
+        self.assertTrue(
+            any("Opening Notepad." in s for s in speaker.spoken)
+        )
+
+    def test_config_enabled_apps_work_without_the_flag(self):
+        allowlist = self._allowlist()
+        launcher = FakeLauncher()
+        registry = self._registry(allowlist, launcher)
+        executor = ToolExecutor(
+            registry, PermissionPolicy(), EchoApprovalProvider()
+        )
+        code, output, _, _ = run_main(
+            texts=["open calculator", "exit"],
+            argv=["--tools"],
+            apps_config=self._apps(),
+            app_allowlist=allowlist,
+            app_launcher=launcher,
+            executor=executor,
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(len(launcher.targets), 1)
+        self.assertEqual(launcher.targets[0].display_name, "Calculator")
+
+    def test_denied_launch_end_to_end_never_launches(self):
+        allowlist = self._allowlist()
+        launcher = FakeLauncher()
+        registry = self._registry(allowlist, launcher)
+        executor = ToolExecutor(
+            registry,
+            PermissionPolicy(),
+            EchoApprovalProvider(ApprovalOutcome.DENIED),
+        )
+        code, output, _, _ = run_main(
+            texts=["open notepad", "exit"],
+            argv=["--tools", "--allow-apps"],
+            apps_config=self._apps(),
+            app_allowlist=allowlist,
+            app_launcher=launcher,
+            executor=executor,
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(launcher.targets, [])
+        self.assertTrue(any("approval denied" in line for line in output))
 
 
 if __name__ == "__main__":
