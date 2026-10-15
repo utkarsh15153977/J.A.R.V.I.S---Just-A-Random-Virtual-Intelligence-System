@@ -9,12 +9,12 @@ unless it was actually tested.
 | 0 — Project foundation | environment, structure, config, logging | partial (config + logging done in Phase 1) |
 | 1 — Reliable voice input | calibration, detection, recording, Whisper | **complete** |
 | 2 — Text-to-speech | pyttsx3 voice output, fail-soft, text-only fallback | **complete (Batch 3)** |
-| 3 — Wake word | openwakeword "Hey Jarvis", command mode | **in progress — interface + fallback (Batch 4), deterministic audio-session lifecycle (Batch 5) and optional local speaker verification (Batch 12); real engine unavailable (models not installed)** |
+| 3 — Wake word | openwakeword "Hey Jarvis", command mode | **in progress — interface + fallback (Batch 4), deterministic audio-session lifecycle (Batch 5), optional local speaker verification (Batch 12) and fail-closed verification startup (Batch 13); real engine unavailable (models not installed)** |
 | 4 — Browser foundation | Playwright controller, search, navigate | pending |
 | 5 — YouTube agent | search/play/pause/seek/volume tools | pending |
 | 6 — AI planner | structured tool calling, no if/else router | pending |
 | 7 — Tool registry | name, schema, permission, executor, verification | **in progress — read-only tools + integration verification (Batches 6–8); first side-effecting tool, allowlisted app launcher (Batch 10)** |
-| 8 — Permission & safety | SAFE / CONFIRM / HIGH RISK enforcement | **in progress — foundation landed (Batch 1); bound, single-use confirmation (Batch 9); confirmed CONFIRM tool + per-action summary (Batch 10); speaker verification kept separate from permissions (Batch 12)** |
+| 8 — Permission & safety | SAFE / CONFIRM / HIGH RISK enforcement | **in progress — foundation landed (Batch 1); bound, single-use confirmation (Batch 9); confirmed CONFIRM tool + per-action summary (Batch 10); speaker verification kept separate from permissions (Batch 12); explicit activation modes, no silent downgrade (Batch 13)** |
 | 9 — PC / filesystem agent | safe search and open of local files | pending |
 | 10 — Document agent | read/search/edit TXT, MD, DOCX, PDF | pending |
 | 11 — Email agent | search/read/draft/reply/send with confirmation | pending |
@@ -334,8 +334,9 @@ never becomes an authority of its own.
   samples, aborts on backend error, enforces the minimum-sample gate).
 - **New `voice/speaker_backend.py`.** Optional SpeechBrain ECAPA adapter
   (CPU, weights downloaded once on first use, never at startup). **Not a
-  core dependency**; if it or torch is missing the app falls back to
-  manual activation, honestly.
+  core dependency**; if it or torch is missing the app reported the
+  problem and dropped to manual activation — Batch 13 later made that a
+  refusal to start instead.
 - **`voice/wakeword.py`.** The detector keeps a rolling ~2 s buffer of
   the just-fired wake audio and exposes it as `trigger_audio`, cleared on
   `start()`/`close()`. Verification embeds this same-session audio, so no
@@ -345,8 +346,9 @@ never becomes an authority of its own.
 - **`app.py`.** New flags `--verify-speaker`, `--enroll-speaker`,
   `--reset-speaker`, `--speaker-status`. Verification gates
   `IDLE → LISTENING` only; a rejected/no-match activation keeps the loop
-  in `IDLE`. Enabled-but-unavailable (no backend or no enrolment) prints
-  a clear notice, disables wake-word activation and falls back to manual.
+  in `IDLE`. Enabled-but-unavailable (no backend or no enrolment) printed
+  a clear notice and fell back to manual activation; Batch 13 replaced
+  that fallback with a refusal to start.
   The verifier is closed on every exit path.
 
 Separation is preserved: wake word, speaker verification and the
@@ -359,3 +361,58 @@ Added 80 tests across `tests/test_speaker_verification.py`,
 `tests/test_enrollment.py`, `tests/test_speaker_backend.py`,
 `tests/test_wakeword.py`, `tests/test_app.py` and `tests/test_config.py`.
 See section R of [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 13 note (fail-closed verification startup + real-backend validation)
+
+Batch 13 adds no new capability. It closes a class of *silent downgrades*
+in the speaker-verification feature and validates the optional backend
+for real on Windows, then documents what that validation did and did not
+prove.
+
+- **Explicit activation modes (`app.py`).** The loop now runs in exactly
+  one of `MANUAL`, `WAKE` or `WAKE_VERIFIED`, resolved once at startup by
+  `_resolve_activation_mode` and enforced at activation by `_activate`.
+  Previously an enabled-but-unavailable verifier quietly produced manual
+  activation, so a user who asked for a stronger gate silently got the
+  weakest one — and a wake word that failed to load did the same.
+- **No silent downgrade.** `--verify-speaker` without `--wake-word` is a
+  configuration error (exit `2`, reported before any one-shot command or
+  heavy object is created). A missing wake engine, enrolment or embedding
+  model now prints the failing gate and **exits with code `1`**; the model
+  and the microphone listener are never constructed on those paths
+  (asserted by tests), and a loaded model is closed again on every
+  failure.
+- **Validation before download.** The stored enrolment is read *before*
+  the embedding model is loaded, and a profile recorded under a different
+  model id is rejected — so a missing profile costs no download and an
+  incompatible one cannot be silently ignored.
+- **Windows fetch fix (`voice/speaker_backend.py`).** SpeechBrain's
+  default `SYMLINK` strategy raises `WinError 1314` for a normal Windows
+  account. The adapter requests `LocalStrategy.COPY_SKIP_CACHE` (copy, no
+  symlink) and retries without the keyword on `TypeError`, for releases
+  that predate the option.
+- **Config alignment.** `SpeakerVerifier` now derives its
+  `min_sample_seconds` (and `min_rms`) defaults from
+  `SpeakerVerificationConfig`, so the documented `0.6` s minimum is the
+  value actually enforced.
+- **Real-backend validation (`scripts/validate_speaker_backend.py`).** A
+  new manual command (12 steps + cleanup, exit `0` pass / `1` fail or
+  refusal / `3` blocked) loads the real model, embeds, enrols (through the
+  real `enroll_speaker` with an injected capture), reloads, verifies a
+  same-speaker sample, exercises the error paths (wrong sample rate,
+  unusable audio, missing model files, unknown backend, corrupt
+  enrolment) and deletes its temporary data. On this machine (Windows,
+  SpeechBrain 1.1.2, torch 2.14.1+cpu) all **13 steps passed**, with a
+  same-speaker cosine score of `0.929` against the `0.5` threshold.
+  Enrolment/verification with a live microphone and a human voice is
+  still **not** verified.
+- **Tests.** +21 tests (548 → 569): the fail-closed startup matrix, the
+  `_activate` mode/gate mismatches, the admin-command exit codes, the
+  fetch-strategy selection and retry, and the verifier/config default
+  alignment. `ruff check .` stays clean, and CI's `compileall` now
+  includes `scripts/`.
+
+Security posture: unchanged in kind, strictly stronger in behaviour.
+Verification still grants no authority — it only decides whether to
+listen — and it remains speaker matching, not liveness. See section S of
+[docs/AUDIT_REPORT.md](AUDIT_REPORT.md).

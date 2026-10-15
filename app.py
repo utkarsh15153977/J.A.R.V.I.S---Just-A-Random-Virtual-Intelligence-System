@@ -31,16 +31,27 @@ a fresh confirmation. It is disabled by default.
 
 Wake-word detection only decides *when* to start listening; it never
 authorises an action. Every command still passes through the router and
-``ToolExecutor.execute``. Wake-word mode is off by default and falls back
-to manual activation when no real engine is available.
+``ToolExecutor.execute``. Wake-word mode is off by default; when no real
+engine is available it reports that and falls back to manual activation.
 
 Speaker verification (``--verify-speaker``) is an optional extra gate on
 voice-triggered activation: when enabled, the captured voice must match an
 explicitly enrolled speaker (``--enroll-speaker``) before a command
 session starts. It also never authorises an action; a match only allows
 listening, and every command still passes through the router and the
-guarded executor. It is off by default, and manual activation remains
-available when it is disabled or unavailable.
+guarded executor.
+
+Activation is always one of three explicit modes, decided at startup:
+
+    MANUAL          no wake word, no verification: always-listen (default)
+    WAKE            ``--wake-word`` only: wait for the phrase first
+    WAKE_VERIFIED   ``--verify-speaker`` + ``--wake-word``: both must pass
+
+``--verify-speaker`` fails closed. It requires ``--wake-word``, a stored
+enrolment, a working wake-word engine and a working embedding model; if
+any of them is missing the process exits with a status code instead of
+downgrading to a mode the user did not ask for. Manual activation is
+never substituted for a requested, unavailable gate.
 
 Privacy: transcripts are not logged unless ``--log-transcripts`` is
 given. Raw audio and handler return values are never logged. Enrolment
@@ -54,6 +65,7 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum
 from typing import Any, Callable, List, Optional
 
 from config import (
@@ -115,12 +127,14 @@ _USAGE = (
     "\n"
     "  --wake-word         Wait for the wake phrase before listening.\n"
     "                      OFF by default; falls back to manual activation\n"
-    "                      if no wake-word engine is available.\n"
+    "                      if no wake-word engine is available, except\n"
+    "                      when --verify-speaker is also given.\n"
     "  --verify-speaker    Accept a voice-triggered activation only when\n"
     "                      the captured voice matches an enrolled speaker.\n"
     "                      OFF by default. Requires --wake-word and a prior\n"
-    "                      --enroll-speaker; falls back to manual activation\n"
-    "                      if verification cannot start.\n"
+    "                      --enroll-speaker; if the engine, the model or\n"
+    "                      the enrolment is unavailable, Jarvis refuses to\n"
+    "                      start (it never falls back to a weaker mode).\n"
     "  --enroll-speaker    Record several samples and store your voice for\n"
     "                      speaker verification, then exit. Deliberate and\n"
     "                      never automatic; asks before replacing one.\n"
@@ -322,31 +336,80 @@ def _release_session(detector: Any) -> None:
         logger.warning("Wake-word detector failed to release the session.")
 
 
+class ActivationMode(Enum):
+    """How a command-listening session may be started.
+
+    The mode is decided once, at startup, from the requested features;
+    activation then enforces it instead of re-deriving it from whatever
+    happens to be wired in.
+    """
+
+    MANUAL = "manual"
+    WAKE = "wake"
+    WAKE_VERIFIED = "wake-verified"
+
+
+def _resolve_activation_mode(
+    wake_enabled: bool,
+    verify_enabled: bool,
+    detector: Any,
+    verifier: Any,
+) -> ActivationMode:
+    """Return the startup activation mode, or fail closed.
+
+    Manual mode must never be selected while a requested gate is
+    missing: if verification or wake-word activation was asked for but
+    cannot be established, this raises
+    :class:`SpeakerVerificationError` rather than downgrading.
+    """
+    if verify_enabled:
+        if not wake_enabled or detector is None or verifier is None:
+            raise SpeakerVerificationError(
+                "verified activation cannot be established"
+            )
+        return ActivationMode.WAKE_VERIFIED
+    if detector is not None:
+        return ActivationMode.WAKE
+    return ActivationMode.MANUAL
+
+
 def _activate(
     machine: ListeningStateMachine,
     detector: Any,
     verifier: Any,
+    mode: ActivationMode,
     output: Callable[[str], None],
 ) -> bool:
     """Move IDLE -> LISTENING once activation is accepted.
 
-    With no detector this is manual activation: we listen immediately,
-    preserving the original always-listening behaviour. With a detector we
-    stay in IDLE until it reports the wake phrase, then hand the micro-
-    phone back to the listener before capturing the command.
+    MANUAL listens immediately, preserving the original always-listening
+    behaviour; WAKE and WAKE_VERIFIED stay in IDLE until the detector
+    reports the wake phrase, then hand the microphone back to the
+    listener before capturing the command. In WAKE_VERIFIED the captured
+    wake-phrase audio is checked against the enrolled voice first; a
+    non-match (including missing, malformed or failed verification)
+    rejects activation and returns False so the caller can wait for
+    another attempt. The session is released on every path (including
+    failure and Ctrl+C).
 
-    When a verifier is present, the captured wake-phrase audio is checked
-    before the command-listening session starts; a non-match (including
-    missing, malformed or failed verification) rejects activation and
-    returns False so the caller can wait for another attempt. The session
-    is released on every path (including failure and Ctrl+C).
+    The mode is enforced, not inferred: a mode whose gates are missing
+    raises :class:`SpeakerVerificationError` so the caller stops instead
+    of running unguarded.
 
     Returns True when the machine moved to LISTENING, False when the
     attempt was rejected before listening.
     """
-    if detector is None:
+    if mode is ActivationMode.MANUAL:
+        if detector is not None or verifier is not None:
+            raise SpeakerVerificationError(
+                "manual activation must not carry extra gates"
+            )
         machine.to(ListeningState.LISTENING)
         return True
+    if detector is None:
+        raise SpeakerVerificationError(
+            "wake-word activation is required but unavailable"
+        )
     start = getattr(detector, "start", None)
     if callable(start):
         start()
@@ -357,7 +420,11 @@ def _activate(
     finally:
         _release_session(detector)
 
-    if verifier is not None:
+    if mode is ActivationMode.WAKE_VERIFIED:
+        if verifier is None:
+            raise SpeakerVerificationError(
+                "speaker verification is required but unavailable"
+            )
         audio = getattr(detector, "trigger_audio", None)
         result = verifier.verify(audio)
         if not result.accepted:
@@ -384,10 +451,17 @@ def _run_loop(
     machine: ListeningStateMachine,
     detector: Any,
     verifier: Any,
+    mode: ActivationMode,
 ) -> int:
     while True:
         try:
-            activated = _activate(machine, detector, verifier, output)
+            activated = _activate(machine, detector, verifier, mode, output)
+        except SpeakerVerificationError as exc:
+            # A required gate disappeared after startup: stop the app
+            # instead of looping forever on activations that cannot pass.
+            output(f"Speaker verification error: {exc}")
+            machine.close()
+            return EXIT_RUNTIME_ERROR
         except (WakeWordUnavailableError, MicrophoneError) as exc:
             output(f"Wake-word detection failed: {exc}")
             machine.close()
@@ -463,44 +537,42 @@ def _build_wake_detector(
     wake_config: WakeConfig,
     factory: Callable[[WakeConfig], Any],
     output: Callable[[str], None],
+    *,
+    require_wake: bool = False,
 ) -> Any:
     """Return a wake-word detector, or None for manual activation.
 
     Wake-word mode is never silently assumed: when it is requested but no
     real engine is available, that is reported explicitly and the app
-    falls back to the manual/always-listening flow.
+    falls back to the manual/always-listening flow. With ``require_wake``
+    (speaker verification is enabled) there is no fallback to offer: the
+    message says why the wake engine is still needed and the caller then
+    refuses to start.
     """
     if not wake_config.enabled:
         logger.info("Wake-word mode disabled; using manual activation.")
         return None
+    fallback = (
+        "Speaker verification also requires it."
+        if require_wake
+        else "Using manual activation instead."
+    )
     try:
         detector = factory(wake_config)
     except WakeWordUnavailableError as exc:
-        output(
-            f"Wake-word mode is unavailable ({exc}). "
-            "Using manual activation instead."
-        )
+        output(f"Wake-word mode is unavailable ({exc}). {fallback}")
         return None
     except Exception:
-        output(
-            "Wake-word mode could not start. "
-            "Using manual activation instead."
-        )
+        output(f"Wake-word mode could not start. {fallback}")
         return None
     if detector is None:
-        output(
-            "Wake-word mode is unavailable. "
-            "Using manual activation instead."
-        )
+        output(f"Wake-word mode is unavailable. {fallback}")
         return None
     if getattr(detector, "available", True) is False:
         # A detector that reports itself unavailable cannot detect, and
-        # its non-blocking detect() would spin the activation loop. Fall
-        # back to manual activation and release anything it already holds.
-        output(
-            "Wake-word mode is unavailable. "
-            "Using manual activation instead."
-        )
+        # its non-blocking detect() would spin the activation loop. Give
+        # it back and release anything it already holds.
+        output(f"Wake-word mode is unavailable. {fallback}")
         _close_resource(detector)
         return None
     logger.info("Wake-word mode enabled ('%s').", wake_config.phrase)
@@ -515,10 +587,26 @@ def _build_speaker_verifier(
 ) -> Any:
     """Return a ready speaker verifier, or None if it cannot start.
 
-    Returning None is never a silent bypass: the caller must then disable
-    voice-triggered activation. Missing enrolment, an unavailable model
-    and unreadable stored data are all reported explicitly.
+    The stored enrolment is read *before* the embedding model is loaded:
+    a missing or unreadable profile then costs no model download, and a
+    model that is loaded later can only be closed on success or by the
+    caller's cleanup. Returning None is never a silent bypass: the caller
+    must refuse to start. A profile recorded by a different model is
+    rejected too, because comparing embeddings from two backends is not
+    meaningful.
     """
+    try:
+        enrollment = store.load()
+    except EnrollmentError as exc:
+        output(f"Could not read the stored voice enrolment ({exc}).")
+        return None
+    if enrollment is None:
+        output(
+            "Speaker verification is enabled but no voice is enrolled; "
+            "run --enroll-speaker first."
+        )
+        return None
+
     try:
         model = model_factory(config)
     except SpeakerVerificationError as exc:
@@ -531,16 +619,11 @@ def _build_speaker_verifier(
         output("Speaker verification is unavailable.")
         return None
 
-    try:
-        enrollment = store.load(expected_model_id=model.model_id)
-    except EnrollmentError as exc:
-        output(f"Could not read the stored voice enrolment ({exc}).")
-        _close_resource(model)
-        return None
-    if enrollment is None:
+    if enrollment.model_id != model.model_id:
         output(
-            "Speaker verification is enabled but no voice is enrolled; "
-            "run --enroll-speaker first."
+            "The stored voice was enrolled with a different speaker "
+            f"model ({enrollment.model_id}); run --enroll-speaker "
+            "again."
         )
         _close_resource(model)
         return None
@@ -605,6 +688,9 @@ def _speaker_enroll(
         return EXIT_RUNTIME_ERROR
     except Exception:
         output("Speaker verification could not start.")
+        return EXIT_RUNTIME_ERROR
+    if model is None:
+        output("Speaker verification is unavailable.")
         return EXIT_RUNTIME_ERROR
 
     def confirm(prompt: str) -> bool:
@@ -750,11 +836,16 @@ def main(
             enrollment_capture,
         )
 
-    if options.verify_speaker and not active_wake.enabled:
+    if active_speaker.enabled and not active_wake.enabled:
+        # Fail closed before anything is initialised for the listening
+        # loop: verification only gates voice-triggered activation, so
+        # running without a wake word would make it a no-op gate.
         output(
-            "Speaker verification only affects voice-triggered activation; "
-            "enable --wake-word for it to have any effect."
+            "Invalid configuration: --verify-speaker requires "
+            "--wake-word; speaker verification only gates voice-triggered "
+            "activation."
         )
+        return EXIT_CONFIG_ERROR
 
     if options.allow_apps and not active_tools.enabled:
         output(
@@ -793,7 +884,10 @@ def main(
     try:
         _respond(_startup_message(active_config), output, speaker)
         detector = _build_wake_detector(
-            active_wake, wake_word_factory, output
+            active_wake,
+            wake_word_factory,
+            output,
+            require_wake=active_speaker.enabled,
         )
         if detector is not None:
             output(
@@ -801,27 +895,31 @@ def main(
                 f"'{active_wake.phrase}' to start a command."
             )
 
+        if active_speaker.enabled and detector is None:
+            # Verification is required but its wake-word gate is not
+            # available: fail closed instead of downgrading.
+            output(
+                "Speaker verification is enabled, but wake-word "
+                "activation is unavailable. Refusing to start in an "
+                "unverified mode."
+            )
+            return EXIT_RUNTIME_ERROR
+
         if active_speaker.enabled:
             store = enrollment_store or EnrollmentStore(active_speaker)
             verifier = _build_speaker_verifier(
                 active_speaker, embedding_model_factory, store, output
             )
-            if verifier is not None:
+            if verifier is None:
                 output(
-                    "Speaker verification is ON: only the enrolled voice "
-                    "can start a voice-triggered command."
+                    "Speaker verification could not start. Refusing to "
+                    "run in an unverified mode."
                 )
-            elif detector is not None:
-                # Enabled but unusable: refuse voice-triggered activation
-                # rather than silently skipping verification. Manual
-                # activation remains available.
-                output(
-                    "Voice verification could not start; wake-word "
-                    "activation is disabled. Using manual activation "
-                    "instead."
-                )
-                _close_resource(detector)
-                detector = None
+                return EXIT_RUNTIME_ERROR
+            output(
+                "Speaker verification is ON: only the enrolled voice "
+                "can start a voice-triggered command."
+            )
 
         if active_tools.enabled:
             output(
@@ -850,6 +948,17 @@ def main(
             output(f"Microphone error: {exc}")
             return EXIT_RUNTIME_ERROR
 
+        try:
+            mode = _resolve_activation_mode(
+                active_wake.enabled,
+                active_speaker.enabled,
+                detector,
+                verifier,
+            )
+        except SpeakerVerificationError as exc:
+            output(f"Could not establish an activation mode: {exc}")
+            return EXIT_RUNTIME_ERROR
+
         return _run_loop(
             listener,
             router,
@@ -859,6 +968,7 @@ def main(
             machine,
             detector,
             verifier,
+            mode,
         )
     except KeyboardInterrupt:
         output("\nInterrupted. Shutting down.")

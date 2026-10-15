@@ -1,18 +1,22 @@
 """Optional SpeechBrain ECAPA-TDNN speaker-embedding backend.
 
-This adapter is **not verified in this project's environment**: the
-``speechbrain`` package and its model weights are not installed here, no
-weights are downloaded at startup, and the unit tests exercise it through
-an injected fake loader rather than the real library.
+This adapter is **optional**: ``speechbrain`` is not part of the base
+requirements, no weights are downloaded at import time, and the unit
+tests exercise it through an injected fake loader rather than the real
+library.
 
-Install it explicitly (``pip install speechbrain torch``) if you want real
-speaker embeddings. The model weights download once, on first use, when
-verification is actually enabled; nothing is fetched at import time.
+Install it explicitly (see "Speaker verification" in the README) if you
+want real speaker embeddings. The model weights download once, on first
+use, when verification is actually enabled.
 
 If the package or its model cannot be loaded, this raises
 :class:`~voice.speaker_verification.SpeakerVerificationError` so the
-application falls back to manual activation instead of silently skipping
-verification.
+application fails closed when verification was requested instead of
+silently skipping it.
+
+Real-backend validation (loader, embedding, enrolment, verification,
+error paths) lives in ``scripts/validate_speaker_backend.py``; it is
+deliberately not part of the offline unit test suite.
 """
 
 from __future__ import annotations
@@ -44,6 +48,25 @@ def _default_loader() -> Callable[..., Any]:
     from speechbrain.inference.speaker import EncoderClassifier
 
     return EncoderClassifier
+
+
+def _copy_strategy() -> Optional[Any]:
+    """Return SpeechBrain's non-symlink fetch strategy when supported.
+
+    SpeechBrain's default fetch strategy symlinks model files from the
+    Hugging Face cache into ``savedir``. Creating symlinks needs an extra
+    Windows privilege (or Developer Mode), so on a normal Windows account
+    that default fails with ``WinError 1314``. ``COPY_SKIP_CACHE`` writes
+    the files straight into ``savedir`` instead: no symlink, no duplicated
+    cache copy. SpeechBrain releases that predate the option simply lack
+    the keyword, so ``None`` is returned and the loader's own default
+    applies.
+    """
+    try:
+        from speechbrain.utils.fetching import LocalStrategy
+    except Exception:
+        return None
+    return getattr(LocalStrategy, "COPY_SKIP_CACHE", None)
 
 
 class SpeechBrainECAPAModel:
@@ -83,6 +106,31 @@ class SpeechBrainECAPAModel:
         self._classifier = None
 
 
+def _from_hparams(
+    classifier_cls: Any,
+    kwargs: dict[str, Any],
+    strategy: Optional[Any],
+) -> Any:
+    """Call ``from_hparams`` once, tolerating older SpeechBrain builds.
+
+    SpeechBrain releases without a ``local_strategy`` parameter reject the
+    keyword with a ``TypeError``; those fall back to the library's own
+    fetch strategy (which may need the Windows symlink privilege).
+    """
+    try:
+        return classifier_cls.from_hparams(**kwargs)
+    except TypeError as exc:
+        if strategy is None or "local_strategy" not in str(exc):
+            raise
+        logger.info(
+            "SpeechBrain build without local_strategy support; "
+            "using its default fetch strategy."
+        )
+        retry = dict(kwargs)
+        retry.pop("local_strategy")
+        return classifier_cls.from_hparams(**retry)
+
+
 def load_speechbrain_ecapa(
     config: SpeakerVerificationConfig,
     *,
@@ -102,12 +150,16 @@ def load_speechbrain_ecapa(
     savedir = os.path.join(
         config.data_dir or default_data_dir(), "models", _MODEL_ID
     )
+    kwargs: dict[str, Any] = {
+        "source": source,
+        "savedir": savedir,
+        "run_opts": {"device": "cpu"},
+    }
+    strategy = _copy_strategy()
+    if strategy is not None:
+        kwargs["local_strategy"] = strategy
     try:
-        classifier = classifier_cls.from_hparams(
-            source=source,
-            savedir=savedir,
-            run_opts={"device": "cpu"},
-        )
+        classifier = _from_hparams(classifier_cls, kwargs, strategy)
     except Exception as exc:
         raise SpeakerVerificationError(
             f"could not load the speaker model {source!r}: {exc}"

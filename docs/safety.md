@@ -10,7 +10,11 @@ tools: disk space and battery status) and **Batch 9 landed** (confirmation
 workflow safety: approval bound to the exact tool and validated
 arguments, single-use and expiring). **Batch 10 landed** (allowlisted,
 confirmed application launcher) and **Batch 12 landed** (optional local
-speaker verification for voice-triggered activation). The production registry
+speaker verification for voice-triggered activation). **Batch 13 landed**
+(fail-closed verification startup: explicit `MANUAL`/`WAKE`/`WAKE_VERIFIED`
+activation modes, refusal to start when a requested gate is unavailable,
+a Windows-safe SpeechBrain fetch strategy, and a real-backend validation
+command). The production registry
 is empty by default; with `--tools` it holds only approved,
 deterministic, read-only tools. This layer exists so that no tool can
 ever be executed without passing through a single guarded gate.
@@ -47,8 +51,12 @@ This document covers:
   on-disk `EnrollmentStore` and the `enroll_speaker` flow.
 - `voice/speaker_backend.py` — optional, lazily-loaded SpeechBrain ECAPA
   embedding backend (not a core dependency).
-- `app.py` — the composition root: wiring, the loop and the process
-  lifecycle.
+- `app.py` — the composition root: wiring, the activation mode, the loop
+  and the process lifecycle.
+- `scripts/validate_speaker_backend.py` — a manual, out-of-band
+  validation command for the optional real embedding backend. It is not
+  part of the app or its runtime path, and it is not run by the unit
+  suite or CI.
 
 It does **not** cover the AI planner or any operating-system, browser,
 file or email action. The only tools that exist are the read-only ones in
@@ -261,7 +269,10 @@ those tools).
   tool request resolves to `UNKNOWN_TOOL` by default.
 - Failures fail closed: model/microphone errors exit with a clear
   message and code `1`, invalid configuration exits with code `2`, and
-  the listener is always released (`finally`) on shutdown.
+  the listener is always released (`finally`) on shutdown. The same codes
+  cover activation: a requested gate that cannot start (missing
+  enrolment, backend, wake engine or model) is code `1`, and
+  `--verify-speaker` without `--wake-word` is code `2`.
 
 ## Read-only tools
 
@@ -433,10 +444,13 @@ Safety properties:
   manual/always-listening flow.
 - **No pretending.** If mode is requested but no real engine is
   available — either the factory raises, returns `None`, or returns a
-  detector whose `available` is `False` — the app prints a clear notice,
-  releases the unused detector, and falls back to manual activation. It
-  never reports detection it did not perform, and an unavailable detector
-  cannot spin the activation loop.
+  detector whose `available` is `False` — the app prints a clear notice
+  and releases the unused detector. In plain wake mode it falls back to
+  manual activation; when `--verify-speaker` is also active the wake word
+  is *part of the requested gate*, so the app instead **exits with a
+  runtime error code** (see "Speaker verification startup" below). In
+  neither case does it report detection it did not perform, and an
+  unavailable detector cannot spin the activation loop.
 - **No authority.** The wake word only moves `IDLE → LISTENING`. It
   cannot produce a command, choose a tool, or approve anything; every
   command still passes through the router and `ToolExecutor.execute`.
@@ -480,28 +494,86 @@ optional backend lives in `voice/speaker_backend.py`. Verification is
 - **Fails closed and honest.** Accept only when the cosine score is
   `>= threshold`. Missing audio, unusable/too-short/silent samples, a
   backend error, a missing/corrupt enrolment or a model mismatch all
-  result in **no activation**. If verification is requested but cannot
-  start (backend unavailable or no enrolment), the app prints a clear
-  notice, disables wake-word activation and falls back to **manual**
-  activation — it never silently bypasses the check.
+  result in **no activation**. At runtime a `SpeakerVerifier.verify()`
+  failure raises `SpeakerVerificationError`, which the loop reports as
+  `"Speaker verification error: …"` and turns into a clean runtime-error
+  shutdown — it never skips the gate and never degrades to a weaker mode.
+- **Fail-closed startup (Batch 13).** If verification is *requested* but
+  any prerequisite is missing — no `--wake-word`, an unavailable
+  wake-word engine, no stored enrolment, an incompatible or unavailable
+  embedding model — the app prints which gate failed and **exits**
+  instead of downgrading. Startup never silently continues in a mode the
+  user did not ask for.
 - **Verification never raises into the loop.** `SpeakerVerifier.verify`
   returns a structured reason (`match`, `below_threshold`,
   `unusable_audio`, `model_error`, `incomparable`, `closed`) instead of
-  throwing, so an unexpected backend fault cannot skip the gate.
+  throwing, so an unexpected backend fault cannot skip the gate; only the
+  small `SpeakerVerificationError` raised during activation can stop the
+  loop, and it does so loudly.
 - **Explicit enrolment only.** `--enroll-speaker` captures samples only
   after an interactive confirmation, rejects unusable samples, computes a
   centroid embedding and stores only that vector plus metadata — never raw
   audio. `--reset-speaker` and `--speaker-status` manage/inspect it; none
-  of these run inside the listening loop.
+  of these run inside the listening loop, and none of them loads the
+  embedding model unless enrolment is actually written.
 - **Local-only backend.** `voice/speaker_backend.py` wraps SpeechBrain
-  ECAPA on CPU and downloads weights once on first use (never at startup).
-  The package is **not** a core dependency; if it (or torch) is missing,
-  the backend raises and the app falls back to manual activation.
+  ECAPA on CPU and downloads weights once on first use (never at startup
+  or import). The package is **not** a core dependency; if it (or torch)
+  is missing, the backend raises and — when verification was requested —
+  the app refuses to start.
+
+### Speaker verification startup (Batch 13)
+
+Activation is decided once, at startup, into exactly one explicit mode
+(`app.py: ActivationMode`):
+
+| Mode | Flags | Gate before `LISTENING` |
+|---|---|---|
+| `MANUAL` | none | none: listen immediately |
+| `WAKE` | `--wake-word` | the wake phrase |
+| `WAKE_VERIFIED` | `--wake-word --verify-speaker` | the wake phrase **and** a matching enrolled voice |
+
+Rules, all enforced by `_resolve_activation_mode` / `_activate` and
+covered by tests:
+
+- `--verify-speaker` without `--wake-word` is a **configuration error**
+  (message `"Invalid configuration: --verify-speaker requires
+  --wake-word; …"`), checked *before* any optional one-shot command runs
+  and long before anything heavy is initialised → exit code `2`.
+- In `WAKE_VERIFIED`, a missing wake-word engine, a missing/corrupt
+  enrolment, an unavailable/incompatible model or an unexpected error is
+  reported as `"… Refusing to start in an unverified mode."` (or
+  `"… Refusing to run …"` for the model case) → exit code `1`. The
+  embedding model and the microphone listener are **not** constructed at
+  all on these paths (asserted by tests), so a failing startup costs
+  nothing but a short message.
+- The stored enrolment is loaded **before** the model: a missing profile
+  never triggers a model download, and an enrolment recorded with a
+  different embedding model id is rejected while the freshly loaded
+  model is closed.
+- `_activate(...)` re-checks the mode at activation time: `MANUAL`
+  rejects extra gates, `WAKE`/`WAKE_VERIFIED` require a live detector,
+  `WAKE_VERIFIED` additionally requires a live verifier. There is no code
+  path that activates a requested gate with the wrong objects.
+- Admin commands (`--speaker-status`, `--reset-speaker`,
+  `--enroll-speaker`) work without `--wake-word`; `--enroll-speaker`
+  still refuses to run if the embedding backend cannot start (exit `1`),
+  because writing an enrolment that verification could never replay
+  would be dishonest.
+- Windows-specific: SpeechBrain's default `SYMLINK` fetch strategy fails
+  without `SeCreateSymbolicLinkPrivilege` (`WinError 1314`), so the
+  adapter requests `COPY_SKIP_CACHE` (files copied, no symlinks) and
+  retries without the option on `TypeError` for releases that predate it.
+  The whole path is validated end-to-end by
+  `scripts/validate_speaker_backend.py`.
 
 Storage: the enrolment file (`speaker_enrollment.npz`) lives in a
 per-user data directory (`%LOCALAPPDATA%\Jarvis` on Windows) and is
 written atomically with owner-only permissions where the platform
-supports it (`0o600` file, `0o700` directory).
+supports it (`0o600` file, `0o700` directory). This is `os.chmod`
+best-effort only: Windows accepts the call but does not enforce POSIX
+bits, so on Windows the real protection is the per-user directory, not
+the mode bits. No NTFS ACL is set or verified.
 
 **Not a security guarantee.** Speaker verification is *speaker matching*,
 not liveness or anti-spoofing: a recording of the enrolled voice could
@@ -615,7 +687,12 @@ rejection, abort on backend error, minimum-sample gate, centroid stored).
 `tests/test_speaker_backend.py` (Batch 12) — the SpeechBrain ECAPA
 adapter against an injected loader (sample-rate validation, model-id
 composition, output shaping, and the missing-`torch` guard) without
-importing SpeechBrain or downloading weights.
+importing SpeechBrain or downloading weights. Batch 13 adds the fetch
+strategy: `COPY_SKIP_CACHE` is requested when the installed SpeechBrain
+exposes it (with the option actually passed through to the loader), the
+key is simply omitted when it does not, and a `TypeError` mentioning
+`local_strategy` retries once without it — while any other `TypeError`
+propagates after exactly one attempt.
 
 `tests/test_states.py` — initial state and history, the full happy-path
 cycle, every legal shortcut, same-state no-op, `STOPPED` terminal,
@@ -644,10 +721,19 @@ session hand-off (the session is released before listening, `start`/`stop`
 run once per activation, the session is released on detection failure and
 on Ctrl+C, and manual mode never opens a session). Batch 12 adds
 speaker-verification integration: a verified wake phrase activates while a
-rejected one stays `IDLE`, `--verify-speaker` without an enrolment or a
-backend falls back to manual activation and disables wake-word, the
-verifier is closed on every exit path, and a speaker match cannot bypass
-permissions or forge an approval.
+rejected one stays `IDLE`, a missing enrolment or backend stops startup
+instead of falling back, the verifier is closed on every exit path, and a
+speaker match cannot bypass permissions or forge an approval. Batch 13
+adds the fail-closed startup matrix: `--verify-speaker` without
+`--wake-word` fails with the configuration code and no model load; a
+missing enrolment, an unavailable model, an enrolment from another model
+(model closed again), an unavailable wake engine, a missing detector and
+a missing verifier each exit with the runtime code and assert that the
+model factory and/or listener factory were never called; the wake
+fallback message names verification when it is required; admin commands
+(`--speaker-status`, `--reset-speaker`, `--enroll-speaker`) report their
+messages and exit codes without touching the model unless needed; and
+`_activate` rejects every mode/gate mismatch.
 
 Run:
 
@@ -738,22 +824,29 @@ calls a handler directly.
   part of the binding. This is safe because the policy derives a tool's
   level deterministically from its id and (validated) arguments, so the
   level cannot differ between the prompt and the redemption.
-- Speaker verification is **not runnable** in this environment: the
-  optional `speechbrain` backend (and torch) is not installed, so
-  `--enroll-speaker` and `--verify-speaker` fall back to manual
-  activation. Only the verification *logic*, the enrolment *store* and the
-  wake-audio *hand-off* are unit-tested (with fake embedding backends and
-  samples); real embeddings and matching against a microphone have not
-  been verified.
+- Speaker verification is **optional and not exercised in CI**: the base
+  `requirements.txt` does not install `speechbrain`/`torch`, so the unit
+  suite runs against fake embedding backends. On this machine the backend
+  was installed by hand and the real path validated with
+  `scripts/validate_speaker_backend.py` (SpeechBrain 1.1.2, torch
+  2.14.1+cpu, Windows: 13/13 steps passed, same-speaker cosine score
+  `0.929` against the `0.5` threshold, temporary data deleted). That run
+  used a locally generated WAV, **not** a live microphone: real enrolment
+  from a person and matching against live speech have not been verified,
+  and every target machine needs its own validation run and threshold
+  calibration.
 - Speaker verification is speaker matching, **not** liveness or
   anti-spoofing: a recording of the enrolled voice could match. The
   default threshold (`0.5`) is an uncalibrated starting point, not a
   security guarantee, and it never replaces the permission/confirmation
   gate.
 - Enrolment storage rejects corrupt, malformed or model-mismatched files
-  (treated as "not enrolled" → manual fallback), but the embedding vector
-  and metadata are stored unencrypted; owner-only permissions are applied
-  where the platform supports them.
+  (treated as "not enrolled", so a startup that requires verification
+  refuses with exit code `1` instead of falling back), but the embedding
+  vector and metadata are stored unencrypted. Owner-only permissions are
+  applied where the platform supports them: `os.chmod` is best-effort and
+  **not enforced on Windows** (no NTFS ACL is set), so on Windows the
+  per-user directory is the only protection.
 - `EnrollmentStore` and `ConfirmationRegistry` are not internally
   synchronised; they are only touched from the single-threaded
   management/loop paths today.

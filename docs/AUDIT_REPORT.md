@@ -1041,7 +1041,9 @@ and leaves the single guarded execution path untouched.
   `ToolExecutor.execute`.
 - Verification fails closed on every abnormal path, and if the backend or
   enrolment is unavailable the app **disables** wake-word activation and
-  falls back to manual instead of bypassing the check.
+  falls back to manual instead of bypassing the check. *(Superseded by
+  Batch 13 in section S: that manual fallback became a refusal to start,
+  so a requested gate can never silently weaken.)*
 - Only the wake-session audio is embedded (no second microphone stream),
   and the buffer is cleared each session.
 
@@ -1088,4 +1090,118 @@ and updated modules → 548.
   management paths only).
 - The optional backend adds no requirement to `requirements.txt`; it must
   be installed deliberately. Weights download once on first use.
+- No commit was made.
+
+## S. Batch 13 addendum — fail-closed verification startup + real-backend validation
+
+Batch 13 adds no new capability. It removes a class of *silent
+downgrades* from the Batch 12 activation feature and validates the
+optional embedding backend for real on Windows. The single guarded
+execution path, the permission rules and the confirmation workflow are
+untouched.
+
+### S.1 Findings
+
+| ID | Severity | Area | Finding | Action |
+|---|---|---|---|---|
+| FCS-001 | Medium | `app.py` | `--verify-speaker` with an unavailable backend, a missing enrolment **or** an unavailable wake engine silently produced **manual** activation: the user asked for a stronger gate and got the weakest one, with only a log line as evidence. | **Fixed** — explicit `MANUAL`/`WAKE`/`WAKE_VERIFIED` modes resolved at startup; any missing gate now prints the failing gate and exits (`1`), and the model/listener are never constructed. |
+| FCS-002 | Low | `app.py` | `--verify-speaker` without `--wake-word` was accepted, so verification could never apply to anything. | **Fixed** — configuration error (`Invalid configuration: --verify-speaker requires --wake-word; …`), exit `2`, checked before any optional command or heavy object. |
+| FCS-003 | Low | `voice/speaker_backend.py` | SpeechBrain's default `LocalStrategy.SYMLINK` raises `OSError: [WinError 1314]` for a normal Windows account, so the real backend could not load at all on the target platform. | **Fixed** — request `COPY_SKIP_CACHE` where available; retry without the keyword on `TypeError` for older releases. Verified against SpeechBrain 1.1.2. |
+| FCS-004 | Low | `voice/speaker_verification.py` | `SpeakerVerifier`'s `min_sample_seconds` default (`1.0`) diverged from the documented `SpeakerVerificationConfig` value (`0.6`), so the enforced minimum depended on the caller. | **Fixed** — defaults are taken from the config object. |
+| FCS-005 | Low | `app.py` | A missing or incompatible enrolment still loaded (and on a cold cache, downloaded) the embedding model before failing. | **Fixed** — the store is read first; a mismatched `model_id` is rejected and the just-loaded model is closed. |
+
+### S.2 Fail-closed startup (audited)
+
+- Activation is one explicit mode (`app.py: ActivationMode`), resolved
+  once by `_resolve_activation_mode` and re-checked at activation time by
+  `_activate`, which refuses every mode/gate mismatch (manual mode with
+  extra gates, wake modes without a detector, verified mode without a
+  verifier).
+- Refusal paths, all covered by tests that also assert the embedding
+  model factory and/or the microphone-listener factory were **never**
+  called:
+  - `--verify-speaker` without `--wake-word` → exit `2`.
+  - wake engine unavailable while verifying → exit `1`
+    (`"… Speaker verification also requires it."` then
+    `"… Refusing to start in an unverified mode."`).
+  - no enrolment → exit `1` (`"Could not read the stored voice
+    enrolment …"` / `"… no voice is enrolled; run --enroll-speaker
+    first."` then `"Speaker verification could not start. Refusing to run
+    in an unverified mode."`).
+  - model unavailable → exit `1`; incompatible enrolment model → exit
+    `1` with the model closed.
+- A runtime verification fault is reported as
+  `"Speaker verification error: …"` and becomes a clean runtime-error
+  shutdown; it never skips the gate or changes the mode.
+- Admin commands (`--speaker-status`, `--reset-speaker`,
+  `--enroll-speaker`) still work without `--wake-word`; the configuration
+  check for verification runs **after** the one-shot-command dispatch on
+  purpose, so inspecting or clearing an enrolment never requires a wake
+  word.
+- Authority is unchanged: verification only decides whether to listen. It
+  cannot approve, mint or redeem a ticket, choose a permission level or
+  invoke a handler.
+
+### S.3 Files changed
+
+| File | Change |
+|---|---|
+| `app.py` | `ActivationMode`, `_resolve_activation_mode`, `_activate`, fail-closed startup ordering, `_build_wake_detector(require_wake=)`, enrolment-first `_build_speaker_verifier`, `_run_loop` verification-error handling, docstring/usage. |
+| `voice/speaker_backend.py` | Windows-safe `_copy_strategy()` + `_from_hparams()` compat retry; docstring updated. |
+| `voice/speaker_verification.py` | Defaults derived from `SpeakerVerificationConfig`. |
+| `scripts/validate_speaker_backend.py` | **New** — manual real-backend validation (12 steps + cleanup; exit `0`/`1`/`3`). |
+| `tests/test_app.py` | Fail-closed startup matrix, `_activate` mismatches, admin-command exit codes, `_run_loop` error path. |
+| `tests/test_speaker_backend.py` | Fetch-strategy selection/retry tests. |
+| `tests/test_speaker_verification.py` | Verifier/config default alignment. |
+| `.github/workflows/ci.yml` | `compileall` now includes `scripts/`. |
+| `README.md`, `docs/safety.md`, `docs/roadmap.md`, `docs/voice-pipeline.md`, `docs/AUDIT_REPORT.md` | Documentation updated to the fail-closed behaviour and the real-backend validation. |
+
+### S.4 Batch 13 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py scripts tests` | **PASS** (exit 0) |
+| Lint | `python -m ruff check .` | **PASS** — All checks passed! |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 569 tests, 0 failures, 3 skipped |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| Config error | `app.py --verify-speaker --no-speech` | **PASS** — exit `2`, `"Invalid configuration: --verify-speaker requires --wake-word; …"` |
+| Refusal (wake gate) | `app.py --wake-word --verify-speaker --no-speech` | **PASS** — exit `1`, wake-unavailable + `"Refusing to start in an unverified mode."`, no model loaded |
+| Admin commands | `app.py --speaker-status` / `--reset-speaker` | **PASS** — exit `0`, `"No voice is enrolled."` / `"No enrolment to remove."` |
+| Wake fallback | `app.py --wake-word --no-speech` | **PASS** — `"Wake-word mode is unavailable … Using manual activation instead."` then manual listening |
+| Real backend | `scripts/validate_speaker_backend.py --audio-file v.wav` | **PASS** — **13 passed, 0 failed, 0 blocked**, exit `0`; same-speaker cosine `0.929` (threshold `0.5`) |
+| Validation exit paths | no-consent / missing-file / `--record 1` / `--record 4 --consent` | exit `1` / `1` / `1` / `0` — as specified |
+
+The real-backend run used SpeechBrain `1.1.2` and torch `2.14.1+cpu` on
+Windows with a locally generated 16-bit PCM WAV, exercised the real
+`enroll_speaker` flow with an injected capture into a temporary data
+directory, and deleted that directory afterwards. Weights were read from
+the Hugging Face cache (`models--speechbrain--spkrec-ecapa-voxceleb`),
+which is outside the repository; nothing was written to the project tree
+or to the user's Jarvis data directory.
+
+**Test delta:** Batch 12 had 548 tests; Batch 13 adds 21 → 569 (3
+skipped: the pre-existing symlink skip, the missing-`torch` skip — which
+now skips locally because torch *is* installed, and still runs in CI —
+and the no-SpeechBrain strategy skip).
+
+### S.5 Not run / remaining limitations
+
+- **Live-mic, human-voice verification was not run.** Only the
+  already-noted `--record 4 --consent` path was executed (with the flag
+  supplied deliberately); it captured ambient audio into the script's
+  temporary directory, which the script then deleted. No audio was
+  logged or persisted, and no enrolment was written to the user's data
+  directory (`--enroll-speaker` was deliberately not run, to avoid
+  storing a noise-derived profile). Real enrolment and matching against a
+  person speaking remain unverified.
+- The validation script is a **manual** command: it needs the optional
+  package, a model download and audio, so it is not part of the unit
+  suite or CI. Every target machine needs its own run and threshold
+  calibration.
+- macOS/Linux real-backend behaviour was not exercised; the Windows
+  symlink workaround is the only platform-specific path tested for real.
+- Speaker verification remains speaker matching, **not** liveness or
+  anti-spoofing, and the `0.5` threshold is uncalibrated.
+- Enrolment permissions are `os.chmod` best-effort and are **not
+  enforced on Windows** (no NTFS ACL is set).
 - No commit was made.

@@ -95,7 +95,10 @@ class NullWakeWordDetector:
     """Safe fallback that never activates.
 
     Used when wake-word mode is disabled, or when a real engine is
-    unavailable and the application falls back to manual activation.
+    unavailable and plain wake mode (without speaker verification)
+    falls back to manual activation. When ``--verify-speaker`` is also
+    requested the application refuses to start instead of using this
+    detector.
     """
 
     name = "null"

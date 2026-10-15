@@ -331,5 +331,23 @@ class TestBuildEmbeddingModel(unittest.TestCase):
         loader.assert_called_once()
 
 
+class TestConfigurationAlignment(unittest.TestCase):
+    """Constructor defaults follow the configuration, never a second copy."""
+
+    def test_verifier_defaults_match_the_config(self):
+        config = SpeakerVerificationConfig()
+        verifier = SpeakerVerifier(
+            FakeModel([1.0, 0.0]),
+            enrollment_for([1.0, 0.0]),
+            threshold=config.threshold,
+            sample_rate=config.sample_rate,
+        )
+        self.assertEqual(
+            verifier.min_sample_seconds, config.min_sample_seconds
+        )
+        self.assertEqual(verifier.min_rms, config.min_rms)
+        self.assertEqual(verifier.threshold, config.threshold)
+
+
 if __name__ == "__main__":
     unittest.main()

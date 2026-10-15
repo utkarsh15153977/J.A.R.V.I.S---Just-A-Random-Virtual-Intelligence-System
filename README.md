@@ -62,13 +62,18 @@ with PyAV 19.
 
 # Accept a voice-triggered activation only when the captured voice
 # matches the enrolled speaker (OFF by default; needs --wake-word and a
-# prior --enroll-speaker; falls back to manual activation if verification
-# cannot start)
+# prior --enroll-speaker; if a gate is missing Jarvis refuses to start
+# instead of falling back to a weaker mode)
 .\.venv\Scripts\python app.py --wake-word --verify-speaker
 
 # Inspect or clear the stored voice enrolment, then exit
 .\.venv\Scripts\python app.py --speaker-status
 .\.venv\Scripts\python app.py --reset-speaker
+
+# Validate the optional real embedding backend on this machine (after
+# installing it; see "Speaker verification" below)
+.\.venv\Scripts\python scripts\validate_speaker_backend.py --audio-file voice.wav
+.\.venv\Scripts\python scripts\validate_speaker_backend.py --record 4 --consent
 
 # Enable the built-in read-only tools (OFF by default). Ask for "the
 # time", "the date", "system status", "disk space" or "battery status".
@@ -135,12 +140,27 @@ has been activated. Wake-word detection only decides *when* to listen; it
 never authorises an action — commands still go through the router and the
 guarded executor.
 
+Activation is always one of three explicit modes, decided once at
+startup:
+
+| Mode | Flags | What must happen before listening |
+| ---- | ----- | --------------------------------- |
+| `MANUAL` | (none) | nothing: listen immediately |
+| `WAKE` | `--wake-word` | the wake phrase |
+| `WAKE_VERIFIED` | `--wake-word --verify-speaker` | the wake phrase **and** a matching enrolled voice |
+
+There is no silently-downgraded fourth mode: if a requested gate cannot
+start, Jarvis reports it and exits with a status code (see "Speaker
+verification" below).
+
 The optional wake-word engine is `openwakeword`. It is **not installed
 with its model files** in this project, so `--wake-word` currently
 reports that it is unavailable and falls back to manual activation rather
 than pretending to work. To enable it, download the models
 (`python -m openwakeword.utils.download_models`) and set the wake phrase
-in `WakeConfig`.
+in `WakeConfig`. With `--verify-speaker` that same failure is fatal
+instead: verification needs the wake-word gate, so Jarvis refuses to
+start.
 
 Wake-word detection owns the microphone only for the duration of one
 activation: the app opens the detection session before waiting for the
@@ -162,22 +182,56 @@ another.
 Enrolment is deliberate: `--enroll-speaker` records a few samples, rejects
 short or silent ones, and stores only a small centroid embedding (never
 the raw recordings) in a per-user application-data file written with
-owner-only permissions where the platform supports it. If verification is
-enabled but cannot start (no enrolment, or the embedding model is
-missing), Jarvis reports that and disables wake-word activation rather
-than silently skipping the check — manual activation remains available.
+owner-only permissions where the platform supports it (best effort: on
+Windows that is `os.chmod`, not an NTFS ACL).
+
+`--verify-speaker` **fails closed**. It requires `--wake-word`, a stored
+enrolment, a working wake-word engine and a working embedding model. If
+any of them is missing — including a missing `--wake-word` — Jarvis
+reports which gate failed and exits with a status code (`2` for a
+configuration error such as `--verify-speaker` without `--wake-word`, `1`
+when a gate could not start) instead of downgrading to manual
+activation. The stored enrolment is read *before* the embedding model is
+loaded, so a missing or unreadable profile never costs a model download,
+and a model that is loaded is closed again on every failure path.
 
 Speaker verification uses a real local speaker-embedding model
-(SpeechBrain's ECAPA-TDNN by default) that is **not installed in this
-project**, so enabling it currently reports that verification is
-unavailable and falls back to manual activation instead of pretending to
-work. To enable it, install the optional dependency
-(`pip install speechbrain torch`); the model weights download once on
-first use, never at startup. The threshold in
-`SpeakerVerificationConfig` is a starting point and must be calibrated
-for your model and enrolment. Verification is speaker matching, **not**
-liveness: a recording of the enrolled voice could match. See
-[docs/safety.md](docs/safety.md) for the security model and limitations.
+(SpeechBrain's ECAPA-TDNN by default). It is **optional**: the base
+`requirements.txt` does not install it. Install it explicitly (CPU-only
+PyTorch keeps the download small and needs no CUDA):
+
+```powershell
+.\.venv\Scripts\pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+.\.venv\Scripts\pip install speechbrain
+```
+
+The model weights download once, on first use, into the Hugging Face
+cache under your user profile — never into the repository, and never at
+import or startup time. On Windows, SpeechBrain's default fetch strategy
+symlinks model files, which needs an extra privilege that a normal
+account does not have (`WinError 1314`); the adapter therefore requests
+the non-symlink `COPY_SKIP_CACHE` strategy instead (verified locally with
+SpeechBrain 1.1.2 and torch 2.14.1+cpu). SpeechBrain releases that
+predate the option fall back to the library's own strategy.
+
+Validate the real backend on each target machine with the separate
+validation command — it is deliberately **not** part of the offline unit
+test suite:
+
+```powershell
+# a 16-bit PCM WAV you are allowed to use, or four consented mic seconds
+.\.venv\Scripts\python scripts\validate_speaker_backend.py --audio-file voice.wav
+.\.venv\Scripts\python scripts\validate_speaker_backend.py --record 4 --consent
+```
+
+It loads the real model, embeds, enrols, reloads, verifies a
+same-speaker sample, exercises the error paths, deletes its temporary
+data and prints `PASS`/`FAIL`/`BLOCKED` per step; exit `0` means every
+step passed. The threshold in `SpeakerVerificationConfig` is a starting
+point and must be calibrated for your model and enrolment. Verification
+is speaker matching, **not** liveness: a recording of the enrolled voice
+could match. See [docs/safety.md](docs/safety.md) for the security model
+and limitations.
 
 Replies are spoken with `pyttsx3` (SAPI5 on Windows). Speech is
 synchronous, so Jarvis never listens to the microphone while it is
@@ -207,9 +261,12 @@ expiry, replay, identifier validation and configuration errors),
 speaker-verification logic and enrolment storage against fake embedding
 backends and samples, and clean-shutdown
 paths).
-The microphone test above is a manual hardware test; speech,
-wake-word detection and real speaker embeddings on a real device are
-likewise manual and are **not** verified automatically.
+The microphone test above is a manual hardware test; speech and
+wake-word detection on a real device are likewise manual and are **not**
+verified automatically. The real embedding backend is the exception: it
+has its own validation command, `scripts/validate_speaker_backend.py`,
+run by hand per machine (it needs the optional package, a model download
+and audio, so it is neither in CI nor in the unit suite).
 
 Batch 11 adds regression tests proving that every *non-consuming*
 approval outcome — denied, unavailable, interrupted, provider error,
@@ -222,6 +279,18 @@ its CLI commands, and tests covering accept/reject/boundary scores,
 unusable and malformed audio, model errors, missing or corrupt enrolment,
 the wake-word trigger-audio hand-off, and the rule that a speaker match
 cannot bypass permissions or forge an approval.
+
+Batch 13 hardens verification startup: `--verify-speaker` without
+`--wake-word` is a configuration error; an unavailable wake engine,
+enrolment or embedding model makes Jarvis **refuse to start** instead of
+falling back to manual activation; the activation mode is an explicit
+`MANUAL` / `WAKE` / `WAKE_VERIFIED` value that is enforced at activation
+time; the enrolment is validated before the model is loaded (with an
+incompatible-profile check and cleanup on failure); the
+`min_sample_seconds` default comes from the configuration; the
+SpeechBrain adapter avoids the Windows symlink fetch path; and tests
+cover every refusal path, including that no model or microphone listener
+is initialised when a gate fails.
 
 ## Quality checks
 
@@ -238,7 +307,7 @@ Then run the same checks that CI runs:
 
 ```powershell
 .\.venv\Scripts\python -m ruff check .
-.\.venv\Scripts\python -m compileall -q app.py core voice config.py tests
+.\.venv\Scripts\python -m compileall -q app.py core voice config.py scripts tests
 .\.venv\Scripts\python -m unittest discover -s tests
 .\.venv\Scripts\python -m pip check
 ```
@@ -291,15 +360,40 @@ the automated verification and must be checked by hand.
 7. Wake-word fallback (software + hardware): run with `--wake-word`.
    Because the `openwakeword` model files are not installed, expect the
    "Wake-word mode is unavailable … Using manual activation instead."
-   message and normal manual listening.
-8. Speaker verification (software + hardware): `--speaker-status` prints
-   the enrolment path and "No voice is enrolled."; `--reset-speaker`
-   prints "No enrolment to remove."; `--enroll-speaker` reports that
-   verification is unavailable (the optional `speechbrain` backend is not
-   installed here) and exits `1`. Running `--wake-word --verify-speaker`
-   without an enrolment reports that verification could not start and
-   falls back to manual activation. Real enrolment and matching require
-   the optional backend and are *(not run in CI)*.
+   message and normal manual listening. *(re-run for Batch 13: message
+   confirmed, listening started; the process was stopped after that.)*
+8. Speaker verification fails closed (software, no microphone needed).
+   *(run for Batch 13; the first three need no hardware at all)*
+   ```powershell
+   # exit 2: configuration error, before anything is initialised
+   .\.venv\Scripts\python app.py --verify-speaker --no-speech
+   # exit 1: wake engine unavailable -> "Speaker verification also
+   # requires it." then "Refusing to start in an unverified mode."
+   .\.venv\Scripts\python app.py --wake-word --verify-speaker --no-speech
+   # exit 0: admin commands still work without a wake word
+   .\.venv\Scripts\python app.py --speaker-status   # path + "No voice is enrolled."
+   .\.venv\Scripts\python app.py --reset-speaker    # "No enrolment to remove."
+   ```
+   With an enrolment present but the embedding model missing, the same
+   run exits `1` with "Speaker verification is unavailable … Refusing to
+   run in an unverified mode." *(verified by unit tests, not by hand:
+   `--enroll-speaker` records from the microphone and writes to your
+   profile, so the real enrolment path is exercised by item 9 instead,
+   in a temporary directory.)*
+9. Real backend validation (software; `--record` needs a microphone and
+   your consent):
+   ```powershell
+   .\.venv\Scripts\python scripts\validate_speaker_backend.py --audio-file voice.wav
+   ```
+   It loads the real model, embeds, enrols, reloads, verifies a
+   same-speaker sample, exercises the error paths and removes its
+   temporary data, printing `PASS`/`FAIL`/`BLOCKED` per step and exiting
+   `0` only if every step passed. *(not run in CI. Run on this machine
+   for Batch 13 with Windows + SpeechBrain 1.1.2 + torch 2.14.1+cpu and
+   a locally generated 16-bit PCM WAV: **13 passed, 0 failed, 0 blocked,
+   exit 0** — same-speaker score 0.929 against the 0.5 threshold. The
+   `--record 4 --consent`, missing-file, no-consent and too-short paths
+   were run as well and returned exit 0/1/1/1 as specified.)*
 
 Expected tool replies with `--tools`: time ("It's 3:45 PM."), date
 ("Today is Thursday, October 15, 2026."), system status ("System status:
@@ -332,6 +426,8 @@ Jarvis/
 │   ├── speaker_backend.py # optional SpeechBrain ECAPA embedding backend
 │   ├── enrollment.py      # voice enrolment storage + capture
 │   └── test_voice.py      # manual microphone test
+├── scripts/
+│   └── validate_speaker_backend.py  # real-backend validation (manual)
 ├── browser/               # (Phase 4) Playwright controller
 ├── tests/                 # automated unit tests
 ├── docs/                  # architecture and phase documentation

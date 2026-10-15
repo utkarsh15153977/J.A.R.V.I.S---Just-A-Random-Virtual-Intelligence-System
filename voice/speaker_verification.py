@@ -47,6 +47,10 @@ logger = logging.getLogger("jarvis.speaker")
 _INT16_SCALE = 32768.0
 _DURATION_EPSILON = 1e-9
 
+# Constructor defaults come from the application configuration so the two
+# cannot drift apart (they are asserted equal by the unit tests too).
+_CONFIG_DEFAULTS = SpeakerVerificationConfig()
+
 
 class SpeakerVerificationError(RuntimeError):
     """Raised when a speaker-embedding backend cannot be loaded or used."""
@@ -213,8 +217,8 @@ class SpeakerVerifier:
         *,
         threshold: float,
         sample_rate: int,
-        min_sample_seconds: float = 1.0,
-        min_rms: float = 20.0,
+        min_sample_seconds: float = _CONFIG_DEFAULTS.min_sample_seconds,
+        min_rms: float = _CONFIG_DEFAULTS.min_rms,
     ) -> None:
         if not 0.0 < threshold <= 1.0:
             raise ValueError("threshold must be between 0.0 and 1.0")

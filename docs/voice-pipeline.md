@@ -117,6 +117,28 @@ The wake audio is read from the same detection session (no second
 microphone stream) and the buffer is cleared at the start of every
 session, so stale audio is never reused.
 
+Activation is one of three explicit modes decided at startup — `MANUAL`,
+`WAKE` (`--wake-word`) or `WAKE_VERIFIED` (`--wake-word
+--verify-speaker`). `WAKE_VERIFIED` **fails closed**: if the wake engine,
+the enrolment or the embedding model is missing, or
+`--verify-speaker` is given without `--wake-word`, Jarvis reports the
+failing gate and exits (`2` for the configuration error, `1` when a gate
+could not start) rather than downgrading to manual activation. The
+enrolment is loaded before the model, so a missing profile never causes a
+download.
+
+Optional backend (install once per machine):
+
+```powershell
+.\.venv\Scripts\pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+.\.venv\Scripts\pip install speechbrain
+```
+
+On Windows, SpeechBrain's default fetch strategy needs symlink privileges
+that a normal account lacks (`WinError 1314`); the adapter requests the
+`COPY_SKIP_CACHE` strategy instead and retries without it on older
+releases.
+
 All values live in `config.py` (`SpeakerVerificationConfig`, validated the
 same way):
 
@@ -146,10 +168,14 @@ speaker matching, **not** liveness or anti-spoofing.
 | Whisper raises | logged with traceback, returns `""` |
 | Empty transcription | logged, returns `""` |
 | Short / noise-only capture | discarded before Whisper, returns `""` |
-| Verification mismatch / unusable / error | activation refused (stays `IDLE`); never bypassed |
-| Verification enabled but no enrolment / model | reported; wake-word activation disabled, manual fallback |
-| Stored enrolment missing | treated as "not enrolled" (manual fallback) |
-| Stored enrolment corrupt / model mismatch | `EnrollmentError`; treated as not enrolled (manual fallback) |
+| `--verify-speaker` without `--wake-word` | configuration error, exit code 2 (checked before anything is initialised) |
+| Verification enabled but wake engine unavailable | reported; **refuses to start**, exit code 1 (listener never built) |
+| Verification enabled but no enrolment | reported; **refuses to start**, exit code 1 (model never loaded) |
+| Verification enabled but model unavailable/incompatible | reported; **refuses to start**, exit code 1 (model closed again) |
+| Verification mismatch / unusable audio | activation refused (stays `IDLE`); never bypassed |
+| Verification error during activation | `SpeakerVerificationError` reported, clean runtime-error exit (code 1) |
+| Stored enrolment missing | "not enrolled": refuses to start if verification is required, otherwise manual mode is unaffected |
+| Stored enrolment corrupt / model mismatch | `EnrollmentError`; treated as not enrolled (refuse when verification is required) |
 | Enrolment sample too short / silent | rejected and re-prompted; never stored |
 | Ctrl+C | caught by the entry point, clean shutdown, exit code 0 |
 | Audio buffer overflow | warning logged, recording continues |
@@ -171,9 +197,22 @@ python -m unittest discover -s tests -v
 
 Covers threshold calculation and clamping, speech segmenter state
 machine (start/silence/reset/finish), capture acceptance gates, config
-validation, transcript joining, the manual-test shutdown paths, and
-speaker verification / enrolment against fake embedding backends (no
-microphone, no model files, no network).
+validation, transcript joining, the manual-test shutdown paths, the
+activation-mode refusals, and speaker verification / enrolment against
+fake embedding backends (no microphone, no model files, no network).
+
+Real embedding backend (manual, needs the optional package installed):
+
+```powershell
+python scripts\validate_speaker_backend.py --audio-file voice.wav
+python scripts\validate_speaker_backend.py --record 4 --consent
+```
+
+Loads the real ECAPA model, embeds, enrols, reloads, verifies a
+same-speaker sample, exercises the error paths (wrong sample rate,
+unusable audio, missing model files, unknown backend, corrupt enrolment)
+and deletes its temporary data, printing `PASS`/`FAIL`/`BLOCKED` per
+step. Exit `0` means every step passed.
 
 Manual (hardware):
 

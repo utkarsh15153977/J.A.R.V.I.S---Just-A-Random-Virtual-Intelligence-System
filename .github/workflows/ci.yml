@@ -27,7 +27,7 @@ jobs:
           python -m pip install -r requirements-dev.txt
 
       - name: Compile all sources
-        run: python -m compileall -q app.py core voice config.py tests
+        run: python -m compileall -q app.py core voice config.py scripts tests
 
       - name: Lint with Ruff
         run: python -m ruff check .
