@@ -1282,3 +1282,86 @@ speaker, model file, network or external process is touched.
   detector that hangs *inside* `detect()` with a session reported open is
   still bounded only by the detector's own timeout, not by the loop.
 - No commit was made.
+
+## U. Batch 15 addendum — voice-pipeline integration & operational readiness
+
+Batch 15 adds no new capability. It audits the **complete pipeline control
+flow** — activation → transcription → routing → guarded execution →
+speech → return to listening → shutdown — and fixes four defects in how
+low-level audio/transcription failures are surfaced and controlled. The
+single guarded execution path (`ToolExecutor.execute`), the permission
+rules, the confirmation tickets, the fail-closed verification startup and
+the Batch 14 lifecycle guarantees are untouched.
+
+### U.1 Findings
+
+| ID | Severity | Area | Finding | Action |
+|---|---|---|---|---|
+| INT-15-001 | Medium | `voice/listener.py` (`calibrate`, `record_until_silence`) | Microphone failures were re-raised as `MicrophoneError(f"…: {exc}")` with the raw PortAudio/OS text and no cause: "no device", "access denied", "busy" and "wrong sample rate" were indistinguishable and unactionable. | **Fixed** — both sites use `describe_audio_error(exc, context=…)`, which names the likely cause and still preserves the original detail. Covered by `tests/test_listener.py::TestMicrophoneDiagnostics`. |
+| INT-15-002 | Medium | `voice/wakeword.py` (`_ensure_stream`, `_read_microphone_frame`) | Wake-word microphone failures replaced the underlying error with a fixed `"microphone unavailable for wake-word detection"`, discarding the cause entirely. | **Fixed** — both sites enrich `WakeWordUnavailableError` with the classified cause and original detail. Covered by `tests/test_wakeword.py::TestWakeWordDiagnostics`. |
+| INT-15-003 | Low | `voice/diagnostics.py` | The diagnostic run printed raw `fd`/PortAudio errors (`Microphone error: {exc}`), so the tool a user runs *to diagnose* the mic gave the least actionable text. | **Fixed** — prints `describe_audio_error(exc, context="Microphone error")`. |
+| INT-15-004 | Low | `app.py` `_run_loop` | `listener.transcribe()` was caught only for `MicrophoneError`. Any other exception (e.g. a capture/provider failure outside the listener's own guard) propagated uncaught to `sys.exit(main())`, producing a traceback instead of a controlled shutdown. | **Fixed** — a second `except Exception` prints one developer-authored line ("Sorry, I had a problem hearing you.") and returns `EXIT_RUNTIME_ERROR`; resources still close in `main`'s `finally`. Covered by `tests/test_pipeline.py`. |
+
+### U.2 Pipeline control flow (audited)
+
+- One iteration is `activate → transcribe → PROCESSING → route → execute →
+  SPEAKING → reply → IDLE` (or `EXIT` → `STOPPED`). Every path returns the
+  machine to a terminal or idle state; `main`'s `finally` closes the
+  detector, verifier, listener, speaker and executor exactly once.
+- **Exactly-once execution.** The router produces a `CommandRequest` and
+  `_resolve` calls `executor.execute` once for a `TOOL` command; other
+  kinds never reach the executor. `tests/test_pipeline.py` asserts the
+  executor call list across repeated activations.
+- **Recovery.** A router exception is caught, prints one message and
+  returns to `IDLE` without executing anything; an empty transcript routes
+  to a `CLARIFY` reply with no execution; both continue listening.
+- **Fail-closed on authority.** No change touches `ToolExecutor`,
+  `PermissionPolicy`, `ConfirmationManager`, the router intents or the
+  tools. Audio *diagnostics* only describe a failure that already
+  happened; they never grant access, approve a confirmation, or weaken a
+  threshold. `audio_errors.py` is pure (no `sounddevice`/`numpy` import)
+  and operates on error text only — never audio content, transcripts or
+  embeddings.
+
+### U.3 Files changed
+
+| File | Change |
+|---|---|
+| `voice/audio_errors.py` | **New** — pure `classify_audio_error` / `describe_audio_error` with ordered, case-insensitive rules (access-denied, no-device, busy, sample-rate, disconnect) and a generic fallback that never guesses; original detail preserved and truncated to 300 chars. |
+| `voice/listener.py` | `calibrate` and `record_until_silence` use `describe_audio_error`. |
+| `voice/wakeword.py` | `_ensure_stream` and `_read_microphone_frame` enrich the unavailable error. |
+| `voice/diagnostics.py` | Prints classified microphone messages. |
+| `app.py` | `_run_loop` handles an unexpected `transcribe()` error with a controlled exit. |
+| `tests/test_audio_errors.py` | **New** — 13 classification/format tests. |
+| `tests/test_pipeline.py` | **New** — 6 integration tests (exactly-once, no-duplicate, empty transcript, router recovery, unexpected-transcription shutdown, no tools on failure). |
+| `tests/test_listener.py`, `tests/test_wakeword.py` | +7 diagnostic-wiring tests. |
+| `docs/voice-smoke-test.md`, `docs/voice-troubleshooting.md` | **New** — manual Windows smoke test and troubleshooting guide (PASS/FAIL/BLOCKED/NOT RUN). |
+| `docs/AUDIT_REPORT.md`, `docs/roadmap.md`, `docs/voice-pipeline.md`, `README.md` | Batch 15 addendum / cross-links. |
+
+### U.4 Batch 15 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py scripts tests` | **PASS** (exit 0) |
+| Lint | `python -m ruff check .` | **PASS** — All checks passed! |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 607 tests, 0 failures, 3 skipped |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI help | `app.py --help` | **PASS** — exit 0, usage printed |
+
+**Test delta:** Batch 14 had 581 tests; Batch 15 adds 26 → 607 (3 skipped,
+unchanged). Every new test uses injected fakes — no microphone, speaker,
+model file, network or external process is touched.
+
+### U.5 Not run / remaining limitations
+
+- **No live audio device was exercised.** The actionable messages are
+  proven by classification/wiring tests against synthetic PortAudio
+  errors; the real "unplug the mic", "deny access" and "device busy"
+  scenarios (items 8–12 of `docs/voice-smoke-test.md`) are **NOT RUN**
+  and must be checked by hand on a Windows machine with a microphone.
+- The classifier is best-effort string matching on driver messages; an
+  unanticipated Windows/driver wording falls back to the generic
+  explanation (intended, never a wrong specific cause).
+- Tool execution and confirmation flows are unchanged and remain covered
+  by the existing suites; no authority path was modified.
+- No commit was made.

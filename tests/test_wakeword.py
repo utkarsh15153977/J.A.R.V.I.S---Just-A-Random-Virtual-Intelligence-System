@@ -320,6 +320,53 @@ class TestAudioSession(unittest.TestCase):
         detector.close()
 
 
+class TestWakeWordDiagnostics(unittest.TestCase):
+    """Wake-word mic failures carry an actionable, classified message."""
+
+    def test_device_busy_failure_is_explained(self):
+        def factory(_config, _samples):
+            raise RuntimeError("Device unavailable [PaErrorCode -9985]")
+
+        detector = OpenWakeWordDetector(
+            model_factory=lambda _config: FakeModel([{"hey_jarvis": 0.9}]),
+            stream_factory=factory,
+        )
+        with self.assertRaises(WakeWordUnavailableError) as caught:
+            detector.detect(timeout=1.0)
+        message = str(caught.exception)
+        self.assertIn("unavailable or busy", message)
+        self.assertIn("Device unavailable", message)
+        detector.close()
+
+    def test_no_device_failure_is_explained(self):
+        def factory(_config, _samples):
+            raise RuntimeError("No Default Input Device Available")
+
+        detector = OpenWakeWordDetector(
+            model_factory=lambda _config: FakeModel([{"hey_jarvis": 0.9}]),
+            stream_factory=factory,
+        )
+        with self.assertRaises(WakeWordUnavailableError) as caught:
+            detector.detect(timeout=1.0)
+        self.assertIn(
+            "no microphone/input device", str(caught.exception)
+        )
+        detector.close()
+
+    def test_read_failure_preserves_original_detail(self):
+        class BadStream(FakeStream):
+            def read(self, samples):
+                raise OSError("device was disconnected")
+
+        detector = build_mic(FakeModel([{"hey_jarvis": 0.9}]), BadStream())
+        with self.assertRaises(WakeWordUnavailableError) as caught:
+            detector.detect(timeout=1.0)
+        message = str(caught.exception)
+        self.assertIn("disconnected", message)
+        self.assertIn("device was disconnected", message)
+        detector.close()
+
+
 class TestScoreHelper(unittest.TestCase):
     def test_picks_highest_value(self):
         self.assertEqual(

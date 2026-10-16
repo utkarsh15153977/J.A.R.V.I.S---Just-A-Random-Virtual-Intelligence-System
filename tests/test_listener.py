@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import sounddevice as sd
 
 from config import VoiceConfig
 from voice import test_voice
@@ -178,5 +179,74 @@ class TestTranscriptLogging(unittest.TestCase):
         self.assertIn("Hello World", logged)
 
 
+class TestMicrophoneDiagnostics(unittest.TestCase):
+    """Microphone failures carry an actionable, classified explanation."""
+
+    def _listener(self):
+        fake = SimpleNamespace(
+            WhisperModel=lambda *args, **kwargs: _FakeWhisperModel("exit")
+        )
+        with patch.dict(sys.modules, {"faster_whisper": fake}):
+            return Listener(VoiceConfig())
+
+    def test_calibration_no_device_reports_actionable_message(self):
+        listener = self._listener()
+        error = sd.PortAudioError("No Default Input Device Available")
+        with patch.object(
+            sd, "InputStream", side_effect=error
+        ):
+            with self.assertRaises(MicrophoneError) as caught:
+                listener.calibrate()
+        message = str(caught.exception)
+        self.assertIn("no microphone/input device", message)
+        self.assertIn("No Default Input Device Available", message)
+
+    def test_calibration_access_denied_reports_actionable_message(self):
+        listener = self._listener()
+        with patch.object(
+            sd, "InputStream", side_effect=OSError("Access is denied")
+        ):
+            with self.assertRaises(MicrophoneError) as caught:
+                listener.calibrate()
+        self.assertIn("access was denied", str(caught.exception))
+
+    def test_stream_read_failure_reports_actionable_message(self):
+        listener = self._listener()
+        listener.energy_threshold = 100.0
+        stream = FakeStreamForRead(
+            sd.PortAudioError("Device unavailable [PaErrorCode -9985]")
+        )
+        with patch.object(sd, "InputStream", return_value=stream):
+            with self.assertRaises(MicrophoneError) as caught:
+                listener.record_until_silence()
+        self.assertIn("unavailable or busy", str(caught.exception))
+
+    def test_unknown_stream_error_is_not_mislabelled(self):
+        listener = self._listener()
+        listener.energy_threshold = 100.0
+        stream = FakeStreamForRead(OSError("totally unexpected"))
+        with patch.object(sd, "InputStream", return_value=stream):
+            with self.assertRaises(MicrophoneError) as caught:
+                listener.record_until_silence()
+        self.assertIn("audio subsystem reported an error", str(caught.exception))
+
+
+class FakeStreamForRead:
+    """Context-manager stream whose read() raises a chosen error."""
+
+    def __init__(self, error):
+        self._error = error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self, _samples):
+        raise self._error
+
+
 if __name__ == "__main__":
     unittest.main()
+

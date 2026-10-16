@@ -487,6 +487,13 @@ def _run_loop(
             output(f"Microphone error: {exc}")
             machine.close()
             return EXIT_RUNTIME_ERROR
+        except Exception:
+            # The listener already degrades a bad transcription to ""; an
+            # unexpected error here means capture/provider itself failed.
+            # Fail closed with one clean message instead of a traceback.
+            output("Sorry, I had a problem hearing you.")
+            machine.close()
+            return EXIT_RUNTIME_ERROR
 
         machine.to(ListeningState.PROCESSING)
 

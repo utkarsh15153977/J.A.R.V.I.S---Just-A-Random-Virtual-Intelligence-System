@@ -451,3 +451,40 @@ confirmation.
 Security posture: unchanged. The lifecycle fixes only make resource
 ownership stricter. See section T of
 [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 15 note (voice-pipeline integration & operational readiness)
+
+Batch 15 adds no new capability. It audits the complete pipeline control
+flow (activation → transcription → routing → guarded execution → speech →
+return to listening → shutdown), fixes how low-level failures are
+surfaced, and makes microphone problems actionable on Windows. No change
+touches the execution gate, permissions or confirmation.
+
+- **Actionable microphone errors (`voice/audio_errors.py`).** A new pure
+  module classifies PortAudio/OS error text — access denied, no input
+  device, unavailable/busy, unsupported sample rate, disconnected — and
+  returns "context + likely cause + original detail" (truncated to 300
+  chars). Unrecognised errors fall back to a generic explanation; it never
+  guesses a specific cause. Wired into `voice/listener.py`,
+  `voice/wakeword.py` and `voice/diagnostics.py`, so the manual test, the
+  wake-word path and the diagnostic run all show the same wording instead
+  of a raw `PaErrorCode`.
+- **Controlled shutdown on an unexpected transcription error (`app.py`).**
+  `_run_loop` now catches any non-`MicrophoneError` exception from
+  `listener.transcribe()`, prints one developer-authored line and exits
+  with a runtime error, instead of an uncaught traceback. The `finally`
+  still releases every resource.
+- **Tests.** +26 tests (581 → 607): `tests/test_audio_errors.py` (13),
+  `tests/test_pipeline.py` (6 — exactly-once execution, no duplicate,
+  empty transcript, router recovery, unexpected-transcription shutdown, no
+  tools on failure), plus diagnostic-wiring tests in `test_listener.py`
+  and `test_wakeword.py` (7). All use injected fakes; no real device,
+  model file or process is used.
+- **Docs.** New `docs/voice-smoke-test.md` (a per-run Windows checklist
+  with PASS/FAIL/BLOCKED/NOT RUN) and `docs/voice-troubleshooting.md`
+  (message meanings and symptom→action table).
+
+Security posture: unchanged. The new code only *describes* failures that
+already happened and never grants access; `audio_errors.py` operates on
+error text only, never on audio, transcripts or embeddings. See section U
+of [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).

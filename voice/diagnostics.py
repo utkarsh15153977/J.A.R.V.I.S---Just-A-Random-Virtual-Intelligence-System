@@ -20,6 +20,7 @@ from typing import Dict, Iterable, List, Sequence
 import sounddevice as sd
 
 from config import VoiceConfig
+from voice.audio_errors import describe_audio_error
 from voice.detection import compute_energy_threshold, rms
 
 # Labels shown to the user (also used as result keys).
@@ -205,7 +206,7 @@ def run_diagnostics(config: VoiceConfig) -> int:
             print(line)
         print(f"  default device pair (in/out): {sd.default.device}")
     except (sd.PortAudioError, OSError) as exc:
-        print(f"Microphone error: {exc}")
+        print(describe_audio_error(exc, context="Microphone error"))
         return 1
 
     levels_by_phase: Dict[str, List[float]] = {}
@@ -231,7 +232,7 @@ def run_diagnostics(config: VoiceConfig) -> int:
         print("\nDiagnostics cancelled.")
         return 0
     except (sd.PortAudioError, OSError) as exc:
-        print(f"Microphone error: {exc}")
+        print(describe_audio_error(exc, context="Microphone error"))
         return 1
 
     ambient_levels = levels_by_phase[PHASE_AMBIENT]

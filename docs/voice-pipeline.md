@@ -164,7 +164,8 @@ speaker matching, **not** liveness or anti-spoofing.
 
 | Condition | Behaviour |
 |---|---|
-| Microphone missing / PortAudio error | `MicrophoneError` raised; manual test prints it and exits with code 1 |
+| Microphone missing / PortAudio error | `MicrophoneError` raised; message names the likely cause (no device, access denied, busy, sample rate, disconnect) plus the original detail via `voice/audio_errors.py` (Batch 15); manual test prints it and exits with code 1 |
+| Unexpected transcription error | one developer-authored line ("I had a problem hearing you."), clean runtime-error exit; every resource released (Batch 15) |
 | Whisper raises | logged with traceback, returns `""` |
 | Empty transcription | logged, returns `""` |
 | Short / noise-only capture | discarded before Whisper, returns `""` |
@@ -274,3 +275,16 @@ prints:
   below/above that threshold, plus the speech/ambient median ratio
 
 Use it to decide tuning changes — never to hard-code a threshold.
+
+### Actionable microphone messages (Batch 15)
+
+Raw PortAudio/OS errors are classified by `voice/audio_errors.py` into an
+actionable explanation — access denied, no input device, unavailable/busy,
+unsupported sample rate, or disconnected — while still printing the
+original detail (truncated to 300 characters). The same wording is used by
+the listener, the wake-word engine and the diagnostic run. Unrecognised
+errors fall back to "the audio subsystem reported an error"; the module is
+pure (imports no audio library) and never touches audio content,
+transcripts or embeddings. See
+[voice-troubleshooting.md](voice-troubleshooting.md) and
+[voice-smoke-test.md](voice-smoke-test.md).

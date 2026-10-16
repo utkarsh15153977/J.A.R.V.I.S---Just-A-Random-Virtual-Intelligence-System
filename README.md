@@ -452,6 +452,28 @@ not passing.
     `pyttsx3` unavailable the reply is printed only and the loop
     continues; on "exit" the process shuts down cleanly.
 
+### Batch 15 integration & diagnostics checks
+
+Batch 15 audits the full pipeline and makes microphone failures
+actionable. The complete, per-run checklist lives in
+[docs/voice-smoke-test.md](docs/voice-smoke-test.md); failure meanings
+are in [docs/voice-troubleshooting.md](docs/voice-troubleshooting.md).
+
+17. Actionable microphone errors: with the microphone unplugged, access
+    denied or held by another app, the manual test prints the classified
+    cause (plus the original detail) instead of a raw `PaErrorCode`
+    (items 8–12 of the smoke test). *(software classification covered by
+    `tests/test_audio_errors.py`; the real-device cases were **not run**
+    in Batch 15 — mark them by hand.)*
+18. Exactly-once execution: a command runs the tool once per activation,
+    never twice (`tests/test_pipeline.py`).
+19. Router recovery and empty transcripts: a routing failure or empty
+    capture does not run a tool and the loop keeps listening.
+20. Unexpected transcription error: the loop shuts down cleanly
+    ("I had a problem hearing you."), releasing every resource.
+21. Clean shutdown during startup: Ctrl+C before speaking exits cleanly
+    with no traceback.
+
 ## Project structure
 
 ```
@@ -470,6 +492,7 @@ Jarvis/
 │   └── router.py          # text -> structured command (no execution)
 ├── voice/
 │   ├── detection.py       # pure audio logic: RMS, calibration, segmenter
+│   ├── audio_errors.py    # actionable, classified microphone errors
 │   ├── listener.py        # mic -> detection -> Whisper pipeline
 │   ├── speaker.py         # text-to-speech (pyttsx3, fail-soft)
 │   ├── states.py          # explicit listening-state machine
@@ -489,4 +512,6 @@ Jarvis/
 ## Documentation
 
 - [docs/voice-pipeline.md](docs/voice-pipeline.md) — how voice input works
+- [docs/voice-smoke-test.md](docs/voice-smoke-test.md) — manual Windows smoke test
+- [docs/voice-troubleshooting.md](docs/voice-troubleshooting.md) — microphone / wake-word / speech problems
 - [docs/roadmap.md](docs/roadmap.md) — phase-by-phase plan and status

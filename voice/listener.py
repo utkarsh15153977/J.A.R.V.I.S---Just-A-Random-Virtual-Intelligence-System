@@ -19,6 +19,7 @@ import numpy as np
 import sounddevice as sd
 
 from config import VoiceConfig
+from voice.audio_errors import describe_audio_error
 from voice.detection import (
     SPEECH_END,
     SPEECH_START,
@@ -133,7 +134,9 @@ class Listener:
                     data, _overflowed = stream.read(self.block_size)
                     levels.append(rms(data[:, 0]))
         except (sd.PortAudioError, OSError) as exc:
-            raise MicrophoneError(f"Microphone unavailable: {exc}") from exc
+            raise MicrophoneError(
+                describe_audio_error(exc, context="Microphone unavailable")
+            ) from exc
 
         baseline = float(np.median(levels))
         threshold = compute_energy_threshold(
@@ -257,7 +260,11 @@ class Listener:
                             return None
 
         except (sd.PortAudioError, OSError) as exc:
-            raise MicrophoneError(f"Microphone stream failed: {exc}") from exc
+            raise MicrophoneError(
+                describe_audio_error(
+                    exc, context="Microphone stream failed"
+                )
+            ) from exc
 
         if not audio_blocks:
             return None

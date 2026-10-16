@@ -44,6 +44,7 @@ from typing import Any, Callable, Deque, Dict, Optional, Protocol
 import numpy as np
 
 from config import WakeConfig
+from voice.audio_errors import describe_audio_error
 
 logger = logging.getLogger("jarvis.wakeword")
 
@@ -316,7 +317,12 @@ class OpenWakeWordDetector:
             raise
         except Exception as exc:
             raise WakeWordUnavailableError(
-                "microphone unavailable for wake-word detection"
+                describe_audio_error(
+                    exc,
+                    context=(
+                        "Microphone unavailable for wake-word detection"
+                    ),
+                )
             ) from exc
         self._stream = stream
         return stream
@@ -328,6 +334,11 @@ class OpenWakeWordDetector:
             data, _overflowed = stream.read(samples)
         except Exception as exc:
             raise WakeWordUnavailableError(
-                "microphone unavailable for wake-word detection"
+                describe_audio_error(
+                    exc,
+                    context=(
+                        "Microphone unavailable for wake-word detection"
+                    ),
+                )
             ) from exc
         return data[:, 0].copy()
