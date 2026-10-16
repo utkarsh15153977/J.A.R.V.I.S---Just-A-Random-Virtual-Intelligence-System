@@ -2347,3 +2347,106 @@ skipped, unchanged).
 - Freshness is disclosed, never judged; provider-vs-source comparison is
   lexical and covers only the quantity kinds the module models.
 - No commit or push was made.
+
+## Z.12 Batch 19 addendum - persistent memory
+
+Batch 19 adds the first **explicitly user-started persistent memory**: an
+opt-in capability, **off by default**, that needs both `--tools` and
+`--memory` (or `MemoryConfig.enabled=True`). It adds **no dependency**
+(standard library only) and no automatic capture of any kind. Every
+memory operation runs through the existing single `ToolExecutor`, so the
+permission model, the bound single-use confirmations and the logging
+privacy rules all apply unchanged.
+
+### Z.12.1 Changes
+
+- **`core/memory.py` (new).** `MemoryRecord` (a validated 8-hex lowercase
+  id, a value, an optional category, created/updated timestamps) with
+  `__post_init__` validation and `to_dict`/`from_dict`;
+  `MemoryValidationError(ValueError)` and `MemoryStoreError(RuntimeError)`
+  (deliberately not the builtin `MemoryError`); a `MemoryStore` protocol
+  (`load`/`save`); and `MemoryService` (`list`, `find`, `save`, `delete`,
+  `clear`) with an injected `store`, id factory and clock. `MEMORY_OPERATIONS`
+  maps each operation to its tool id; `build_memory_specs` and
+  `register_memory_tools` register `memory_save`, `memory_list`,
+  `memory_get` (all `SAFE`) and `memory_delete`, `memory_clear` (both
+  `CONFIRM`). Values are capped at `MAX_VALUE_CHARS` (500), categories at
+  `MAX_CATEGORY_CHARS` (32), listings at `MAX_LIST_CHARS` (600) and the
+  store at `MAX_RECORDS` (200): a save past the cap raises
+  `MemoryValidationError` rather than evicting. A save of an existing value
+  is a no-op; reads never write; delete/clear save only when something
+  changed.
+- **`core/memory_store.py` (new).** `default_memory_dir()` and
+  `JsonMemoryStore` (optional base dir or explicit path). One fixed
+  `memories.json`, an envelope `{"version": 1, "memories": [...]}`, an
+  atomic write (temp file + `os.replace`), best-effort owner-only
+  permissions (`_restrict`, `os.chmod` where supported) and a `_safe_unlink`
+  cleanup. A missing file loads as empty and creates nothing; an
+  unreadable, malformed or invalid file raises `MemoryStoreError` and is
+  never silently overwritten.
+- **`config.py`.** New `MemoryConfig` (`enabled=False`, `data_dir=""`,
+  `max_records=200`, `max_value_chars=500`, `max_category_chars=32`) with a
+  `validate()` that bounds each numeric field and type-checks `data_dir`.
+- **`core/router.py`.** Added whole-word memory phrase sets and helpers
+  (`_MEMORY_SAVE_TRIGGERS`, `_MEMORY_GET_TRIGGERS`, `_MEMORY_DELETE_TRIGGERS`,
+  `_MEMORY_LIST_PHRASES`/`_MEMORY_LIST_PREFIXES`, `_MEMORY_CLEAR_PHRASES`,
+  `_memory_request`, `_memory_payload`). Matching is exact/whole-word only
+  (no fuzzy/prefix/semantic matching); a bare "remember" is not a save; the
+  payload is sliced from the original utterance so casing is preserved. The
+  router still only classifies — it never executes.
+- **`app.py`.** Added the `--memory` flag (usage, `_Options`, `_parse_args`),
+  injected `memory_config`/`memory_store`/`memory_service` into
+  `_build_registry` and `memory_tools` into `_build_router`, built the store
+  and service only when `--memory` and `--tools` are both active, reported
+  `"Persistent memory requires --tools; keeping it disabled."` otherwise,
+  computed the registered `memory_tools` mapping, and added a startup
+  notice. No directory or file is created when the capability is off, and
+  importing the modules performs no I/O.
+- **Tests.** `tests/test_memory.py` (new, 48 tests: record validation,
+  store round-trip/atomic-write-corruption, service dedup/caps/list/get,
+  handler mapping and safety). `tests/test_router.py` gains
+  `TestMemoryRouting` (17). `tests/test_app.py` gains
+  `TestMemoryIntegration` (10: off by default, `--memory` requires
+  `--tools`, save/list/get end to end with confirmation-gated delete and
+  clear, research text cannot become a memory, registry inertness).
+  `tests/test_config.py` gains `TestMemoryConfig` (6).
+- **Docs.** New `docs/memory.md`; `README.md` (status, `--memory` example,
+  a memory paragraph, project structure, docs index, Batch 19 test note),
+  `docs/safety.md` (a "Persistent memory (Batch 19)" section and a known
+  limitation), `docs/roadmap.md` (Batch 19 note) and this addendum.
+
+### Z.12.2 Batch 19 verification (actually run)
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Full suite | `python -m unittest discover -s tests` | **PASS** - 864 tests, OK (skipped=3) |
+| Compile | `python -m compileall -q app.py core voice config.py scripts tests` | **PASS** - exit 0 |
+| Lint | `ruff check .` | **PASS** - All checks passed |
+| Dependencies | `python -m pip check` | **PASS** - No broken requirements found |
+| Entry point | `python app.py --help` | **PASS** - usage printed, exit 0 |
+| Whitespace | `git diff --check` | **PASS** - exit 0 (LF->CRLF notices only) |
+| Evaluation runner | `python scripts/run_evaluation.py` | **PASS** - 34/34 cases (research=19, routing=15), exit 0 |
+| Memory tests | `python -m unittest tests.test_memory` | **PASS** - 48 tests, OK |
+| Live validator (no key) | `python scripts/validate_research_backend.py` | **BLOCKED** - prints `[BLOCKED]`, exit 3 |
+
+**Test delta:** Batch 18.1 had 783 tests; Batch 19 adds 81 -> 864 (3
+skipped, unchanged).
+
+### Z.12.3 Not run / remaining limitations (Batch 19)
+
+- **No live microphone verification here** (`Microphone error: no
+  device`). Memory routing is exercised with fixed transcripts and
+  injected stores; recognising the save phrase from real speech is not
+  verified and depends on the same transcription quality as every other
+  command.
+- **No live Tavily call - BLOCKED** (`TAVILY_API_KEY` unset); the
+  "research text cannot be saved" case uses an injected result.
+- The store is **plain text and not encrypted**; owner-only permissions are
+  best-effort (`os.chmod`, not an NTFS ACL on Windows), so the per-user
+  directory is the real protection. Do not store secrets.
+- There is no edit or search command, no age/size eviction and no
+  encryption; a save past the 200-record cap is refused, not silently
+  evicted.
+- Matching is a fixed whole-word phrase set; there is no fuzzy or semantic
+  matching, so a mis-heard phrase is not corrected.
+- No commit or push was made.

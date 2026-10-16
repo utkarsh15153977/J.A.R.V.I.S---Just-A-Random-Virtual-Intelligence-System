@@ -809,3 +809,52 @@ grammar; a mis-heard word mid-query is untouched; freshness is disclosed,
 not judged; provider-vs-source comparison reuses the same lexical quantity
 extraction, so a value it cannot parse is not compared. Live Tavily and a
 real microphone remain unverified in this environment.
+
+## Batch 19 note (persistent memory)
+
+Batch 19 adds a small, secure, testable **persistent memory**. It is the
+first capability that keeps user-provided state between runs, so it is
+deliberately narrow: explicitly user-started, local-only, off by default
+and doubly opt-in (`--tools` **and** `--memory`, or
+`MemoryConfig.enabled=True`). No new dependency is added and nothing is
+written when it is off.
+
+- **Service and store.** `core/memory.py` adds `MemoryRecord`, a
+  `MemoryService` over an injected `MemoryStore` protocol, and the five
+  tool specs; `core/memory_store.py` adds `JsonMemoryStore`, a
+  standard-library JSON store with an atomic write (temp file plus
+  `os.replace`) and best-effort owner-only permissions. The composition
+  root (`app.py`) builds the store and service and injects them; importing
+  the module does no I/O and creates no file.
+- **Five tools, two confirmed.** `memory_save`, `memory_list` and
+  `memory_get` are `SAFE`; `memory_delete` and `memory_clear` are the only
+  `CONFIRM` actions. All five register in the normal `ToolRegistry` and run
+  only through the single `ToolExecutor`, so delete/clear reuse the bound,
+  single-use, expiring confirmation tickets. `--memory` without `--tools`
+  is reported and stays disabled.
+- **Explicit, whole-word triggers only.** A save needs a fixed save phrase
+  ("remember that/this", "please remember that/this", "note that", "make a
+  note that", "save a memory that", "save memory that"); a bare "remember"
+  is not a save, and nothing is captured automatically. List/get/delete/
+  clear match fixed phrase sets with no fuzzy, prefix or semantic matching.
+- **Content is data, never an instruction.** A stored value is quoted or
+  listed as text; it can never approve a confirmation, grant a permission
+  or trigger a tool, and it is not used to answer anything unless asked for.
+- **Bounded and fail-closed.** Values are capped at 500 characters,
+  categories at 32, listings at 600 characters returned, and the store
+  holds at most 200 records (a save past the cap is refused, not silently
+  evicted). A missing file is an empty memory; an unreadable, malformed or
+  invalid file raises `MemoryStoreError` and is never overwritten.
+- **Verification.** +81 tests (783 → 864): `tests/test_memory.py` (48),
+  `TestMemoryRouting` in `tests/test_router.py` (17),
+  `TestMemoryIntegration` in `tests/test_app.py` (10) and
+  `TestMemoryConfig` in `tests/test_config.py` (6) — all with injected
+  stores and clamps, no file, microphone, model or network.
+
+Limits, reported not hidden: the store is **plain text and not
+encrypted**, and owner-only permissions are best-effort (on Windows,
+`os.chmod` only), so the per-user directory is the real protection — do
+not store secrets. There is no edit or search command and no age/size
+eviction, and recognition of the save phrase depends on the same speech
+transcription as every other command. Live microphone and live provider
+checks remain unverified in this environment.

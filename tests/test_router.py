@@ -4,6 +4,13 @@ import dataclasses
 import unittest
 
 from core.app_launcher import APP_LAUNCH_INTENTS, TOOL_LAUNCH_APPLICATION
+from core.memory import (
+    TOOL_MEMORY_CLEAR,
+    TOOL_MEMORY_DELETE,
+    TOOL_MEMORY_GET,
+    TOOL_MEMORY_LIST,
+    TOOL_MEMORY_SAVE,
+)
 from core.research import TOOL_WEB_RESEARCH
 from core.router import (
     DEFAULT_TOOL_INTENTS,
@@ -551,6 +558,171 @@ class TestSpeechQueryNormalization(unittest.TestCase):
             router.route("Jarvis, who is the president of the USA?").kind,
             CommandKind.UNSUPPORTED,
         )
+
+
+class TestMemoryRouting(unittest.TestCase):
+    """Batch 19: explicit memory phrases route only to memory tools.
+
+    The router names a registered memory tool and never executes it. Saving
+    needs a whole-word trigger, so unrelated text is never stored, and with
+    ``memory_tools`` unset every memory phrase stays unsupported.
+    """
+
+    def _router(self, **kwargs):
+        tools = {
+            "save": TOOL_MEMORY_SAVE,
+            "list": TOOL_MEMORY_LIST,
+            "get": TOOL_MEMORY_GET,
+            "delete": TOOL_MEMORY_DELETE,
+            "clear": TOOL_MEMORY_CLEAR,
+        }
+        options = {
+            "available_tools": (
+                *tools.values(),
+                "get_current_time",
+                TOOL_WEB_RESEARCH,
+            ),
+            "memory_tools": tools,
+        }
+        options.update(kwargs)
+        return ToolCommandRouter(DEFAULT_TOOL_INTENTS, **options)
+
+    def test_save_trigger_preserves_value_and_case(self):
+        command = self._router().route("Remember that I love Python")
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_MEMORY_SAVE)
+        self.assertEqual(dict(command.arguments), {"value": "I love Python"})
+
+    def test_polite_save_trigger(self):
+        command = self._router().route(
+            "Please remember that the meeting is on Friday"
+        )
+        self.assertEqual(command.tool_name, TOOL_MEMORY_SAVE)
+        self.assertEqual(
+            dict(command.arguments)["value"], "the meeting is on Friday"
+        )
+
+    def test_leading_filler_is_skipped_for_save(self):
+        command = self._router().route("and jarvis remember that I like tea")
+        self.assertEqual(command.tool_name, TOOL_MEMORY_SAVE)
+        self.assertEqual(dict(command.arguments)["value"], "I like tea")
+
+    def test_note_that_is_a_save_trigger(self):
+        command = self._router().route("Note that the code is blue")
+        self.assertEqual(command.tool_name, TOOL_MEMORY_SAVE)
+
+    def test_bare_remember_is_not_a_save(self):
+        router = self._router()
+        for text in (
+            "remember to call mom",
+            "remember that",
+            "I prefer concise answers",
+            "how can I remember more effectively?",
+            "what should I remember for the exam",
+        ):
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+    def test_list_phrases(self):
+        router = self._router()
+        for text in (
+            "list my memories",
+            "list my saved memories",
+            "show my memories",
+            "what do you remember",
+            "what do you remember about me",
+            "what have you remembered",
+        ):
+            with self.subTest(text=text):
+                command = router.route(text)
+                self.assertIs(command.kind, CommandKind.TOOL)
+                self.assertEqual(command.tool_name, TOOL_MEMORY_LIST)
+                self.assertEqual(dict(command.arguments), {})
+
+    def test_list_prefix_with_a_subject(self):
+        command = self._router().route("what do you remember about my editor")
+        self.assertEqual(command.tool_name, TOOL_MEMORY_LIST)
+
+    def test_get_phrase_carries_a_selector(self):
+        command = self._router().route("recall memory a1b2c3d4")
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_MEMORY_GET)
+        self.assertEqual(dict(command.arguments), {"selector": "a1b2c3d4"})
+
+    def test_get_without_a_selector_is_unsupported(self):
+        self.assertIs(
+            self._router().route("what is memory").kind,
+            CommandKind.UNSUPPORTED,
+        )
+
+    def test_delete_phrase_carries_a_selector(self):
+        command = self._router().route("forget memory a1b2c3d4")
+        self.assertEqual(command.tool_name, TOOL_MEMORY_DELETE)
+        self.assertEqual(dict(command.arguments), {"selector": "a1b2c3d4"})
+
+    def test_delete_by_value(self):
+        command = self._router().route("delete the memory about my editor")
+        self.assertEqual(command.tool_name, TOOL_MEMORY_DELETE)
+        self.assertEqual(dict(command.arguments), {"selector": "my editor"})
+
+    def test_clear_phrases(self):
+        router = self._router()
+        for text in (
+            "clear all memories",
+            "clear all my saved memories",
+            "forget everything",
+            "delete all memories",
+        ):
+            with self.subTest(text=text):
+                command = router.route(text)
+                self.assertEqual(command.tool_name, TOOL_MEMORY_CLEAR)
+                self.assertEqual(dict(command.arguments), {})
+
+    def test_action_requests_are_not_treated_as_clear_or_delete(self):
+        router = self._router()
+        for text in ("delete all files", "remove the file", "open notepad"):
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+    def test_memory_disabled_leaves_phrases_unsupported(self):
+        router = self._router(memory_tools=None)
+        for text in (
+            "remember that I like tea",
+            "list my memories",
+            "forget memory a1b2c3d4",
+            "clear all memories",
+        ):
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+    def test_unregistered_memory_tool_is_ignored(self):
+        router = self._router(
+            available_tools=("get_current_time",),
+            memory_tools={"save": TOOL_MEMORY_SAVE},
+        )
+        self.assertIs(
+            router.route("remember that I like tea").kind,
+            CommandKind.UNSUPPORTED,
+        )
+
+    def test_memory_wins_over_research(self):
+        router = self._router(research_tool=TOOL_WEB_RESEARCH)
+        command = router.route("remember that I like tea")
+        self.assertEqual(command.tool_name, TOOL_MEMORY_SAVE)
+        # A list prefix is a memory request, not a research question.
+        command = router.route("what do you remember about the war")
+        self.assertEqual(command.tool_name, TOOL_MEMORY_LIST)
+
+    def test_research_still_works_alongside_memory(self):
+        router = self._router(research_tool=TOOL_WEB_RESEARCH)
+        command = router.route("who is the president of the USA")
+        self.assertEqual(command.tool_name, TOOL_WEB_RESEARCH)
 
 
 class TestCommandRequest(unittest.TestCase):

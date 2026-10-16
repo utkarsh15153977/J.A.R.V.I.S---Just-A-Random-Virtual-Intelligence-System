@@ -5,6 +5,7 @@ import unittest
 from config import (
     AppsConfig,
     ConfigError,
+    MemoryConfig,
     SpeakerVerificationConfig,
     VoiceConfig,
     WakeConfig,
@@ -141,6 +142,39 @@ class TestAppsConfig(unittest.TestCase):
     def test_duplicate_allowed_rejected(self):
         with self.assertRaises(ConfigError):
             AppsConfig(allowed=("notepad", "notepad")).validate()
+
+
+class TestMemoryConfig(unittest.TestCase):
+    def test_defaults_are_disabled_and_valid(self):
+        config = MemoryConfig()
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.data_dir, "")
+        self.assertIs(config.validate(), config)
+
+    def test_enabled_with_data_dir_is_valid(self):
+        config = MemoryConfig(enabled=True, data_dir="some/dir")
+        self.assertIs(config.validate(), config)
+
+    def assert_invalid(self, **overrides):
+        config = MemoryConfig(**overrides)
+        with self.assertRaises(ConfigError):
+            config.validate()
+
+    def test_non_bool_enabled_rejected(self):
+        self.assert_invalid(enabled="yes")
+
+    def test_non_string_data_dir_rejected(self):
+        self.assert_invalid(data_dir=1)
+
+    def test_caps_must_be_positive(self):
+        self.assert_invalid(max_records=0)
+        self.assert_invalid(max_value_chars=0)
+        self.assert_invalid(max_category_chars=0)
+
+    def test_caps_cannot_exceed_absolute_limits(self):
+        self.assert_invalid(max_records=201)
+        self.assert_invalid(max_value_chars=501)
+        self.assert_invalid(max_category_chars=33)
 
 
 class TestSpeakerVerificationConfig(unittest.TestCase):

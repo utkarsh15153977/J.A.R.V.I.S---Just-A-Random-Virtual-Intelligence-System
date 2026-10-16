@@ -556,6 +556,82 @@ Transcript logging stays off unless separately opted in. See
 `docs/roadmap.md` (Batch 17) for the Tavily pricing/usage note and the
 distance/movie follow-ups.
 
+## Persistent memory (Batch 19)
+
+`core/memory.py` and `core/memory_store.py` add an optional, **explicitly
+user-started** memory. It is off by default and doubly opt-in: it needs
+**both** `--tools` and `--memory` (or `MemoryConfig.enabled=True`). With
+`--memory` but no `--tools`, `app.py` reports that it stays disabled and
+nothing is registered. It adds five tools, all zero-or-one-argument,
+registered through the normal `ToolRegistry` and executed only through the
+single `ToolExecutor`:
+
+| Tool | Level | Effect |
+| --- | --- | --- |
+| `memory_save` | `SAFE` | store one short text value |
+| `memory_list` | `SAFE` | list short summaries of stored memories |
+| `memory_get` | `SAFE` | read one memory by its id |
+| `memory_delete` | `CONFIRM` | remove one memory by its id |
+| `memory_clear` | `CONFIRM` | remove every memory |
+
+Properties:
+
+- **Explicit triggers only; never automatic.** A save happens only when the
+  utterance contains a whole-word save phrase ("remember that/this",
+  "please remember that/this", "note that", "make a note that", "save a
+  memory that", "save memory that"). A bare "remember" is **not** a save,
+  and Jarvis never records a conversation, a transcript, a tool result or a
+  research answer on its own. A save always requires the user's own words.
+- **Remembered text is data, never an instruction.** A stored value is
+  quoted back, listed or read as text; it is never parsed as a command, can
+  never approve a confirmation, grant a permission or trigger a tool, and is
+  never used to answer a question unless the user explicitly asks for it.
+  The router and the executor remain the only authorities.
+- **Deletion and clearing are confirmed.** `memory_delete` and
+  `memory_clear` are the only `CONFIRM` actions and use the same bound,
+  single-use, expiring ticket mechanism (section "Bound confirmation") as
+  every other confirmed tool; a denial, expiry, replay or unrelated outcome
+  runs nothing and revokes the pending ticket. A spoken "yes" is still not
+  accepted.
+- **Bounded.** A value is capped at `MAX_VALUE_CHARS` (500) and a category
+  at `MAX_CATEGORY_CHARS` (32); the store keeps at most `MAX_RECORDS` (200)
+  and listing emits at most `MAX_LIST_CHARS` (600) characters before it
+  truncates with a clear marker. Saved values are length-checked and
+  stripped; an empty value or category is rejected.
+- **Local-only, fixed location, no dependency.** `core/memory_store.py`
+  writes one `memories.json` file under a per-user application-data
+  directory (`default_memory_dir()`), never into the repository and never
+  anywhere a tool argument can choose. Writes are atomic (temp file plus
+  `os.replace`) and the file is restricted to the owner where the platform
+  supports it (best effort: on Windows that is `os.chmod`, not an NTFS ACL).
+  The store is standard-library only, so `--memory` adds **no** dependency,
+  does no network I/O and never sends a memory anywhere.
+- **Injected, not global.** `app.py` is the composition root: it builds the
+  store and service and hands them to the registry builder. Importing
+  `core/memory.py` performs no I/O and creates no file, and no directory or
+  file is created while the capability is off.
+- **Fail-closed on corruption.** A missing store file is an empty memory
+  (and nothing is created until the first save). A file that is unreadable,
+  malformed or fails validation raises `MemoryStoreError`; the tool reports
+  it as text and **never** silently overwrites or discards existing data.
+- **No fuzzy or semantic matching.** List, get, delete and clear run on a
+  fixed, enumerated set of whole-word phrases; there is no prefix, regex,
+  embedding or LLM selector, so a mis-heard phrase cannot widen a match.
+- **Privacy.** A memory is stored in plain text in the user's application
+  data. It is not encrypted and no confidentiality is claimed: anyone with
+  access to your user profile can read it, so do not ask Jarvis to remember
+  secrets, passwords or anything you would not write in a plain-text file.
+  Memory activity is logged the same minimal way as other turns (the tool
+  id and outcome, never the value), and transcript logging stays off unless
+  separately opted in.
+
+**Testing.** `tests/test_memory.py`, `tests/test_router.py` and
+`tests/test_app.py` exercise record validation, the store's atomic write
+and corruption handling, dedup and caps, listing/get by id, the
+confirmation round-trips for delete and clear, and the invariant that a
+remembered value cannot become an instruction — all with injected stores
+and clocks (no file, microphone, model or network).
+
 ## Speech output
 
 `voice/speaker.py` produces spoken replies with `pyttsx3` (SAPI5 on
@@ -1015,6 +1091,18 @@ calls a handler directly.
   providers (Google Maps Routes for travel distance, a movie database for
   film facts) are noted as follow-ups in `docs/roadmap.md` (Batch 17)
   rather than implemented here.
+- Persistent memory is **optional, off by default, and stored in plain
+  text**: it is not encrypted and owner-only permissions are best-effort
+  (on Windows, `os.chmod` only, no NTFS ACL), so the per-user directory is
+  the real protection. Do not store secrets or passwords. Matching is a
+  fixed phrase set (no fuzzy, embedding or LLM selection), and the
+  capability never saves anything on its own — but the *recognition* of
+  the save phrase still depends on the same speech transcription as every
+  other command, so a mis-heard utterance could in principle be saved or,
+  more likely, a genuine save phrase could be missed. There is no memory
+  editing command, no search across memories, and no size/age-based
+  eviction beyond the `MAX_RECORDS` cap; when the cap is reached a new
+  save is refused rather than silently dropping an old memory.
 - Battery status is Windows-only (read through `ctypes`); on other
   platforms the tool reports that battery status is unavailable. The
   battery and disk values reported on this machine were read live and are

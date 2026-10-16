@@ -116,6 +116,192 @@ def _strip_lead_ins(normalized: str) -> str:
     return " ".join(tokens)
 
 
+# ---------------------------------------------------------------------------
+# Optional persistent-memory commands
+# ---------------------------------------------------------------------------
+# Recognised only when the matching memory tool is registered. Saving is
+# deliberately explicit: a phrase must contain a whole save trigger (for
+# example "remember that ...") before any text is treated as a memory, so a
+# bare "I prefer concise answers" or a provider's search result can never be
+# stored. The trigger words are matched as whole words after leading
+# conversational filler, never fuzzily.
+_WORD_EDGE: str = "'\u2019\".,:;!?"
+
+_MEMORY_SAVE_TRIGGERS: tuple[tuple[str, ...], ...] = (
+    ("remember", "that"),
+    ("remember", "this"),
+    ("please", "remember", "that"),
+    ("please", "remember", "this"),
+    ("note", "that"),
+    ("make", "a", "note", "that"),
+    ("save", "a", "memory", "that"),
+    ("save", "memory", "that"),
+)
+
+_MEMORY_GET_TRIGGERS: tuple[tuple[str, ...], ...] = (
+    ("recall", "the", "memory"),
+    ("recall", "memory"),
+    ("read", "the", "memory"),
+    ("read", "memory"),
+    ("retrieve", "the", "memory"),
+    ("retrieve", "memory"),
+    ("get", "the", "memory"),
+    ("get", "memory"),
+    ("what", "is", "the", "memory"),
+    ("what", "is", "memory"),
+    ("whats", "the", "memory"),
+    ("whats", "memory"),
+)
+
+_MEMORY_DELETE_TRIGGERS: tuple[tuple[str, ...], ...] = (
+    ("forget", "the", "memory", "about"),
+    ("forget", "memory", "about"),
+    ("delete", "the", "memory", "about"),
+    ("delete", "memory", "about"),
+    ("forget", "the", "memory"),
+    ("forget", "memory"),
+    ("delete", "the", "memory"),
+    ("delete", "memory"),
+    ("remove", "the", "memory"),
+    ("remove", "memory"),
+)
+
+_MEMORY_LIST_PHRASES: FrozenSet[str] = frozenset(
+    {
+        "list my memories",
+        "list my saved memories",
+        "list saved memories",
+        "list memories",
+        "list all my memories",
+        "list all memories",
+        "show my memories",
+        "show my saved memories",
+        "show memories",
+        "show all my memories",
+        "show all memories",
+        "show me my memories",
+        "what memories do you have",
+        "what have you remembered",
+        "what do you remember",
+        "what do you remember about me",
+        "do you remember anything about me",
+    }
+)
+
+_MEMORY_LIST_PREFIXES: tuple[str, ...] = (
+    "what do you remember",
+    "what have you remembered",
+)
+
+_MEMORY_CLEAR_PHRASES: FrozenSet[str] = frozenset(
+    {
+        "clear all my memories",
+        "clear all memories",
+        "clear my memories",
+        "clear my saved memories",
+        "clear all my saved memories",
+        "delete all my memories",
+        "delete all memories",
+        "forget all my memories",
+        "forget all memories",
+        "forget everything",
+        "erase all my memories",
+        "erase all memories",
+        "wipe all my memories",
+        "wipe all memories",
+        "remove all my memories",
+        "remove all memories",
+    }
+)
+
+
+def _clean_word(word: str) -> str:
+    """Lower-cased word with surrounding punctuation removed."""
+    return word.strip(_WORD_EDGE).casefold()
+
+
+def _is_memory_list(normalized: str) -> bool:
+    if normalized in _MEMORY_LIST_PHRASES:
+        return True
+    return any(
+        normalized.startswith(prefix + " ") for prefix in _MEMORY_LIST_PREFIXES
+    )
+
+
+def _memory_payload(
+    original: str, triggers: tuple[tuple[str, ...], ...]
+) -> Optional[str]:
+    """Return the text after a whole-word trigger, preserving casing.
+
+    Leading conversational filler is skipped so "and remember that X" works.
+    The payload is sliced from the *original* utterance, so the saved value
+    keeps the user's own capitalisation and wording. Returns ``None`` when no
+    trigger is present or nothing follows it.
+    """
+    words = (original or "").split()
+    if not words:
+        return None
+    cleaned = [_clean_word(word) for word in words]
+    start = 0
+    while start < len(cleaned) and cleaned[start] in _LEAD_INS:
+        start += 1
+    for trigger in sorted(triggers, key=len, reverse=True):
+        end = start + len(trigger)
+        if tuple(cleaned[start:end]) == trigger:
+            payload = " ".join(words[end:]).strip()
+            if payload:
+                return payload
+    return None
+
+
+def _memory_request(
+    normalized: str,
+    original: str,
+    memory_tools: Mapping[str, str],
+) -> Optional[CommandRequest]:
+    """Turn an explicit memory phrase into a tool request, or ``None``.
+
+    The router never executes; it only names a registered memory tool. A
+    request is built only from a fixed, enumerated phrase or a whole-word
+    trigger, so unknown input is never treated as memory.
+    """
+    if not memory_tools:
+        return None
+    clear = memory_tools.get("clear")
+    if clear and normalized in _MEMORY_CLEAR_PHRASES:
+        return CommandRequest(CommandKind.TOOL, tool_name=clear)
+    list_tool = memory_tools.get("list")
+    if list_tool and _is_memory_list(normalized):
+        return CommandRequest(CommandKind.TOOL, tool_name=list_tool)
+    save = memory_tools.get("save")
+    if save:
+        value = _memory_payload(original, _MEMORY_SAVE_TRIGGERS)
+        if value:
+            return CommandRequest(
+                CommandKind.TOOL,
+                tool_name=save,
+                arguments={"value": value},
+            )
+    if normalized.startswith("forget") or normalized.startswith("delete") or (
+        normalized.startswith("remove")
+    ):
+        order = (("delete", _MEMORY_DELETE_TRIGGERS), ("get", _MEMORY_GET_TRIGGERS))
+    else:
+        order = (("get", _MEMORY_GET_TRIGGERS), ("delete", _MEMORY_DELETE_TRIGGERS))
+    for operation, triggers in order:
+        tool = memory_tools.get(operation)
+        if not tool:
+            continue
+        selector = _memory_payload(original, triggers)
+        if selector:
+            return CommandRequest(
+                CommandKind.TOOL,
+                tool_name=tool,
+                arguments={"selector": selector},
+            )
+    return None
+
+
 # Deterministic policy for the *general-question* fallback used when web
 # research is enabled (see ``ToolCommandRouter``). A phrase is eligible
 # only if it opens with a question word and is not an imperative action
@@ -235,7 +421,7 @@ class PlaceholderRouter:
         classification = _strip_lead_ins(normalized)
         if classification in self._exit_words:
             return CommandRequest(CommandKind.EXIT)
-        intent = self._match_intent(classification)
+        intent = self._match_intent(classification, text)
         if intent is not None:
             return intent
         fallback = self._match_fallback(classification, text)
@@ -246,8 +432,10 @@ class PlaceholderRouter:
             CommandKind.UNSUPPORTED, response=self._unsupported_response
         )
 
-    def _match_intent(self, normalized: str) -> Optional[CommandRequest]:
-        """Hook for subclasses; receives normalised, de-noised text."""
+    def _match_intent(
+        self, normalized: str, original: str
+    ) -> Optional[CommandRequest]:
+        """Hook for subclasses; receives de-noised and original text."""
         return None
 
     def _match_fallback(
@@ -531,6 +719,13 @@ class ToolCommandRouter(PlaceholderRouter):
     used as a search string. With ``research_tool`` unset (the default)
     the behaviour is exactly the fixed-phrase router: spoken text is
     never copied and unknown input stays unsupported.
+
+    When ``memory_tools`` maps an operation (``save``/``list``/``get``/
+    ``delete``/``clear``) to a registered tool, a small, explicit set of
+    memory phrases is recognised. Saving requires a whole-word trigger
+    ("remember that ..."), so no unrelated text is ever stored; the router
+    still only names the tool and never executes it. With ``memory_tools``
+    unset the router behaves exactly as before.
     """
 
     def __init__(
@@ -540,6 +735,7 @@ class ToolCommandRouter(PlaceholderRouter):
         available_tools: Iterable[str] = (),
         research_tool: Optional[str] = None,
         research_max_query_chars: int = 400,
+        memory_tools: Optional[Mapping[str, str]] = None,
         exit_words: FrozenSet[str] = _EXIT_WORDS,
         clarify_response: str = _CLARIFY_RESPONSE,
         unsupported_response: str = _UNSUPPORTED_RESPONSE,
@@ -564,15 +760,24 @@ class ToolCommandRouter(PlaceholderRouter):
             research_tool if research_tool in available else None
         )
         self._research_max_query_chars = max(1, int(research_max_query_chars))
+        self._memory_tools = {
+            operation: tool_name
+            for operation, tool_name in (memory_tools or {}).items()
+            if isinstance(tool_name, str) and tool_name in available
+        }
 
-    def _match_intent(self, normalized: str) -> Optional[CommandRequest]:
+    def _match_intent(
+        self, normalized: str, original: str
+    ) -> Optional[CommandRequest]:
         entry = self._intents.get(normalized)
-        if entry is None:
-            return None
-        tool_name, arguments = entry
-        return CommandRequest(
-            CommandKind.TOOL, tool_name=tool_name, arguments=dict(arguments)
-        )
+        if entry is not None:
+            tool_name, arguments = entry
+            return CommandRequest(
+                CommandKind.TOOL,
+                tool_name=tool_name,
+                arguments=dict(arguments),
+            )
+        return _memory_request(normalized, original, self._memory_tools)
 
     def _match_fallback(
         self, normalized: str, original: str

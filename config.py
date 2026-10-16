@@ -358,6 +358,52 @@ class ResearchConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    """Settings for the optional, user-started persistent memory.
+
+    Memory is **off by default** and **requires** :class:`ToolsConfig` to
+    be enabled too. It stores only what the user explicitly asks to save,
+    never infers or auto-collects anything, and every operation still runs
+    through the guarded executor. Only text records are kept, in a single
+    local JSON file; the caps below bound each record and the collection so
+    a bad write cannot grow without limit.
+    """
+
+    enabled: bool = False
+
+    # Directory for the memory file. Empty means a per-user default
+    # location; the file is written atomically with owner-only permissions
+    # where the platform supports it.
+    data_dir: str = ""
+
+    # Collection and per-record bounds (cannot exceed the absolute limits
+    # enforced by core.memory).
+    max_records: int = 200
+    max_value_chars: int = 500
+    max_category_chars: int = 32
+
+    def validate(self) -> "MemoryConfig":
+        """Check every value and return self, or raise ConfigError."""
+        problems = []
+
+        if not isinstance(self.enabled, bool):
+            problems.append("enabled must be a boolean")
+        if not isinstance(self.data_dir, str):
+            problems.append("data_dir must be a string")
+        if not 1 <= self.max_records <= 200:
+            problems.append("max_records must be between 1 and 200")
+        if not 1 <= self.max_value_chars <= 500:
+            problems.append("max_value_chars must be between 1 and 500")
+        if not 1 <= self.max_category_chars <= 32:
+            problems.append("max_category_chars must be between 1 and 32")
+
+        if problems:
+            raise ConfigError("; ".join(problems))
+
+        return self
+
+
+@dataclass(frozen=True)
 class SpeechConfig:
     """Settings for the text-to-speech output pipeline."""
 

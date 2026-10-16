@@ -49,6 +49,14 @@ be routed to it, and a query is sent to the configured provider. Without
 credentials the capability reports itself unavailable and every existing
 command keeps working. It never executes anything itself.
 
+Persistent memory is an optional, opt-in capability (``--memory``, which
+also requires ``--tools``). It adds five tools (save, list, retrieve,
+delete, clear) operating on a single local JSON file. Nothing is ever
+saved automatically: saving needs an explicit "remember that ..." phrase.
+Delete and clear require confirmation. Memory only stores and returns text
+the user chose to keep; it never grants authority and is never treated as
+an instruction.
+
 Activation is always one of three explicit modes, decided at startup:
 
     MANUAL          no wake word, no verification: always-listen (default)
@@ -82,6 +90,7 @@ from typing import Any, Callable, List, Optional
 from config import (
     AppsConfig,
     ConfigError,
+    MemoryConfig,
     ResearchConfig,
     SpeakerVerificationConfig,
     SpeechConfig,
@@ -101,6 +110,13 @@ from core.app_launcher import (
 from core.builtin_tools import build_builtin_registry
 from core.executor import ExecutionResult, ExecutionStatus, ToolExecutor
 from core.log import setup_logging
+from core.memory import (
+    MEMORY_OPERATIONS,
+    MemoryService,
+    MemoryStore,
+    register_memory_tools,
+)
+from core.memory_store import JsonMemoryStore, default_memory_dir
 from core.permissions import ConsoleApprovalProvider, PermissionPolicy
 from core.research import (
     TOOL_WEB_RESEARCH,
@@ -177,6 +193,11 @@ _USAGE = (
     "                      in the TAVILY_API_KEY environment variable; OFF\n"
     "                      by default. General questions are sent to the\n"
     "                      search provider and answers cite their sources.\n"
+    "  --memory            Enable persistent memory you control explicitly.\n"
+    "                      Requires --tools. OFF by default: nothing is ever\n"
+    "                      saved automatically. Say 'remember that ...' to\n"
+    "                      save, 'list my memories' to review, and clear with\n"
+    "                      a confirmation. Stored locally as plain text.\n"
     "  --log-transcripts   Write full voice transcripts AND the routing\n"
     "                      outcome (which tool a command matched, or that\n"
     "                      it was unsupported) to the log file. OFF by\n"
@@ -197,6 +218,7 @@ class _Options:
     tools: bool = False
     allow_apps: bool = False
     research: bool = False
+    memory: bool = False
     log_transcripts: bool = False
     speak: bool = True
     show_help: bool = False
@@ -212,6 +234,7 @@ def _parse_args(argv: List[str]) -> _Options:
         tools="--tools" in argv,
         allow_apps="--allow-apps" in argv,
         research="--research" in argv,
+        memory="--memory" in argv,
         log_transcripts="--log-transcripts" in argv,
         speak="--no-speech" not in argv,
         show_help=any(arg in ("-h", "--help") for arg in argv),
@@ -239,6 +262,8 @@ def _build_registry(
     research_provider: Optional[ResearchProvider] = None,
     research_synthesizer: Optional[AnswerSynthesizer] = None,
     research_diagnostic: Optional[Callable[[str], None]] = None,
+    memory_config: Optional[MemoryConfig] = None,
+    memory_service: Optional[MemoryService] = None,
 ) -> ToolRegistry:
     """Return the registry of approved tools (empty unless enabled).
 
@@ -283,6 +308,12 @@ def _build_registry(
             synthesizer=research_synthesizer,
             diagnostic=research_diagnostic,
         )
+    if (
+        memory_config is not None
+        and memory_config.enabled
+        and memory_service is not None
+    ):
+        register_memory_tools(registry, memory_service)
     return registry
 
 
@@ -301,20 +332,23 @@ def _build_router(
     *,
     research_tool: Optional[str] = None,
     research_max_query_chars: int = 400,
+    memory_tools: Optional[Mapping[str, str]] = None,
 ) -> Router:
     """Build the deterministic router for the registered tools.
 
     With an empty registry this degrades to the placeholder behaviour
     (only exit words are recognised). Application-launch phrases are
-    inert unless the launch tool is actually registered, and the
+    inert unless the launch tool is actually registered, the
     general-question fallback is inert unless ``research_tool`` names a
-    registered tool.
+    registered tool, and memory phrases are inert unless ``memory_tools``
+    maps an operation to a registered tool.
     """
     return ToolCommandRouter(
         DEFAULT_TOOL_INTENTS + APP_LAUNCH_INTENTS,
         available_tools=registry.names(),
         research_tool=research_tool,
         research_max_query_chars=research_max_query_chars,
+        memory_tools=memory_tools,
     )
 
 
@@ -908,6 +942,9 @@ def main(
     research_config: Optional[ResearchConfig] = None,
     research_provider: Optional[ResearchProvider] = None,
     research_synthesizer: Optional[AnswerSynthesizer] = None,
+    memory_config: Optional[MemoryConfig] = None,
+    memory_store: Optional[MemoryStore] = None,
+    memory_service: Optional[MemoryService] = None,
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
 ) -> int:
@@ -976,6 +1013,13 @@ def main(
         if options.research and active_tools.enabled:
             active_research = replace(active_research, enabled=True)
         active_research.validate()
+
+        active_memory = (
+            memory_config if memory_config is not None else MemoryConfig()
+        )
+        if options.memory and active_tools.enabled:
+            active_memory = replace(active_memory, enabled=True)
+        active_memory.validate()
     except ConfigError as exc:
         output(f"Invalid configuration: {exc}")
         return EXIT_CONFIG_ERROR
@@ -1012,6 +1056,10 @@ def main(
         output(
             "Web research requires --tools; keeping it disabled."
         )
+    if options.memory and not active_tools.enabled:
+        output(
+            "Persistent memory requires --tools; keeping it disabled."
+        )
 
     allowlist: Optional[AppAllowlist] = None
     if active_tools.enabled and active_apps.enabled:
@@ -1043,6 +1091,23 @@ def main(
             "that it is unavailable."
         )
 
+    active_memory_service: Optional[MemoryService] = None
+    if active_tools.enabled and active_memory.enabled:
+        if memory_service is not None:
+            active_memory_service = memory_service
+        else:
+            store = memory_store
+            if store is None:
+                store = JsonMemoryStore(
+                    active_memory.data_dir or default_memory_dir()
+                )
+            active_memory_service = MemoryService(
+                store,
+                max_records=active_memory.max_records,
+                max_value_chars=active_memory.max_value_chars,
+                max_category_chars=active_memory.max_category_chars,
+            )
+
     registry = _build_registry(
         active_tools,
         clock,
@@ -1055,7 +1120,16 @@ def main(
         research_diagnostic=(
             logger.info if active_config.log_transcripts else None
         ),
+        memory_config=active_memory,
+        memory_service=active_memory_service,
     )
+    memory_tools: Optional[Mapping[str, str]] = None
+    if active_memory_service is not None:
+        memory_tools = {
+            operation: tool_name
+            for operation, tool_name in MEMORY_OPERATIONS.items()
+            if tool_name in registry
+        }
     if router is None:
         research_tool = (
             TOOL_WEB_RESEARCH if TOOL_WEB_RESEARCH in registry else None
@@ -1064,6 +1138,7 @@ def main(
             registry,
             research_tool=research_tool,
             research_max_query_chars=active_research.max_query_chars,
+            memory_tools=memory_tools,
         )
     if executor is None:
         executor = _build_executor(registry)
@@ -1126,6 +1201,13 @@ def main(
             output(
                 f"Application launching is ON for {names}. "
                 "Each launch will ask for confirmation."
+            )
+
+        if active_memory_service is not None:
+            output(
+                "Persistent memory is ON. Say 'remember that ...' to save a "
+                "memory and 'list my memories' to review them; deleting or "
+                "clearing memories asks for confirmation."
             )
 
         try:

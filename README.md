@@ -6,8 +6,9 @@ input, understands natural language, and over time will operate the PC
 tool-based planner with a permission/safety layer.
 
 **Current status: voice input, spoken replies, explicit listening
-states, a first set of safe read-only tools, and an opt-in, confirmed
-application launcher.** Voice input is
+states, a first set of safe read-only tools, an opt-in, confirmed
+application launcher, and an opt-in, user-started persistent memory.**
+Voice input is
 reliable (Phase 1), text-to-speech output is wired in (Phase 2), the
 permission/safety foundation is in place, and the interaction loop runs
 through an explicit listening state machine with an optional wake-word
@@ -91,6 +92,14 @@ with PyAV 19.
 # that research is unavailable and every other command still works.
 $env:TAVILY_API_KEY = "tvly-your-key"
 .\.venv\Scripts\python app.py --tools --research
+
+# Additionally enable persistent memory (OFF by default; requires
+# --tools). Say "remember that I prefer tea", "list my memories",
+# "what is memory ID ...", "forget memory ..." or "clear all my saved
+# memories"; saving, listing and reading are safe, while deleting and
+# clearing ask for confirmation. Memories are stored locally, one small
+# JSON file under your per-user application-data directory.
+.\.venv\Scripts\python app.py --tools --memory
 
 # Opt in to writing full voice transcripts AND the routing outcome
 # (which tool a command matched, or that it was unsupported) to the log
@@ -176,11 +185,26 @@ the `Authorization` header, never the URL), so `--research` adds **no**
 new dependency. Retrieved text is untrusted: snippets are quoted and
 attributed, whitespace is collapsed, and control characters (ANSI escapes,
 NULs) are stripped before anything is shown or spoken, and content
-embedded in a page is never treated as a command. Query text is sent to
-the provider, so treat it like any
-other third-party search box; transcript logging stays off unless you opt
 in. See [`docs/safety.md`](docs/safety.md) for the full design and
 limitations.
+
+Persistent memory is a fourth opt-in capability, **off by default**, that
+requires **both** `--tools` and `--memory` (or `MemoryConfig.enabled`). It
+lets you explicitly ask Jarvis to keep a short note — for example "remember
+that I prefer tea" — and later ask it to list, read, delete one or clear all
+of them. Saving, listing and reading are `SAFE`; **deleting one and clearing
+everything are `CONFIRM` actions**, so each needs a fresh, single-use
+confirmation. Memory is entirely user-started: Jarvis never saves a
+conversation, transcript or tool output on its own, and a memory is only
+ever a short piece of text you explicitly asked to remember. Memories live
+in a single small JSON file under a per-user application-data directory
+(written atomically, with owner-only permissions where the platform supports
+it); nothing is written when the capability is off, and with `--memory`
+but no `--tools` it reports that it stays disabled. Remembered text is
+treated as data, never as an instruction: it can never approve a
+confirmation, grant a permission or trigger a tool, and it is never used to
+answer a question unless you ask for it. See
+[docs/memory.md](docs/memory.md) for the full design and limits.
 
 By default Jarvis listens immediately (manual/always-listening mode).
 With `--wake-word` it waits in `IDLE` until a wake-word engine reports
@@ -354,6 +378,17 @@ failures name the resource type (never its data). A dedicated
 partially-initialised, interrupted and repeated activations entirely
 through injected fakes — no microphone, speaker, model file, network or
 external process. See section T of [docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md).
+
+Batch 19 adds opt-in persistent memory: an injected-store `MemoryService`
+and local JSON store, five tool specs (`memory_save`, `memory_list`,
+`memory_get`, `memory_delete`, `memory_clear`), router phrase rules, the
+`--memory` flag and `MemoryConfig`. The deletion and clear tools are the
+only `CONFIRM` actions and still run through the one guarded executor.
+Tests cover record validation, the store's atomic write and corruption
+handling, dedup and caps, the confirmation round-trips, and that remembered
+text can never become an instruction — all with injected stores and clamps
+(no file, microphone, model or network). See section Z.12 of
+[docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md).
 
 ## Quality checks
 
@@ -614,7 +649,7 @@ are in [docs/voice-troubleshooting.md](docs/voice-troubleshooting.md).
 ```
 Jarvis/
 ├── app.py                 # main entry point (composition root)
-├── config.py              # validated config (VoiceConfig, SpeechConfig, WakeConfig, SpeakerVerificationConfig, ToolsConfig, AppsConfig, ResearchConfig)
+├── config.py              # validated config (VoiceConfig, SpeechConfig, WakeConfig, SpeakerVerificationConfig, ToolsConfig, AppsConfig, ResearchConfig, MemoryConfig)
 ├── requirements.txt
 ├── core/
 │   ├── log.py             # shared console + file logging
@@ -624,6 +659,8 @@ Jarvis/
 │   ├── builtin_tools.py   # read-only tools (time, date, date+time, status, disk, battery)
 │   ├── app_launcher.py    # allowlisted, confirmed application launcher
 │   ├── research.py        # optional read-only web research (injected provider)
+│   ├── memory.py          # persistent memory service + tools (injected store)
+│   ├── memory_store.py    # local JSON memory store (atomic write, owner-only)
 │   ├── executor.py        # the single guarded execution gate
 │   └── router.py          # text -> structured command (no execution)
 ├── voice/
@@ -653,4 +690,5 @@ Jarvis/
 - [docs/voice-smoke-test.md](docs/voice-smoke-test.md) — manual Windows smoke test
 - [docs/voice-troubleshooting.md](docs/voice-troubleshooting.md) — microphone / wake-word / speech problems
 - [docs/research-evaluation.md](docs/research-evaluation.md) — deterministic answer-quality + routing evaluation
+- [docs/memory.md](docs/memory.md) — persistent memory: design, safety and limits
 - [docs/roadmap.md](docs/roadmap.md) — phase-by-phase plan and status
