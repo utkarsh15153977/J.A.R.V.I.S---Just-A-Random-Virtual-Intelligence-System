@@ -1205,3 +1205,80 @@ and the no-SpeechBrain strategy skip).
 - Enrolment permissions are `os.chmod` best-effort and are **not
   enforced on Windows** (no NTFS ACL is set).
 - No commit was made.
+
+## T. Batch 14 addendum — activation-lifecycle reliability audit
+
+Batch 14 adds no new capability. It audits the **end-to-end voice
+activation lifecycle** for resource ownership and failure recovery, and
+fixes four defects where a wake-word or verification failure could leak a
+resource (a held microphone session or a loaded embedding model). The
+single guarded execution path, the permission rules, the confirmation
+workflow and the fail-closed startup from Batch 13 are untouched.
+
+### T.1 Findings
+
+| ID | Severity | Area | Finding | Action |
+|---|---|---|---|---|
+| REL-14-001 | Medium | `app.py` `_activate` | `detector.start()` ran *before* the `try/finally`, so a detector that opened its audio session and then raised leaked the microphone session: `_release_session` was never called. | **Fixed** — `start()` is inside the `try`; the `finally` releases every path. Covered by `test_detector_start_failure_releases_the_session`. |
+| REL-14-002 | Medium | `app.py` `_activate` | The activation loop was `while not detector.detect(): pass`. A detector whose audio session is closed but which keeps returning `False` without blocking would spin forever (Batch 7 only guarded `available=False`). | **Fixed** — the loop stops with `WakeWordUnavailableError` when `session_open is False`, so an ended session ends the attempt. Covered by `test_closed_session_stops_instead_of_busy_looping` (with a `detect_calls` failsafe). |
+| REL-14-003 | Low | `app.py` `_build_speaker_verifier` | If `SpeakerVerifier(...)` raised after the embedding model was loaded (e.g. a bad threshold), the model leaked — the caller only closes the verifier, which is `None` on failure. | **Fixed** — construction is wrapped; on failure it prints a notice, closes the model and returns `None` (the run then refuses to start). Covered by `test_verifier_construction_failure_closes_the_model`. |
+| REL-14-004 | Low | `app.py` `_close_resource` | A cleanup failure logged a generic `"Error while releasing a resource."`, so which resource failed was undiagnosable. | **Fixed** — the log names `type(resource).__name__` only (never its data). |
+
+### T.2 Activation lifecycle (audited)
+
+- Every activation runs `start → detect → release → listen → stop`: the
+  session is released by `_release_session` in a `finally`, and the tests
+  assert `detector.stopped == detector.started` and
+  `session_open is False` at shutdown.
+- Startup is partially-initialised-safe: if the verifier is built and the
+  microphone listener then fails to construct, the verifier (and its
+  embedding model) is still closed on the failure path
+  (`test_listener_failure_closes_the_built_verifier`).
+- A rejected verification never opens a listening session and never
+  reaches the tool executor: asserted with `executor.calls == []`,
+  listener `transcribe_calls == 0` and no `LISTENING` entry in the state
+  history (`test_rejected_verification_never_reaches_listener_or_executor`).
+- An unexpected (non-domain) detector error escapes `main` after every
+  resource is released and the state machine reaches the terminal
+  `STOPPED` state (`test_unexpected_detector_error_releases_every_resource`).
+- Admin commands (`--speaker-status`, `--reset-speaker`) build no listener,
+  speaker or embedding model — asserted with factories that raise
+  (`TestAdminCommandsBuildNothing`).
+- The detector session is released *before* every transcription across
+  repeated activations (`test_session_released_before_every_transcription`).
+- Authority is unchanged: no change touches `ToolExecutor`,
+  `PermissionPolicy`, `ConfirmationManager`, the router or the tools.
+
+### T.3 Files changed
+
+| File | Change |
+|---|---|
+| `app.py` | `_activate` (`start()` inside `try`; closed-session loop guard), `_build_speaker_verifier` (model cleanup on construction failure), `_close_resource` (resource-named log), docstring. |
+| `tests/test_lifecycle.py` | **New** — 12 deterministic lifecycle tests (session release on start failure, closed-session guard, unexpected-error cleanup, release-before-transcribe, partial-init cleanup, verifier-construction cleanup, rejection blocking, audio/speech failure recovery, idempotent close, admin commands build nothing). |
+| `docs/AUDIT_REPORT.md`, `docs/roadmap.md` | Batch 14 addendum. |
+
+### T.4 Batch 14 verification (actually run)
+
+| Check | Command | Result |
+|---|---|---|
+| Byte-compile | `python -m compileall -q app.py core voice config.py scripts tests` | **PASS** (exit 0) |
+| Lint | `python -m ruff check .` | **PASS** — All checks passed! |
+| Unit tests | `python -m unittest discover -s tests` | **PASS** — 581 tests, 0 failures, 3 skipped |
+| Dependency consistency | `python -m pip check` | **PASS** — no broken requirements |
+| CLI help | `app.py --help` | **PASS** — exit 0, usage printed |
+| Config error | `app.py --verify-speaker --no-speech` | **PASS** — exit 2, `"Invalid configuration: --verify-speaker requires --wake-word; …"` |
+
+**Test delta:** Batch 13 had 569 tests; Batch 14 adds 12 → 581 (3
+skipped, unchanged). Every new test uses injected fakes — no microphone,
+speaker, model file, network or external process is touched.
+
+### T.5 Not run / remaining limitations
+
+- **No live microphone or audio device was exercised.** The lifecycle is
+  proven only against injected fakes; real device hot-unplug, real
+  wake-word inference and real playback timing remain unverified here (the
+  Batch 13 real-backend script covers the embedding backend only).
+- The closed-session guard defends the `session_open is False` contract; a
+  detector that hangs *inside* `detect()` with a session reported open is
+  still bounded only by the detector's own timeout, not by the loop.
+- No commit was made.

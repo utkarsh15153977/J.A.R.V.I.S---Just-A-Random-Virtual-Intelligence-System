@@ -390,7 +390,8 @@ def _activate(
     non-match (including missing, malformed or failed verification)
     rejects activation and returns False so the caller can wait for
     another attempt. The session is released on every path (including
-    failure and Ctrl+C).
+    failure and Ctrl+C), and a detector that ends its audio session
+    without activating stops the attempt instead of spinning.
 
     The mode is enforced, not inferred: a mode whose gates are missing
     raises :class:`SpeakerVerificationError` so the caller stops instead
@@ -410,13 +411,22 @@ def _activate(
         raise SpeakerVerificationError(
             "wake-word activation is required but unavailable"
         )
-    start = getattr(detector, "start", None)
-    if callable(start):
-        start()
+    # ``start`` is inside the try so a detector that opens (or partially
+    # opens) its audio session and then fails is still released by the
+    # ``finally``: no activation attempt may leave the microphone held.
     try:
+        start = getattr(detector, "start", None)
+        if callable(start):
+            start()
         while not detector.detect():
             # A real detector blocks per call; loop until it activates.
-            pass
+            # A detector that reports its audio session is *closed* (an
+            # explicitly ended or never-opened session) cannot make
+            # progress, so stop cleanly instead of spinning forever.
+            if getattr(detector, "session_open", None) is False:
+                raise WakeWordUnavailableError(
+                    "the wake-word session ended before activation"
+                )
     finally:
         _release_session(detector)
 
@@ -507,7 +517,11 @@ def _close_resource(resource: Any) -> None:
         try:
             close()
         except Exception:
-            logger.warning("Error while releasing a resource.")
+            # Name the resource type (never its data) so a cleanup failure
+            # is diagnosable without masking the primary error.
+            logger.warning(
+                "Error while releasing %s.", type(resource).__name__
+            )
 
 
 def _build_speaker(
@@ -628,14 +642,21 @@ def _build_speaker_verifier(
         _close_resource(model)
         return None
 
-    return SpeakerVerifier(
-        model,
-        enrollment,
-        threshold=config.threshold,
-        sample_rate=config.sample_rate,
-        min_sample_seconds=config.min_sample_seconds,
-        min_rms=config.min_rms,
-    )
+    try:
+        return SpeakerVerifier(
+            model,
+            enrollment,
+            threshold=config.threshold,
+            sample_rate=config.sample_rate,
+            min_sample_seconds=config.min_sample_seconds,
+            min_rms=config.min_rms,
+        )
+    except Exception:
+        # A verifier that cannot be constructed must not leave a loaded
+        # model behind; the caller refuses to start either way.
+        output("Speaker verification could not start.")
+        _close_resource(model)
+        return None
 
 
 def _speaker_status(

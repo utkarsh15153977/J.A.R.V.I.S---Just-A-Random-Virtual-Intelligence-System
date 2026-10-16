@@ -416,3 +416,38 @@ Security posture: unchanged in kind, strictly stronger in behaviour.
 Verification still grants no authority — it only decides whether to
 listen — and it remains speaker matching, not liveness. See section S of
 [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 14 note (activation-lifecycle reliability audit)
+
+Batch 14 adds no new capability. It audits the end-to-end voice
+activation lifecycle for resource ownership and failure recovery, and
+fixes four defects where a wake-word or verification failure could leak a
+resource. No change touches the execution gate, permissions or
+confirmation.
+
+- **Wake session released on `start()` failure (`app.py`).** The detector's
+  `start()` moved inside the `try`, so a detector that opens (or partially
+  opens) its audio session and then raises is still stopped by the
+  `finally`: no activation attempt can leave the microphone held.
+- **Closed-session activation can no longer spin.** The activation loop
+  stops with `WakeWordUnavailableError` when `detector.session_open is
+  False`, instead of `while not detect(): pass` looping forever on a
+  session that ended (Batch 7 only guarded `available=False`).
+- **Verifier model released on construction failure.** If
+  `SpeakerVerifier(...)` raises after the embedding model loaded, the
+  model is closed and the run refuses to start, rather than leaking it
+  (previously the caller closed only the — `None` — verifier).
+- **Diagnosable cleanup.** `_close_resource` logs the failing resource's
+  type name (never its data) instead of a generic message.
+- **Tests (`tests/test_lifecycle.py`).** +12 tests (569 → 581): session
+  release on `start()` failure, the closed-session guard (with a
+  busy-loop failsafe), cleanup after an unexpected detector error,
+  release-before-every-transcription, partial-initialisation cleanup,
+  verifier-construction cleanup, rejection blocking the executor and
+  listener, audio/speech failure recovery, idempotent close, and admin
+  commands building no heavy components. All use injected fakes; no real
+  device, model file or process is used.
+
+Security posture: unchanged. The lifecycle fixes only make resource
+ownership stricter. See section T of
+[docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
