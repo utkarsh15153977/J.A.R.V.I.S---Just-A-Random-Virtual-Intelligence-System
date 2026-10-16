@@ -57,6 +57,7 @@ _MAX_TITLE_CHARS = 300
 _MAX_URL_CHARS = 2000
 _MAX_SNIPPET_CHARS = 600
 _MAX_ANSWER_CHARS = 2000
+_MAX_DATE_CHARS = 40
 
 # Tokenising and ranking helpers for relevance. All deterministic and
 # local: no network, no dependency, no model.
@@ -196,6 +197,15 @@ _STATUS_ANTONYMS: tuple[tuple[str, str], ...] = (
     ("valid", "invalid"),
 )
 
+# Wording that asks about the *current* state of something, where an old
+# source can mislead. It only ever triggers a disclosure of the source's
+# own published date -- Jarvis has no reliable "now" to judge staleness
+# against, so it never declares a source stale.
+_CURRENT_HINTS: tuple[str, ...] = (
+    "current", "currently", "right now", "latest", "today", "still",
+    "as of now", "these days",
+)
+
 
 class ResearchStatus(Enum):
     """Outcome category of one research attempt."""
@@ -209,11 +219,19 @@ class ResearchStatus(Enum):
 
 @dataclass(frozen=True)
 class ResearchSource:
-    """One cited source returned by the provider."""
+    """One cited source returned by the provider.
+
+    ``published_date`` is optional and opaque: it is whatever date string
+    the provider supplied (Tavily returns ``published_date`` for some
+    results), cleaned and bounded, or ``""`` when none was given. It is
+    never invented and is only ever *disclosed*, never used to judge the
+    current time.
+    """
 
     title: str
     url: str
     snippet: str = ""
+    published_date: str = ""
 
 
 @dataclass(frozen=True)
@@ -351,11 +369,17 @@ def _evidence_tokens(source: ResearchSource) -> set[str]:
     The snippet is preferred: a title can promise a topic the page does
     not deliver (clickbait, a navigation label, a disambiguation page), so
     when a snippet is present only its words count. A source with no
-    snippet falls back to its title, since that is all there is to go on.
+    snippet falls back to its title, since that is all there is to go on --
+    unless the "title" is really just the URL (the provider's placeholder
+    when a result has no title), in which case it is not evidence at all:
+    a query word in a host or path is superficial overlap.
     """
     if source.snippet:
         return set(_tokens(source.snippet))
-    return set(_tokens(source.title))
+    title = source.title or ""
+    if title.startswith(("http://", "https://")):
+        return set()
+    return set(_tokens(title))
 
 
 def _distinctive_terms(text: str) -> tuple[str, ...]:
@@ -697,6 +721,84 @@ def _contradiction_reply(
     )
 
 
+def _is_current_question(query: str) -> bool:
+    """Whether the question asks about the present ("current", "latest")."""
+    lowered = (query or "").lower()
+    return any(hint in lowered for hint in _CURRENT_HINTS)
+
+
+def _dated_note(sources: Sequence[ResearchSource]) -> str:
+    """A short list of the source published dates the provider supplied.
+
+    Purely a disclosure: an old date is shown next to the answer so the
+    user can judge it, rather than being silently hidden or guessed at.
+    Returns ``""`` when the provider gave no dates.
+    """
+    dates: list[str] = []
+    for source in sources:
+        date = (source.published_date or "").strip()
+        if date and date not in dates:
+            dates.append(date)
+    if not dates:
+        return ""
+    return f"(Source dates: {', '.join(dates)}.)"
+
+
+def _provider_conflict_note(
+    query: str, provider_answer: str, sources: Sequence[ResearchSource]
+) -> str:
+    """A note when the provider's own summary contradicts its sources.
+
+    The provider answer is an unverified summary; when it asserts a value
+    the cited sources do not support (for a kind the question asks about,
+    or an opposite status) the disagreement is surfaced instead of being
+    shown as if it were consistent with the evidence. Returns ``""`` when
+    the summary agrees, is silent, or the comparison is not applicable.
+    """
+    for kind in _requested_quantity_kinds(query):
+        source_values: dict[float, str] = {}
+        for source in sources:
+            for found_kind, raw, value in _quantities(_claim_text(source)):
+                if found_kind == kind:
+                    source_values.setdefault(round(value, 2), raw)
+        if not source_values:
+            continue
+        provider_values = [
+            (raw, round(value, 2))
+            for found_kind, raw, value in _quantities(provider_answer)
+            if found_kind == kind
+        ]
+        unsupported = [
+            raw
+            for raw, value in provider_values
+            if value not in source_values
+        ]
+        if unsupported:
+            cited = ", ".join(
+                source_values[value] for value in sorted(source_values)
+            )
+            return (
+                f"The search service summary says "
+                f"{', '.join(unsupported)}, but the cited sources give "
+                f"{cited}."
+            )
+
+    provider_tokens = set(_tokens(provider_answer))
+    source_tokens = [set(_tokens(_claim_text(source))) for source in sources]
+    for positive, negative in _STATUS_ANTONYMS:
+        for claimed, opposite in ((positive, negative), (negative, positive)):
+            if claimed in provider_tokens and opposite not in provider_tokens:
+                if any(
+                    opposite in tokens and claimed not in tokens
+                    for tokens in source_tokens
+                ):
+                    return (
+                        f"The search service summary says {claimed}, but a "
+                        f"cited source says {opposite}."
+                    )
+    return ""
+
+
 def extractive_answer(
     query: str, sources: Sequence[ResearchSource], *, max_chars: int
 ) -> str:
@@ -878,11 +980,18 @@ class TavilyProvider:
                     if isinstance(raw_content, str)
                     else ""
                 )
+                raw_date = item.get("published_date")
+                published_date = (
+                    _clean_text(raw_date)
+                    if isinstance(raw_date, str)
+                    else ""
+                )
                 sources.append(
                     ResearchSource(
                         title=title[:_MAX_TITLE_CHARS],
                         url=url[:_MAX_URL_CHARS],
                         snippet=snippet[:_MAX_SNIPPET_CHARS],
+                        published_date=published_date[:_MAX_DATE_CHARS],
                     )
                 )
                 if len(sources) >= max_results:
@@ -949,7 +1058,13 @@ def compose_answer(
     an answer to look complete. When the relevant sources make materially
     different claims (a different value for the quantity asked about, or
     opposite statuses), the disagreement is surfaced with attribution
-    rather than resolved by picking one. The ``provenance`` string
+    rather than resolved by picking one. The provider's own summary is
+    held to the same evidence: if it asserts a value its cited sources do
+    not support for a kind the question asks about (or an opposite
+    status), the disagreement is surfaced under ``conflict`` rather than
+    printed as if consistent. For a question about the *current* state,
+    any source dates the provider supplied are disclosed at the end so an
+    old answer is not read as fresh. The ``provenance`` string
     (``unavailable``/``no-sources``/``no-relevant``/``clarify``/
     ``no-distance``/``conflict``/``synthesizer``/``provider``/
     ``extractive``) records which path produced the text.
@@ -989,6 +1104,16 @@ def compose_answer(
     if conflict:
         return _truncate(conflict, max_chars), "conflict"
 
+    # For a question about the *current* state, disclose the source dates
+    # the provider supplied so an old answer is not mistaken for a fresh
+    # one. This never declares a source stale: there is no reliable "now".
+    note = _dated_note(sources) if _is_current_question(query) else ""
+    budget = max(max_chars - len(note) - 1, 1) if note else max_chars
+
+    def finalize(text: str) -> str:
+        bounded = _truncate(text, budget)
+        return f"{bounded} {note}" if note else bounded
+
     answer = ""
     if synthesizer is not None:
         try:
@@ -999,13 +1124,18 @@ def compose_answer(
             # attributed extract.
             answer = ""
     if answer:
-        return _truncate(answer, max_chars), "synthesizer"
+        return finalize(answer), "synthesizer"
     provider_answer = (result.answer or "").strip()
     if provider_answer:
+        provider_conflict = _provider_conflict_note(
+            query, provider_answer, sources
+        )
+        if provider_conflict:
+            return _truncate(provider_conflict, max_chars), "conflict"
         labelled = _labelled_provider_answer(provider_answer, sources)
-        return _truncate(labelled, max_chars), "provider"
-    extract = extractive_answer(query, sources, max_chars=max_chars)
-    return extract, "extractive"
+        return finalize(labelled), "provider"
+    extract = extractive_answer(query, sources, max_chars=budget)
+    return finalize(extract), "extractive"
 
 
 def compose_reply(

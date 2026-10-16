@@ -2251,3 +2251,99 @@ skipped, unchanged).
   Unreliable comparison falls back to the ordinary attributed answer
   rather than guessing.
 - No commit or push was made.
+
+## Z.11 Batch 18.1 addendum - speech-query normalization and answer-quality hardening
+
+Batch 18.1 is a small, targeted follow-up to Batch 18. It adds **no new
+tool, no dependency and no capability to opt into**. It was motivated by
+live voice testing where "And Jarvis, who is the president of U.S.A.?"
+was rejected, and by a desire to harden the Batch 18 answer-quality paths
+with regression tests.
+
+### Z.11.1 Changes
+
+- **`core/router.py` - leading speech noise.** Added `_LEAD_INS` (a fixed
+  frozenset: `and`, `so`, `well`, `now`, `ok`, `okay`, `um`, `uh`, `erm`,
+  `er`, `ah`, `oh`, `hey`, `hi`, `hello`, `jarvis`) and `_strip_lead_ins`,
+  which drops a run of those leading tokens (and their attached commas)
+  from the *normalized* form only. `route` now classifies the turn on that
+  de-noised view (exit, fixed intents, research fallback), while the
+  original utterance is still what a provider receives and the
+  request/action boundary runs on the same de-noised view, so an action
+  request can never become a question. Deliberately **not** done: acronym
+  punctuation is not rewritten, and no fuzzy matching is added.
+- **`core/research.py` - URL-only sources.** `_evidence_tokens` now
+  returns an empty set when the only "title" is a bare URL and there is no
+  snippet, so a query word inside a host name can no longer be treated as
+  subject matter.
+- **`core/research.py` - freshness disclosure.** `ResearchSource` gained
+  `published_date` (parsed from the provider's `published_date` when
+  supplied). `_is_current_question` detects a current-state question from
+  a small keyword set; when one is asked and any relevant source carries a
+  date, `_dated_note` appends the dates (bounded by `_MAX_DATE_CHARS`) to
+  the synthesizer/provider/extractive replies. Jarvis never declares a
+  source *stale* and never invents a date.
+- **`core/research.py` - provider-vs-source conflict.** `_provider_conflict_note`
+  compares the provider's one-line `answer` with the relevant sources for
+  the requested quantity kind (or an opposite status); when they disagree,
+  `compose_answer` returns the disagreement with the `conflict` provenance
+  instead of printing the summary as if it agreed with the evidence.
+- **Evaluation suite.** The Batch 18 fixture grows to **34 cases** (19
+  research, 15 routing): research gains `weak-evidence`,
+  `unusable-results`, `provider-conflict`, `stale-evidence`,
+  `dated-evidence-not-disclosed`; routing gains
+  `voice-lead-in-and-jarvis`, `voice-lead-in-vocative`,
+  `voice-lead-in-builtin`, `voice-bare-vocative`,
+  `voice-lead-in-action-request`, `voice-lead-in-modal-action-request`.
+- **Tests.** `tests/test_research.py` gains
+  `TestResearchFreshnessAndEvidence` (URL-only not evidence, snippet still
+  wins over a URL title, provider conflict/agreement, same-value
+  different-format not a conflict, conflict only for the asked kind, date
+  disclosed for a current question and not otherwise, no note without
+  dates, empty results, budget-respecting note). `tests/test_router.py`
+  gains `TestSpeechQueryNormalization`. `tests/test_app.py` gains two
+  transcript-level cases ("And Jarvis, …" reaches research; "Jarvis, delete
+  my files" stays `UNSUPPORTED`).
+- **Docs.** `docs/research-evaluation.md` (normalization section, new
+  categories, freshness/conflict limits), `docs/safety.md` (leading-noise,
+  freshness and provider-summary paragraphs), `docs/roadmap.md` (Batch
+  18.1 note) and this addendum.
+
+One pre-existing test, `TestToolCommandRouter.test_superset_phrases_do_not_invoke_a_tool`,
+listed "hey jarvis what is the date" as a superset that must not match. That
+is now the *intended* behaviour (a leading vocative is stripped), so its
+example was changed to a genuinely non-lead-in superset ("i want to know
+what is the date") and a comment records the deliberate exception; the
+test's exact-match principle is unchanged.
+
+### Z.11.2 Batch 18.1 verification (actually run)
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Full suite | `python -m unittest discover -s tests` | **PASS** - 783 tests, OK (skipped=3) |
+| Compile | `python -m compileall -q .` | **PASS** - exit 0 |
+| Lint | `ruff check .` | **PASS** - All checks passed |
+| Dependencies | `python -m pip check` | **PASS** - No broken requirements found |
+| Entry point | `python app.py --help` | **PASS** - usage printed, exit 0 |
+| Whitespace | `git diff --check` | **PASS** - exit 0 (LF->CRLF notices only) |
+| Evaluation runner | `python scripts/run_evaluation.py` | **PASS** - 34/34 cases (research=19, routing=15), exit 0 |
+| Live validator (no key) | `python scripts/validate_research_backend.py` | **BLOCKED** - prints `[BLOCKED]`, exit 3 |
+
+**Test delta:** Batch 18 had 760 tests; Batch 18.1 adds 23 -> 783 (3
+skipped, unchanged).
+
+### Z.11.3 Not run / remaining limitations (Batch 18.1)
+
+- **No live Tavily call - BLOCKED.** `TAVILY_API_KEY` is not set here, so
+  `scripts/validate_research_backend.py` printed `[BLOCKED]` and exited
+  `3`. The real `published_date` field and live provider-summary
+  behaviour remain **unverified** here.
+- **No live microphone verification here** (`Microphone error: no
+  device`); the normalization cases use fixed transcripts.
+- Normalization is a fixed leading list, not a grammar: a mis-heard word
+  in the middle of a query (the reported "arvi" for "Jarvis", "qsa" for
+  "USA") is left untouched by design, because fuzzy-matching could change
+  a query's meaning. This is a known upstream speech-recognition limit.
+- Freshness is disclosed, never judged; provider-vs-source comparison is
+  lexical and covers only the quantity kinds the module models.
+- No commit or push was made.

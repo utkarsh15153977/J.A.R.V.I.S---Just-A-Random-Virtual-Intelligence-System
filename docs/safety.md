@@ -522,6 +522,34 @@ this file" and "run this command" therefore stay `UNSUPPORTED` and are
 never sent to a provider. Existing tool intents are matched first and are
 unchanged.
 
+**Leading conversational noise is stripped, safely (Batch 18.1).** Speech
+often starts with "and Jarvis," or just "Jarvis,"; left in place it hides
+the question word and rejects a plain question. Only a fixed, enumerated
+set of **leading** fillers and the vocative "Jarvis" (`and`, `so`, `well`,
+`now`, `ok`, `okay`, `um`, `uh`, `erm`, `er`, `ah`, `oh`, `hey`, `hi`,
+`hello`, `jarvis`) is dropped, and only to *classify* the turn: the
+provider still receives the user's own words, and an action request can
+never become a question because the request boundary (section above) runs
+on the same de-noised view. A mis-heard word that is not in that set is
+left alone — Jarvis does not fuzzy-match or "correct" speech, so a
+recognition error like "arvi" for "Jarvis" stays an upstream limitation
+rather than a guess.
+
+**Freshness is disclosed, not invented (Batch 18.1).** A source may carry
+an optional `published_date` (parsed from the provider when supplied). For
+a question that asks about the current state, the supplied dates are
+appended to the answer so an old source is not mistaken for a fresh one.
+Jarvis never states that a source *is* stale — that would require a
+reliable "now" and a threshold it does not have — and it never invents a
+date. A source with no date yields no disclosure.
+
+**A provider summary must not overrule its own sources (Batch 18.1).**
+The provider's one-line `answer` is an unverified summary and is labelled
+as such. Before it is used, it is compared with the relevant sources for
+the quantity kind the question asks about (or an opposite status); when it
+asserts a value the sources do not support, the disagreement is surfaced
+(`conflict`) instead of being printed as if it agreed with the evidence.
+
 **Privacy.** A research request sends the recognised query text to the
 provider, and the reply is spoken through the normal speaker path.
 Transcript logging stays off unless separately opted in. See

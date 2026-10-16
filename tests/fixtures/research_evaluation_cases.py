@@ -72,8 +72,15 @@ class RoutingCase:
     expected_query: str = ""
 
 
-def _src(title: str, url: str, snippet: str) -> ResearchSource:
-    return ResearchSource(title=title, url=url, snippet=snippet)
+def _src(
+    title: str, url: str, snippet: str, published_date: str = ""
+) -> ResearchSource:
+    return ResearchSource(
+        title=title,
+        url=url,
+        snippet=snippet,
+        published_date=published_date,
+    )
 
 
 RESEARCH_CASES: tuple[ResearchCase, ...] = (
@@ -272,13 +279,96 @@ RESEARCH_CASES: tuple[ResearchCase, ...] = (
     ResearchCase(
         id="distance-no-evidence",
         category="distance",
-        query="what is the distance between ranchi and dhanbad",
+        query="how far is ranchi from dhanbad",
         sources=(
             _src("Rail", "https://rail.example/r", "The train covers about 300 km."),
         ),
         expected_provenance="no-distance",
         must_include=("none of them gave a distance",),
         must_exclude=("300",),
+    ),
+    ResearchCase(
+        id="weak-evidence",
+        category="weak-evidence",
+        query="who is the ceo of acme corporation",
+        sources=(
+            _src(
+                "Acme",
+                "https://acme.example/about",
+                "Acme is a company based in Delaware.",
+            ),
+        ),
+        expected_provenance="clarify",
+        must_include=("rephrase",),
+        must_exclude=("delaware",),
+    ),
+    ResearchCase(
+        id="url-only-source",
+        category="unusable-results",
+        query="what is the capital of france",
+        sources=(
+            _src(
+                "https://spam.example/france",
+                "https://spam.example/france",
+                "",
+            ),
+        ),
+        expected_provenance="no-relevant",
+        must_include=("couldn't find",),
+        must_exclude=("spam.example",),
+    ),
+    ResearchCase(
+        id="provider-answer-conflict",
+        category="provider-conflict",
+        query="what is the population of atlantis",
+        answer="Atlantis has a population of 9,000.",
+        sources=(
+            _src(
+                "A",
+                "https://a.example/atlantis",
+                "Atlantis has a population of 5,000.",
+            ),
+            _src(
+                "B",
+                "https://b.example/atlantis",
+                "The population of Atlantis is 5,000.",
+            ),
+        ),
+        expected_provenance="conflict",
+        must_include=("9,000", "5,000", "cited sources"),
+        must_exclude=("summarised",),
+    ),
+    ResearchCase(
+        id="stale-current-status",
+        category="stale-evidence",
+        query="who is the current president of ruritania",
+        sources=(
+            _src(
+                "Ruritania",
+                "https://r.example/leadership",
+                "Ruritania is led by President Ada.",
+                published_date="2019-03-04",
+            ),
+        ),
+        expected_provenance="extractive",
+        must_include=("president ada", "2019-03-04"),
+        must_exclude=("disagree",),
+    ),
+    ResearchCase(
+        id="dated-but-not-current",
+        category="stale-evidence",
+        query="who led ruritania in 1900",
+        sources=(
+            _src(
+                "Ruritania history",
+                "https://r.example/history",
+                "Ruritania was led by King Bela in 1900.",
+                published_date="2019-03-04",
+            ),
+        ),
+        expected_provenance="extractive",
+        must_include=("king bela",),
+        must_exclude=("2019-03-04",),
     ),
 )
 
@@ -353,6 +443,51 @@ ROUTING_CASES: tuple[RoutingCase, ...] = (
         expected_kind=CommandKind.TOOL.value,
         expected_tool=TOOL_WEB_RESEARCH,
         expected_query="why should I open notepad",
+    ),
+    RoutingCase(
+        id="voice-lead-in-and-jarvis",
+        category="voice-normalization",
+        transcript="And Jarvis, who is the president of U.S.A.?",
+        research_enabled=True,
+        expected_kind=CommandKind.TOOL.value,
+        expected_tool=TOOL_WEB_RESEARCH,
+    ),
+    RoutingCase(
+        id="voice-lead-in-vocative",
+        category="voice-normalization",
+        transcript="Jarvis, who is the president of the USA?",
+        research_enabled=True,
+        expected_kind=CommandKind.TOOL.value,
+        expected_tool=TOOL_WEB_RESEARCH,
+    ),
+    RoutingCase(
+        id="voice-lead-in-builtin",
+        category="voice-normalization",
+        transcript="Jarvis, what time is it",
+        research_enabled=True,
+        expected_kind=CommandKind.TOOL.value,
+        expected_tool="get_current_time",
+    ),
+    RoutingCase(
+        id="voice-bare-vocative",
+        category="voice-normalization",
+        transcript="Jarvis",
+        research_enabled=True,
+        expected_kind=CommandKind.UNSUPPORTED.value,
+    ),
+    RoutingCase(
+        id="voice-lead-in-action-request",
+        category="voice-security",
+        transcript="Jarvis, delete my files",
+        research_enabled=True,
+        expected_kind=CommandKind.UNSUPPORTED.value,
+    ),
+    RoutingCase(
+        id="voice-lead-in-modal-action-request",
+        category="voice-security",
+        transcript="And Jarvis, are you able to open the file?",
+        research_enabled=True,
+        expected_kind=CommandKind.UNSUPPORTED.value,
     ),
 )
 

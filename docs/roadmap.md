@@ -775,3 +775,37 @@ different entity can still look relevant, and a status word used in an
 unrelated sense on two pages can still register as an antonym clash. No
 live Tavily call or microphone run was possible in this environment, so
 live behaviour stays **unverified/blocked** here.
+
+## Batch 18.1 note (speech normalization and answer-quality hardening)
+
+Batch 18.1 is a small, targeted follow-up to Batch 18. It adds no new
+tool, no dependency and no capability to opt into; it makes the
+already-shipped behaviour harder to get wrong.
+
+- **Leading speech noise.** The router now drops a fixed, enumerated set of
+  leading fillers and the vocative "Jarvis" before matching, so "And
+  Jarvis, who is the president of U.S.A.?" and "Jarvis, what time is it"
+  are understood. It is used for *classification* only: the provider still
+  receives the user's own utterance, and the action/request boundary runs
+  on the same de-noised view, so "Jarvis, delete my files" stays
+  `UNSUPPORTED`. It does not fuzzy-match: a mis-heard "arvi"/"qsa" is left
+  as an upstream recognition limit.
+- **URL-only sources are not evidence.** A provider "title" that is just a
+  URL is no longer treated as subject matter, so a query word in a host
+  name cannot be cited as a source.
+- **Freshness disclosure.** When the provider supplies a `published_date`
+  and the question asks about the current state, the dates are appended to
+  the answer so an old source is not read as fresh. Jarvis never declares
+  a source stale (it has no reliable "now") and never invents a date.
+- **Provider-vs-source conflict.** A provider summary that asserts a value
+  the on-topic sources do not support is surfaced (`conflict`) rather than
+  printed as if it agreed.
+- **Evaluation grows to 34 cases** (19 research, 15 routing) and the unit
+  suite adds freshness/evidence, normalization and app-level transcript
+  regressions.
+
+Limits, reported not hidden: the normalization set is a fixed list, not a
+grammar; a mis-heard word mid-query is untouched; freshness is disclosed,
+not judged; provider-vs-source comparison reuses the same lexical quantity
+extraction, so a value it cannot parse is not compared. Live Tavily and a
+real microphone remain unverified in this environment.

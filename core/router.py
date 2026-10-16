@@ -84,6 +84,38 @@ def _normalize_phrase(text: str) -> str:
     return " ".join(lowered.split())
 
 
+# Leading conversational noise that speech recognition keeps: a person
+# often opens with "and Jarvis," or just "Jarvis,". Left in place it hides
+# the question word that decides routing, so a plain factual question is
+# rejected. Only a fixed, explicitly enumerated set of leading tokens is
+# dropped, and only from the *front*, so an action request ("delete my
+# files") can never be turned into a question. The set is deliberately
+# small and is not fuzzy matching: a mis-heard name such as "arvi" is an
+# upstream recognition error the router does not try to guess its way
+# past (see docs/research-evaluation.md).
+_LEAD_INS: FrozenSet[str] = frozenset(
+    {
+        "and", "so", "well", "now", "ok", "okay", "um", "uh", "erm",
+        "er", "ah", "oh", "hey", "hi", "hello", "jarvis",
+    }
+)
+
+
+def _strip_lead_ins(normalized: str) -> str:
+    """Drop leading conversational filler and a leading vocative.
+
+    ``normalized`` is already lower-cased and edge-stripped (see
+    :func:`_normalize_phrase`); commas are treated as separators so
+    "jarvis, who ..." splits cleanly. This is used only to *classify* a
+    turn: the original utterance is still what is sent to a provider, and
+    the fixed intents and the request boundary are unchanged.
+    """
+    tokens = normalized.replace(",", " ").split()
+    while tokens and tokens[0] in _LEAD_INS:
+        tokens.pop(0)
+    return " ".join(tokens)
+
+
 # Deterministic policy for the *general-question* fallback used when web
 # research is enabled (see ``ToolCommandRouter``). A phrase is eligible
 # only if it opens with a question word and is not an imperative action
@@ -198,12 +230,15 @@ class PlaceholderRouter:
             return CommandRequest(
                 CommandKind.CLARIFY, response=self._clarify_response
             )
-        if normalized in self._exit_words:
+        # Classification runs on a lightly de-noised view so a leading
+        # "and Jarvis," does not hide the command; nothing else changes.
+        classification = _strip_lead_ins(normalized)
+        if classification in self._exit_words:
             return CommandRequest(CommandKind.EXIT)
-        intent = self._match_intent(normalized)
+        intent = self._match_intent(classification)
         if intent is not None:
             return intent
-        fallback = self._match_fallback(normalized, text)
+        fallback = self._match_fallback(classification, text)
         if fallback is not None:
             return fallback
         # Deliberately does not echo the user's words back.
@@ -212,16 +247,18 @@ class PlaceholderRouter:
         )
 
     def _match_intent(self, normalized: str) -> Optional[CommandRequest]:
-        """Hook for subclasses; receives already-normalised text."""
+        """Hook for subclasses; receives normalised, de-noised text."""
         return None
 
     def _match_fallback(
         self, normalized: str, original: str
     ) -> Optional[CommandRequest]:
-        """Hook for subclasses; receives normalised and original text.
+        """Hook for subclasses; receives de-noised and original text.
 
         Runs only after fixed-intent matching fails. The default does
-        nothing, so unknown input stays unsupported.
+        nothing, so unknown input stays unsupported. ``normalized`` is the
+        de-noised classification view; ``original`` is the user's own
+        utterance, which is what a research query is built from.
         """
         return None
 

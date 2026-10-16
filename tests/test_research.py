@@ -1104,6 +1104,172 @@ class TestResearchGrounding(unittest.TestCase):
         self.assertNotIn("99,000", reply)
 
 
+class TestResearchFreshnessAndEvidence(unittest.TestCase):
+    """Batch 18.1: URL-only sources, freshness disclosure, provider conflicts."""
+
+    def _answer(self, query, sources, *, answer="", max_chars=400):
+        return compose_answer(
+            query,
+            ResearchResult(
+                status=ResearchStatus.OK,
+                answer=answer,
+                sources=tuple(sources),
+            ),
+            max_chars=max_chars,
+        )
+
+    def test_url_only_source_is_not_evidence(self):
+        reply, provenance = self._answer(
+            "what is the capital of france",
+            [ResearchSource("https://spam.example/france", "")],
+        )
+        # The "title" is just the URL the provider substituted; a query
+        # word in the host is not evidence and the reply is honest.
+        self.assertEqual(provenance, "no-relevant")
+        self.assertIn("couldn't find", reply.lower())
+
+    def test_relevant_snippet_still_wins_over_a_url_title(self):
+        reply, provenance = self._answer(
+            "what is the capital of france",
+            [
+                ResearchSource(
+                    "https://france.example/x",
+                    "https://france.example/x",
+                    "Paris is the capital of France.",
+                )
+            ],
+        )
+        self.assertEqual(provenance, "extractive")
+        self.assertIn("paris", reply.lower())
+
+    def test_provider_answer_conflicting_with_sources_is_surfaced(self):
+        reply, provenance = self._answer(
+            "what is the population of atlantis",
+            [
+                ResearchSource(
+                    "A",
+                    "https://a.example/atlantis",
+                    "Atlantis has a population of 5,000.",
+                ),
+                ResearchSource(
+                    "B",
+                    "https://b.example/atlantis",
+                    "The population of Atlantis is 5,000.",
+                ),
+            ],
+            answer="Atlantis has a population of 9,000.",
+        )
+        self.assertEqual(provenance, "conflict")
+        self.assertIn("9,000", reply)
+        self.assertIn("5,000", reply)
+        self.assertNotIn("search service summarised", reply.lower())
+
+    def test_provider_answer_agreeing_with_sources_is_provider(self):
+        _, provenance = self._answer(
+            "what is the population of atlantis",
+            [
+                ResearchSource(
+                    "A",
+                    "https://a.example/atlantis",
+                    "Atlantis has a population of 5,000.",
+                )
+            ],
+            answer="Atlantis has a population of 5,000.",
+        )
+        self.assertEqual(provenance, "provider")
+
+    def test_provider_answer_same_value_different_format_is_not_a_conflict(self):
+        _, provenance = self._answer(
+            "what is the population of atlantis",
+            [
+                ResearchSource(
+                    "A",
+                    "https://a.example/atlantis",
+                    "Atlantis has a population of 5,000.",
+                )
+            ],
+            answer="Atlantis has a population of 5000.",
+        )
+        self.assertEqual(provenance, "provider")
+
+    def test_provider_answer_about_a_kind_not_asked_is_not_a_conflict(self):
+        _, provenance = self._answer(
+            "why is the sky blue",
+            [
+                ResearchSource(
+                    "Sky",
+                    "https://sky.example/blue",
+                    "Rayleigh scattering makes the sky blue.",
+                )
+            ],
+            answer="It scatters; recorded in 1871.",
+        )
+        self.assertEqual(provenance, "provider")
+
+    def test_current_question_discloses_the_source_date(self):
+        reply, provenance = self._answer(
+            "who is the current president of ruritania",
+            [
+                ResearchSource(
+                    "Ruritania",
+                    "https://r.example/x",
+                    "Ruritania is led by President Ada.",
+                    published_date="2019-03-04",
+                )
+            ],
+        )
+        self.assertEqual(provenance, "extractive")
+        self.assertIn("2019-03-04", reply)
+
+    def test_non_current_question_does_not_disclose_the_date(self):
+        reply, _ = self._answer(
+            "who led ruritania in 1900",
+            [
+                ResearchSource(
+                    "History",
+                    "https://r.example/history",
+                    "Ruritania was led by King Bela in 1900.",
+                    published_date="2019-03-04",
+                )
+            ],
+        )
+        self.assertNotIn("2019-03-04", reply)
+
+    def test_current_question_without_dates_has_no_note(self):
+        reply, _ = self._answer(
+            "who is the current president of ruritania",
+            [
+                ResearchSource(
+                    "Ruritania",
+                    "https://r.example/x",
+                    "Ruritania is led by President Ada.",
+                )
+            ],
+        )
+        self.assertNotIn("source dates", reply.lower())
+
+    def test_empty_results_report_no_sources(self):
+        reply, provenance = self._answer("what is the capital of france", [])
+        self.assertEqual(provenance, "no-sources")
+        self.assertIn("couldn't find", reply.lower())
+
+    def test_freshness_note_respects_the_answer_budget(self):
+        reply, _ = self._answer(
+            "who is the current president of ruritania",
+            [
+                ResearchSource(
+                    "Ruritania",
+                    "https://r.example/x",
+                    "Ruritania is led by President Ada.",
+                    published_date="2019-03-04",
+                )
+            ],
+            max_chars=60,
+        )
+        self.assertLessEqual(len(reply), 60)
+        self.assertIn("2019-03-04", reply)
+
+
 class TestResearchDiagnostic(unittest.TestCase):
     """Batch 17.6: opt-in per-lookup diagnostic; quiet by default."""
 

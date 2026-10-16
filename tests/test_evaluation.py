@@ -92,9 +92,24 @@ class TestEvaluationSuite(unittest.TestCase):
             "contradictory-evidence",
             "irrelevant-adversarial",
             "provider-failure",
+            "weak-evidence",
+            "unusable-results",
+            "provider-conflict",
+            "stale-evidence",
         ):
             with self.subTest(category=expected):
                 self.assertIn(expected, research)
+
+    def test_routing_categories_cover_normalization_and_security(self):
+        routing = {case.category for case in ROUTING_CASES}
+        for expected in (
+            "voice-control",
+            "voice-research",
+            "voice-normalization",
+            "voice-security",
+        ):
+            with self.subTest(category=expected):
+                self.assertIn(expected, routing)
 
 
 def _load_script(name: str):

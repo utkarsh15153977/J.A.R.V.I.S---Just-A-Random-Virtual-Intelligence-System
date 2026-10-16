@@ -522,11 +522,12 @@ key; none can run in CI, so run them by hand and record
   snippet or the API key. Without the flag nothing about the lookup is
   logged.
 
-### Batch 18 evaluation suite (offline, deterministic)
+### Batch 18/18.1 evaluation suite (offline, deterministic)
 
 Batch 18 adds a repeatable answer-quality and voice-understanding
-evaluation that needs **no network, key, microphone or model**. It is the
-same fixed cases the unit suite runs, so it can be run on demand or in CI:
+evaluation that needs **no network, key, microphone or model**; Batch 18.1
+extends it to 34 cases (19 research, 15 routing). It is the same fixed
+cases the unit suite runs, so it can be run on demand or in CI:
 
 ```
 .\.venv\Scripts\python scripts\run_evaluation.py
@@ -538,8 +539,10 @@ case passes, `1` otherwise. Fixing the exact provider output and exact
 transcript for each case is what makes it reproducible. The cases cover
 answerable factual questions, specific entities, ambiguous/misspelled
 subjects, contradictory evidence (different numbers, dates or statuses),
-irrelevant/adversarial sources, provider failure, and voice-transcription
-routing (including that action requests never reach research). See
+irrelevant/adversarial and URL-only sources, provider failure and
+provider-vs-source disagreement, stale/fresh evidence disclosure, and
+voice-transcription routing (including leading "and Jarvis,"/"Jarvis,"
+noise and that action requests never reach research). See
 [`docs/research-evaluation.md`](docs/research-evaluation.md).
 
 Manual checks that still need a live Tavily key or a microphone are in the

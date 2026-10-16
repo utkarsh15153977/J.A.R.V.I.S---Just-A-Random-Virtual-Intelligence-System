@@ -601,6 +601,32 @@ class TestVoiceUnderstandingRegressions(unittest.TestCase):
         )
         self.assertTrue(any("lit.example" in line for line in output))
 
+    def test_transcribed_lead_in_question_reaches_research(self):
+        provider = self._provider()
+        transcript = "And Jarvis, who is the president of the USA?"
+        code, _output, _, _ = run_main(
+            argv=["--tools", "--research"],
+            listener_factory=lambda config: self._heard(transcript),
+            research_provider=provider,
+            clock=self._clock,
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(provider.calls, [(transcript, 5)])
+
+    def test_transcribed_lead_in_action_request_stays_unsupported(self):
+        provider = self._provider()
+        code, output, _, _ = run_main(
+            argv=["--tools", "--research"],
+            listener_factory=lambda config: self._heard(
+                "Jarvis, delete my files"
+            ),
+            research_provider=provider,
+            clock=self._clock,
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(any("can't do that yet" in line for line in output))
+        self.assertEqual(provider.calls, [])
+
     def test_transcribed_action_request_is_unsupported(self):
         provider = self._provider()
         code, output, _, _ = run_main(

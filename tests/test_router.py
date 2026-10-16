@@ -179,11 +179,15 @@ class TestToolCommandRouter(unittest.TestCase):
 
     def test_superset_phrases_do_not_invoke_a_tool(self):
         # A phrase that merely *contains* a known phrase must not match:
-        # matching is exact, so unrelated speech cannot reach a tool.
+        # matching is exact, so unrelated speech cannot reach a tool. The
+        # only deliberate exception is a *leading* filler or vocative,
+        # which is stripped before matching (see
+        # TestSpeechQueryNormalization); extra words elsewhere still do
+        # not match.
         for text in (
             "what time is it in paris",
             "please tell me the time now",
-            "hey jarvis what is the date",
+            "i want to know what is the date",
         ):
             with self.subTest(text=text):
                 self.assertIs(
@@ -455,6 +459,98 @@ class TestResearchRequestBoundary(unittest.TestCase):
     def test_fixed_intent_still_wins(self):
         command = self._router().route("can you tell me the time")
         self.assertEqual(command.tool_name, "get_current_time")
+
+
+class TestSpeechQueryNormalization(unittest.TestCase):
+    """Batch 18.1: leading conversational noise does not hide a command.
+
+    A person (and Whisper) often precede a question with "and Jarvis," or
+    just "Jarvis,". Only a fixed, leading set of fillers is dropped, and
+    only for classification: the original utterance is still what a
+    provider receives, and an action request can never become a question.
+    """
+
+    def _router(self, **kwargs):
+        options = {
+            "available_tools": (TOOL_WEB_RESEARCH, "get_current_time"),
+            "research_tool": TOOL_WEB_RESEARCH,
+        }
+        options.update(kwargs)
+        return ToolCommandRouter(DEFAULT_TOOL_INTENTS, **options)
+
+    def test_leading_and_vocative_question_routes_to_research(self):
+        command = self._router().route(
+            "And Jarvis, who is the president of U.S.A.?"
+        )
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_WEB_RESEARCH)
+
+    def test_leading_vocative_alone_routes(self):
+        command = self._router().route(
+            "Jarvis, who is the president of the USA?"
+        )
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_WEB_RESEARCH)
+
+    def test_acronym_punctuation_does_not_change_routing(self):
+        router = self._router()
+        for text in (
+            "who is the president of the U.S.A.",
+            "who is the president of the USA",
+            "And Jarvis, who is the president of U.S.A.?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    router.route(text).tool_name, TOOL_WEB_RESEARCH
+                )
+
+    def test_original_utterance_is_still_the_query(self):
+        text = "And Jarvis, who is the president of the U.S.A.?"
+        command = self._router().route(text)
+        # Classification is de-noised; the query that is sent keeps the
+        # user's own words (nothing about the provider call changes).
+        self.assertEqual(dict(command.arguments)["query"], text)
+
+    def test_lead_in_before_a_builtin_intent_still_matches(self):
+        command = self._router().route("Jarvis, what time is it")
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, "get_current_time")
+        self.assertEqual(dict(command.arguments), {})
+
+    def test_stacked_lead_ins_are_all_dropped(self):
+        command = self._router().route("so well um jarvis who won the game")
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_WEB_RESEARCH)
+
+    def test_lead_ins_never_turn_a_request_into_a_question(self):
+        router = self._router()
+        for text in (
+            "Jarvis, delete my files",
+            "and open the file",
+            "so run the command",
+            "um remove the file",
+            "okay launch the calculator",
+            "Jarvis, are you able to open the file?",
+            "And Jarvis, could you kindly delete this file",
+        ):
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+    def test_pure_lead_in_is_not_a_command(self):
+        router = self._router()
+        for text in ("jarvis", "and", "hey jarvis", "ok so"):
+            with self.subTest(text=text):
+                command = router.route(text)
+                self.assertIs(command.kind, CommandKind.UNSUPPORTED)
+
+    def test_lead_in_does_not_route_without_a_research_tool(self):
+        router = self._router(research_tool=None)
+        self.assertIs(
+            router.route("Jarvis, who is the president of the USA?").kind,
+            CommandKind.UNSUPPORTED,
+        )
 
 
 class TestCommandRequest(unittest.TestCase):
