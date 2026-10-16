@@ -494,3 +494,46 @@ class SpeechConfig:
             raise ConfigError("; ".join(problems))
 
         return self
+
+
+@dataclass(frozen=True)
+class MediaConfig:
+    """Configuration for the optional local media playback capability.
+
+    Disabled by default and doubly opt-in: the capability is only wired
+    when ``enabled`` is true, tools are on, and at least one approved
+    ``roots`` entry is configured. ``roots`` are the only folders the
+    discovery helper is ever allowed to search, and ``max_scan_files``
+    bounds how many files a single search may inspect.
+    """
+
+    enabled: bool = False
+    roots: tuple[str, ...] = ()
+    max_scan_files: int = 50000
+
+    def validate(self) -> "MediaConfig":
+        problems: list[str] = []
+        if not isinstance(self.enabled, bool):
+            problems.append("enabled must be a boolean")
+        if not isinstance(self.roots, tuple):
+            problems.append("roots must be a tuple of paths")
+        else:
+            for r in self.roots:
+                if not isinstance(r, str) or not r.strip():
+                    problems.append("roots must be non-empty strings")
+                    break
+                if any(_is_control(c) for c in r):
+                    problems.append(
+                        "roots must not contain control characters"
+                    )
+                    break
+        # bool is an int subclass, but True/False are never a file count.
+        if (
+            isinstance(self.max_scan_files, bool)
+            or not isinstance(self.max_scan_files, int)
+            or self.max_scan_files < 1
+        ):
+            problems.append("max_scan_files must be a positive integer")
+        if problems:
+            raise ConfigError("; ".join(problems))
+        return self

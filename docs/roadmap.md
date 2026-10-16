@@ -904,17 +904,52 @@ approval binding, injection/recall/routing, fail-safe configuration).
 A step-by-step manual procedure is documented in
 [docs/memory.md](memory.md#manual-test-procedure).
 
+## Batch 20 note (local media playback)
+
+Batch 20 adds an optional, **safe local media player** for video files in
+folders you approve. It keeps the Batch 9 permission model, the Batch 16
+phrase-set routing and the Batch 19 fail-closed composition-root style: off
+by default, doubly opt-in (`--tools` **and** `--media`, plus at least one
+folder in `MediaConfig.roots`), and every action still runs only through the
+single `ToolExecutor`.
+
+- **Discovery is contained.** `core/media.py` walks only the configured
+  roots, ignores files whose extension is not a known video type, and skips
+  symbolic links (files and directories), so it stays within the approved
+  folders (subject to the Windows reparse-point caveat in
+  `docs/safety.md`). A bounded scan limit prevents a huge tree from stalling
+  a turn.
+- **Ambiguity never auto-plays.** `core/media_tools.py` adds `media_play`
+  (`CONFIRM`), `media_select` (`CONFIRM`) and `media_cancel` (`SAFE`). A
+  unique or single-exact match may play; several plausible matches are
+  listed and never chosen for you. A position is accepted only against the
+  current in-memory list; stale, expired or out-of-range selections launch
+  nothing. Selection state is never persisted, and cancel or an unrelated
+  command clears it.
+- **Launch is guarded and shell-free.** Every launch re-checks existence,
+  extension and root containment immediately before opening the file
+  through the OS handler; there is no `shell=True`, no command string and
+  no `subprocess`. The launcher is injected so tests never start a real
+  player.
+- **Explicit flag.** `app.py` gained `--media`, the `MediaConfig` wiring,
+  the printed `--media` help and the `"Media playback requires --tools; …"`
+  / `"… requires at least one approved folder …"` fail-closed messages.
+
+Verification: **961 tests OK (5 skipped)**, `ruff check` clean,
+`compileall` clean, `pip check` clean, the offline evaluation suite PASS
+(+65 tests over Batch 19.1's 896: 57 in `tests/test_media.py` plus 8 new
+`MediaConfig` tests in `tests/test_config.py`, including two symlink tests
+skipped on this host because creating symlinks is not permitted). No real
+microphone, speaker, media player or movie library was touched; the
+real-Windows playback check is a manual step.
+
 ## Recommended next batches
 
 Ordered by user value against risk; each keeps the Batch 9 permission
 model, the Batch 16 phrase-set routing and the Batch 19 fail-closed
-composition-root style.
+composition-root style. (Batch 20, local media playback, is now
+implemented — see the note above.)
 
-- **Batch 20 — media playback (`play`/`pause`/`next`/`volume`).**
-  Read-only-ish state transitions over a single local audio device,
-  allowlisted media sources only, `CONFIRM` for anything that opens or
-  downloads content, no shell, no arbitrary URL. Volume and pause are
-  natural first `SAFE` actions.
 - **Batch 21 — wake-word / voice activation reliability.**
   No new capability, a hardening pass: activation lifecycle regressions,
   false-trigger and missed-trigger behaviour, and explicit states for

@@ -646,6 +646,72 @@ or a research answer cannot become an instruction — all with injected
 stores and clocks (no file, microphone, model or network). A step-by-step
 manual procedure is in `docs/memory.md`.
 
+## Local media playback (Batch 20)
+
+`core/media.py` and `core/media_tools.py` add an optional local media
+player for video files inside folders you approve. It is off by default and
+doubly opt-in: it needs **both** `--tools` and `--media` (or
+`MediaConfig.enabled=True`), **and** at least one folder in
+`MediaConfig.roots`. With `--media` but no `--tools`, or with no root
+configured, `app.py` reports that it stays disabled and nothing is
+registered. It adds three tools, registered through the normal
+`ToolRegistry` and executed only through the single `ToolExecutor`:
+
+| Tool | Level | Effect |
+| --- | --- | --- |
+| `media_play` | `CONFIRM` | search the approved folders for a title |
+| `media_select` | `CONFIRM` | open one result from the last search by position |
+| `media_cancel` | `SAFE` | forget the pending search results |
+
+Properties:
+
+- **Confined to the approved folders.** Discovery only ever walks the
+  folders listed in `MediaConfig.roots`. A path is accepted only if its
+  *resolved* location is inside a root, symbolic links (both files and
+  directories) are skipped, and only known video extensions are
+  considered. The tool therefore cannot read or play anything outside the
+  folders you named, and it never takes a path from speech, configuration
+  or tool arguments.
+- **No silent choice among several files.** `media_play` opens a file only
+  when the match is unambiguous — a single result, or a single *exact*
+  match of the whole title. Several plausible matches are listed and
+  **never** auto-played; the only way to open one is `media_select` with an
+  explicit position, and that position is checked against the *current*
+  list only. A stale, expired or out-of-range selection launches nothing.
+- **Selection state is ephemeral.** Pending candidates live in a
+  per-session, in-memory `MediaSession` owned by the composition root.
+  Nothing about a selection is written to persistent memory, and
+  `media_cancel` or any unrelated command clears it. A remembered value or
+  a tool result can never name a file.
+- **Playback is confirmed and re-validated.** `media_play` and
+  `media_select` are `CONFIRM` actions using the same bound, single-use,
+  expiring ticket mechanism (section "Bound confirmation") as every other
+  confirmed tool; a denial, expiry, replay or unrelated outcome runs
+  nothing. Immediately before opening, the handler re-checks that the file
+  still exists, is a regular file, has a supported extension and is inside
+  an approved root, so a path that changed after discovery cannot escape.
+- **No shell, no arguments, no waiting.** The file is opened through the OS
+  handler (`os.startfile` on Windows) with an empty argument list; there is
+  no `shell=True`, no command string, no `subprocess`, and the player is
+  never waited for or terminated. The launcher is injected, so tests use a
+  fake opener and never start a real player.
+- **Containment is best-effort against reparse points.** Symlinks are
+  skipped during discovery and every path is re-resolved before launch, but
+  an NTFS junction or other reparse point created *after* a file is
+  discovered is a Windows-specific edge the standard library does not
+  fully resolve; keep approved roots free of such reparse points if this
+  matters to you.
+- **Independent of voice gates.** Media permission does not depend on the
+  wake word or speaker verification; those still only decide *when* Jarvis
+  listens, never what it may open.
+
+**Testing.** `tests/test_media.py` exercises discovery (containment,
+unsupported extensions, symlink skipping, bounded scan), the session bounds
+and single-use selection, the launcher, and the tool round-trips (unique
+launch, ambiguous list-without-play, explicit selection, denied approval,
+stale/out-of-range selection, cancel) entirely with temporary directories
+and a fake opener — no real player, no real library, no network.
+
 ## Speech output
 
 `voice/speaker.py` produces spoken replies with `pyttsx3` (SAPI5 on

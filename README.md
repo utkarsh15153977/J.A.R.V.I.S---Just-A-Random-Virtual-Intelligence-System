@@ -101,6 +101,14 @@ $env:TAVILY_API_KEY = "tvly-your-key"
 # JSON file under your per-user application-data directory.
 .\.venv\Scripts\python app.py --tools --memory
 
+# Additionally enable safe local media playback (OFF by default; requires
+# --tools AND at least one approved folder in MediaConfig.roots). Say
+# "play Project Hail Mary" or "play the movie Interstellar"; playing a
+# file asks for confirmation. If several files match, Jarvis lists them
+# and waits for "play the first one" / "play the second one", or you can
+# say "cancel".
+.\.venv\Scripts\python app.py --tools --media
+
 # Opt in to writing full voice transcripts AND the routing outcome
 # (which tool a command matched, or that it was unsupported) to the log
 # (OFF by default, because spoken commands may contain sensitive info)
@@ -209,6 +217,26 @@ confirmation, grant a permission or trigger a tool, and it is never used to
 answer a question unless you ask for it. See
 [docs/memory.md](docs/memory.md) for the full design, the limits and the
 manual test procedure.
+
+Local media playback is a fifth opt-in capability, **off by default**, that
+requires **both** `--tools` and `--media` (or `MediaConfig.enabled`), plus at
+least one folder listed in `MediaConfig.roots` — with none, `--media` is
+reported and stays disabled. It adds three tools: `media_play` (a `CONFIRM`
+search-and-play), `media_select` (`CONFIRM`, picks one item from the last
+search by position) and `media_cancel` (`SAFE`, forgets the last search).
+Discovery only ever walks the configured roots, ignores files whose extension
+is not a known video type, and skips symbolic links, so it stays within the
+approved folders (with the Windows reparse-point caveat noted in
+[docs/safety.md](docs/safety.md)). A search only plays a file when the match is
+unambiguous; several plausible matches are listed and **never** auto-played —
+you must name a position, and only against the current list. Every launch
+re-checks that the file still exists, is a supported video and is inside an
+approved root immediately before opening it, and the file is opened with the
+OS handler (never `shell=True`, never a shell). Selection state lives only in
+memory: it is never written to persistent memory, and an unrelated command or
+`media_cancel` clears it. Media permission is independent of the wake word and
+speaker verification. See [docs/safety.md](docs/safety.md) for the full design,
+the limits and the manual test procedure.
 
 By default Jarvis listens immediately (manual/always-listening mode).
 With `--wake-word` it waits in `IDLE` until a wake-word engine reports
@@ -404,6 +432,17 @@ is registered. New tests cover restart persistence, unsafe paths, corrupt
 store immutability, shutdown, approval binding and injection/routing, plus a
 documented manual procedure in [docs/memory.md](docs/memory.md). The suite
 is now 896 tests (3 skipped). See section Z.13 of
+[docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md).
+
+Batch 20 adds safe local media playback: a `MediaDiscovery` that only walks
+configured roots and skips symlinks and unsupported files, an injectable
+launcher that opens files through the OS handler (never `shell=True`), the
+three tool specs above, conservative router phrases, the `--media` flag and
+`MediaConfig`. A unique/exact match may play; several matches are listed and
+never auto-played; the chosen path is re-validated immediately before opening.
+Tests use temporary directories and fake launchers only — no real player or
+library. The suite is now 961 tests (5 skipped; the extra two skips are
+symlink cases Windows declines to create). See section Z.14 of
 [docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md).
 
 ## Quality checks
@@ -665,7 +704,7 @@ are in [docs/voice-troubleshooting.md](docs/voice-troubleshooting.md).
 ```
 Jarvis/
 ├── app.py                 # main entry point (composition root)
-├── config.py              # validated config (VoiceConfig, SpeechConfig, WakeConfig, SpeakerVerificationConfig, ToolsConfig, AppsConfig, ResearchConfig, MemoryConfig)
+├── config.py              # validated config (VoiceConfig, SpeechConfig, WakeConfig, SpeakerVerificationConfig, ToolsConfig, AppsConfig, ResearchConfig, MemoryConfig, MediaConfig)
 ├── requirements.txt
 ├── core/
 │   ├── log.py             # shared console + file logging
@@ -677,6 +716,8 @@ Jarvis/
 │   ├── research.py        # optional read-only web research (injected provider)
 │   ├── memory.py          # persistent memory service + tools (injected store)
 │   ├── memory_store.py    # local JSON memory store (atomic write, owner-only)
+│   ├── media.py           # safe local media discovery + file launcher
+│   ├── media_tools.py     # media_play / media_select / media_cancel tools
 │   ├── executor.py        # the single guarded execution gate
 │   └── router.py          # text -> structured command (no execution)
 ├── voice/
@@ -707,4 +748,5 @@ Jarvis/
 - [docs/voice-troubleshooting.md](docs/voice-troubleshooting.md) — microphone / wake-word / speech problems
 - [docs/research-evaluation.md](docs/research-evaluation.md) — deterministic answer-quality + routing evaluation
 - [docs/memory.md](docs/memory.md) — persistent memory: design, safety and limits
+- [docs/safety.md](docs/safety.md) — safety model, including local media playback
 - [docs/roadmap.md](docs/roadmap.md) — phase-by-phase plan and status

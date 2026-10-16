@@ -2558,3 +2558,124 @@ skipped, unchanged): `tests/test_memory.py` 48 -> 69 (+21),
   permissions are still best-effort (`os.chmod`, not an NTFS ACL on
   Windows).
 - No commit or push was made.
+
+## Z.14 Batch 20 addendum - safe local media playback
+
+Batch 20 adds an optional **local media player** for video files inside
+folders the user approves. It is off by default and doubly opt-in: it
+requires **both** `--tools` and `--media` (or `MediaConfig.enabled=True`),
+**and** at least one folder in `MediaConfig.roots`. The security
+architecture is unchanged: every media action is a `ToolSpec` executed only
+through the existing single `ToolExecutor`, with the same bound, single-use,
+expiring confirmation tickets as every other confirmed action.
+
+### Z.14.1 What changed (Batch 20)
+
+- **`core/media.py` (new).** `_strip_media_location` (drops a trailing
+  "from drive E" / "on the disk D"), `MediaMatch` (display name, path, an
+  `is_exact` flag) and `MediaDiscovery(roots, extensions, max_scan)`:
+  `is_supported` (by extension), `is_within_roots` (resolved
+  `Path.is_relative_to`), and `find_candidates(query, follow_symlinks=False)`
+  which walks the roots with `os.walk`, **skips symlinked directories and
+  symlinked files**, caps the number of files inspected at `max_scan`
+  (default 50000), and ranks exact matches before prefix before substring.
+  `SubprocessMediaLauncher(opener=None)` opens a file through an injected
+  `opener` (default `os.startfile` on Windows) and wraps `OSError` in
+  `MediaError`. `VIDEO_EXTENSIONS` is the fixed allowlist of video
+  extensions. No `subprocess`, no `shell=True`, no `eval`/`exec`.
+- **`core/media_tools.py` (new).** `MediaSession` (an in-memory,
+  per-session, bounded list of candidates; `resolve` rejects `bool` and
+  out-of-range indices); `_is_unambiguous` (a single candidate, or a single
+  exact match); input validators; `_LaunchGuard`, which re-validates a
+  chosen path (resolved, still inside a root, supported extension, is a
+  regular file) immediately before opening it; the three handlers; and
+  `build_media_specs` / `register_media_tools`. `media_play` and
+  `media_select` are `CONFIRM` with `timeout=30.0`; `media_cancel` is
+  `SAFE`.
+- **`config.py`.** New `MediaConfig` (`enabled=False`, `roots=()`,
+  `max_scan_files=50000`) whose `validate()` raises `ConfigError` for a
+  non-`int`/non-positive `max_scan_files`, a `roots` value that is not a
+  tuple, a non-string or empty entry, or an entry containing control
+  characters.
+- **`core/router.py`.** Added the `media_tools` parameter and conservative
+  media handling (`_media_request`, `_media_select_index`) with fixed
+  ordinal/number-word/filler sets: `media_cancel` phrases first, then
+  explicit ordinal selections ("play the second one"), then explicit play
+  triggers ("play ...", "find the movie ..."). Matching is whole-word/exact
+  - no fuzzy or model matching - so a research question such as "who
+  directed Interstellar" still routes to research, and memory-save phrases
+  are handled before media.
+- **`app.py`.** Added the `--media` flag (usage text, `_Options`,
+  `_parse_args`), imported `MediaConfig`, `MediaDiscovery`,
+  `SubprocessMediaLauncher` and the media tool ids/session, extended
+  `_build_registry` (register media tools only when tools **and** media are
+  enabled and a discovery **and** session are present) and `_build_router`
+  (`media_tools` mapping), added an `on_route` hook to `_run_loop` that
+  clears the pending media session for any command that is not a media
+  command, and wired the opt-in in `main` with the fail-closed messages
+  `"Media playback requires --tools; keeping it disabled."` and
+  `"Media playback requires at least one approved folder
+  (MediaConfig.roots); keeping it disabled."`.
+- **Tests.** `tests/test_media.py` (new, 57 tests: discovery, session,
+  launcher, tool round-trips, router, registry wiring and `main` opt-in)
+  and a new `TestMediaConfig` in `tests/test_config.py` (8 tests, including
+  the `max_scan_files` bool-rejection regression).
+- **Docs.** `README.md` (status, `--media` example, a media paragraph,
+  project structure, docs index, Batch 20 test note), `docs/safety.md` (a
+  "Local media playback (Batch 20)" section and the reparse-point
+  limitation), `docs/roadmap.md` (a Batch 20 note, media no longer a
+  recommended next batch) and this addendum.
+
+### Z.14.2 Batch 20 verification (actually run)
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Media tests | `python -m unittest tests.test_media` | **PASS** - 57 tests, OK (2 skipped: symlink creation not permitted on this host) |
+| Full suite | `python -m unittest discover` | **PASS** - 961 tests, OK (5 skipped) |
+| Lint | `python -m ruff check .` | **PASS** - clean |
+| Byte-compile | `python -m compileall -q .` | **PASS** - clean |
+| Dependency check | `python -m pip check` | **PASS** - no broken requirements |
+| Evaluation suite | `python scripts/run_evaluation.py` | **PASS** - research routing suite |
+| Whitespace | `git diff --check` | **PASS** - clean |
+| CLI help | `python app.py --help` | **PASS** - documents `--media` |
+
+**Test delta:** Batch 19.1 had 896 tests (3 skipped); Batch 20 adds 65 ->
+961 (5 skipped; the two extra skips are the symlink tests): 57 in
+`tests/test_media.py` and 8 in `tests/test_config.py`.
+
+### Z.14.3 Not run / remaining limitations (Batch 20)
+
+- **No real player or media library was opened.** Every launch in the tests
+  uses an injected fake opener; real-Windows playback (that the OS handler
+  opens the file in the default player) is a manual step and was not run
+  here.
+- **No live microphone verification here** (`Microphone error: no
+  device`); the media phrases were exercised through the router with fixed
+  transcripts.
+- **Reparse points are best-effort on Windows.** Symlinks are skipped and
+  every path is re-resolved before launch, but an NTFS junction or other
+  reparse point created after discovery is not fully resolved by the
+  standard library.
+- **Plain video files only.** There is no playlist, pause/seek/volume or
+  remote/media-library support; those remain future work.
+- No commit or push was made.
+
+### Z.14.4 Requirement-to-test mapping (Batch 20)
+
+| # | Requirement | Test(s) |
+| --- | --- | --- |
+| 1 | Opt-in only: media is off unless `--tools` and `--media` and a root | `test_media.TestRegistryWiring.*`, `test_media.TestMainOptIn.test_media_requires_tools`, `test_media_requires_roots`, `test_media_off_by_default` |
+| 2 | Discovery never leaves the approved roots | `test_media.TestDiscovery.test_containment_rejects_paths_outside_roots`, `test_missing_root_is_skipped` |
+| 3 | Symlinks are skipped (file and directory) | `test_media.TestDiscovery.test_symlinked_file_is_skipped`, `test_symlinked_directory_is_not_traversed` |
+| 4 | Unsupported file types are ignored | `test_media.TestDiscovery.test_unsupported_extension_is_ignored` |
+| 5 | A unique/exact match may play after confirmation | `test_media.TestMediaTools.test_unique_match_launches_once`, `test_exact_match_preferred_over_partial` |
+| 6 | Several matches are listed and never auto-played | `test_media.TestMediaTools.test_multiple_matches_do_not_launch` |
+| 7 | A position plays only against the current list | `test_media.TestMediaTools.test_select_launches_after_multi_result`, `test_select_without_active_list_does_not_launch` |
+| 8 | Stale/out-of-range selections launch nothing | `test_media.TestMediaTools.test_select_out_of_range_does_not_launch`, `test_select_is_single_use`, `test_selection_outside_roots_is_refused` |
+| 9 | Cancel and unrelated commands clear the selection | `test_media.TestMediaTools.test_cancel_clears_the_session`, `test_media.TestMainOptIn.test_unrelated_command_invalidates_pending_selection` |
+| 10 | Denied approval never launches | `test_media.TestMediaTools.test_denied_approval_never_launches` |
+| 11 | Path is re-validated immediately before launch | `test_media.TestMediaTools.test_file_removed_before_launch_is_reported`, `test_selection_outside_roots_is_refused` |
+| 12 | Launcher uses no shell and no `subprocess` | `test_media.TestLauncher.test_source_uses_no_shell_and_no_subprocess` |
+| 13 | Selection state is never persisted (in-memory only) | `test_media.TestSession.*`, `test_media.TestMediaTools.test_cancel_clears_the_session` |
+| 14 | Media phrases do not hijack research or memory | `test_media.TestRouterMedia.test_research_question_is_not_hijacked`, `test_memory_save_phrase_never_becomes_playback`, `test_media_phrases_are_inert_without_media_tools` |
+| 15 | The `--media` flag is documented and fails closed | `test_media.TestMainOptIn.test_help_documents_media_flag`, `test_media_requires_tools`, `test_media_requires_roots` |

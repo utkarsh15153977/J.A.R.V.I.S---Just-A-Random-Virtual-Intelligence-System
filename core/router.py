@@ -302,6 +302,150 @@ def _memory_request(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Media playback routing (opt-in; only active when the media tools exist).
+#
+# The vocabulary is deliberately small and whole-word. "play <title>" and
+# "find the movie <title>" carry a title payload; "play the second one"
+# selects from the most recent search; a few words cancel it. Nothing here
+# is stateful: the router only names a tool, and the tool decides whether a
+# numeric selection is currently valid.
+# ---------------------------------------------------------------------------
+_MEDIA_SELECT_VERBS: FrozenSet[str] = frozenset(
+    {"play", "select", "choose", "pick"}
+)
+_MEDIA_MAX_SELECTION = 10
+_MEDIA_ORDINALS: dict[str, int] = {
+    "first": 0, "1st": 0,
+    "second": 1, "2nd": 1,
+    "third": 2, "3rd": 2,
+    "fourth": 3, "4th": 3,
+    "fifth": 4, "5th": 4,
+    "sixth": 5, "6th": 5,
+    "seventh": 6, "7th": 6,
+    "eighth": 7, "8th": 7,
+    "ninth": 8, "9th": 8,
+    "tenth": 9, "10th": 9,
+}
+_MEDIA_NUMBER_WORDS: dict[str, int] = {
+    "one": 0, "two": 1, "three": 2, "four": 3, "five": 4,
+    "six": 5, "seven": 6, "eight": 7, "nine": 8, "ten": 9,
+}
+_MEDIA_FILLERS: FrozenSet[str] = frozenset(
+    {"the", "a", "my", "number", "option", "item", "please"}
+)
+_MEDIA_PLAY_TRIGGERS: tuple[tuple[str, ...], ...] = (
+    ("play", "the", "movie"),
+    ("play", "the", "video"),
+    ("play", "the", "film"),
+    ("play", "the", "song"),
+    ("play", "movie"),
+    ("play", "video"),
+    ("play", "film"),
+    ("watch", "the", "movie"),
+    ("watch", "the", "video"),
+    ("watch", "movie"),
+    ("watch", "video"),
+    ("watch",),
+    ("play",),
+    ("find", "the", "movie"),
+    ("find", "the", "video"),
+    ("find", "the", "film"),
+    ("find", "movie"),
+    ("find", "video"),
+    ("find", "film"),
+)
+_MEDIA_CANCEL_PHRASES: FrozenSet[str] = frozenset(
+    {
+        "cancel",
+        "cancel that",
+        "cancel it",
+        "never mind",
+        "nevermind",
+        "forget it",
+        "forget about it",
+        "stop searching",
+        "stop looking",
+    }
+)
+
+
+def _media_select_index(normalized: str) -> Optional[int]:
+    """Return the 0-based candidate index for a selection phrase, or None.
+
+    Accepts only a firmly-formed selection ("play the second one",
+    "play number 2", "the second one", "play two"). A title that merely
+    happens to contain a number ("play the 2 towers") does not match,
+    because every trailing word must be a harmless filler.
+    """
+    words = normalized.split()
+    if not words:
+        return None
+    if words[0] in _MEDIA_SELECT_VERBS:
+        rest = words[1:]
+    elif words[0] in _MEDIA_FILLERS or words[0] in _MEDIA_NUMBER_WORDS or (
+        words[0] in _MEDIA_ORDINALS
+    ):
+        rest = words
+    else:
+        return None
+    while rest and (
+        rest[0] in _MEDIA_FILLERS
+        and rest[0] not in _MEDIA_ORDINALS
+        and rest[0] not in _MEDIA_NUMBER_WORDS
+        and not rest[0].isdigit()
+    ):
+        rest = rest[1:]
+    if not rest:
+        return None
+    token = rest[0]
+    index = _MEDIA_ORDINALS.get(token)
+    if index is None:
+        index = _MEDIA_NUMBER_WORDS.get(token)
+    if index is None and token.isdigit():
+        value = int(token)
+        if not 1 <= value <= _MEDIA_MAX_SELECTION:
+            return None
+        index = value - 1
+    if index is None:
+        return None
+    if any(t not in ("one", "item", "please") for t in rest[1:]):
+        return None
+    return index
+
+
+def _media_request(
+    normalized: str,
+    original: str,
+    media_tools: Mapping[str, str],
+) -> Optional[CommandRequest]:
+    """Turn a conservative media phrase into a tool request, or ``None``."""
+    if not media_tools:
+        return None
+    cancel = media_tools.get("cancel")
+    if cancel and normalized in _MEDIA_CANCEL_PHRASES:
+        return CommandRequest(CommandKind.TOOL, tool_name=cancel)
+    select = media_tools.get("select")
+    if select:
+        index = _media_select_index(normalized)
+        if index is not None:
+            return CommandRequest(
+                CommandKind.TOOL,
+                tool_name=select,
+                arguments={"index": index},
+            )
+    play = media_tools.get("play")
+    if play:
+        query = _memory_payload(original, _MEDIA_PLAY_TRIGGERS)
+        if query:
+            return CommandRequest(
+                CommandKind.TOOL,
+                tool_name=play,
+                arguments={"query": query},
+            )
+    return None
+
+
 # Deterministic policy for the *general-question* fallback used when web
 # research is enabled (see ``ToolCommandRouter``). A phrase is eligible
 # only if it opens with a question word and is not an imperative action
@@ -736,6 +880,7 @@ class ToolCommandRouter(PlaceholderRouter):
         research_tool: Optional[str] = None,
         research_max_query_chars: int = 400,
         memory_tools: Optional[Mapping[str, str]] = None,
+        media_tools: Optional[Mapping[str, str]] = None,
         exit_words: FrozenSet[str] = _EXIT_WORDS,
         clarify_response: str = _CLARIFY_RESPONSE,
         unsupported_response: str = _UNSUPPORTED_RESPONSE,
@@ -765,6 +910,11 @@ class ToolCommandRouter(PlaceholderRouter):
             for operation, tool_name in (memory_tools or {}).items()
             if isinstance(tool_name, str) and tool_name in available
         }
+        self._media_tools = {
+            operation: tool_name
+            for operation, tool_name in (media_tools or {}).items()
+            if isinstance(tool_name, str) and tool_name in available
+        }
 
     def _match_intent(
         self, normalized: str, original: str
@@ -777,7 +927,12 @@ class ToolCommandRouter(PlaceholderRouter):
                 tool_name=tool_name,
                 arguments=dict(arguments),
             )
-        return _memory_request(normalized, original, self._memory_tools)
+        memory_request = _memory_request(
+            normalized, original, self._memory_tools
+        )
+        if memory_request is not None:
+            return memory_request
+        return _media_request(normalized, original, self._media_tools)
 
     def _match_fallback(
         self, normalized: str, original: str

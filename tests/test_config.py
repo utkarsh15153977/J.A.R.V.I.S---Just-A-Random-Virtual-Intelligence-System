@@ -5,6 +5,7 @@ import unittest
 from config import (
     AppsConfig,
     ConfigError,
+    MediaConfig,
     MemoryConfig,
     SpeakerVerificationConfig,
     VoiceConfig,
@@ -192,6 +193,49 @@ class TestMemoryConfig(unittest.TestCase):
 
     def test_empty_data_dir_stays_valid(self):
         self.assertIs(MemoryConfig(data_dir="").validate().data_dir, "")
+
+
+class TestMediaConfig(unittest.TestCase):
+    def test_defaults_are_disabled_and_valid(self):
+        config = MediaConfig()
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.roots, ())
+        self.assertIs(config.validate(), config)
+
+    def test_enabled_with_roots_is_valid(self):
+        config = MediaConfig(enabled=True, roots=("C:/Videos",))
+        self.assertIs(config.validate(), config)
+
+    def assert_invalid(self, **overrides):
+        config = MediaConfig(**overrides)
+        with self.assertRaises(ConfigError):
+            config.validate()
+
+    def test_non_bool_enabled_rejected(self):
+        self.assert_invalid(enabled="yes")
+
+    def test_roots_must_be_a_tuple(self):
+        self.assert_invalid(roots=["C:/Videos"])
+
+    def test_roots_entries_must_be_non_empty_strings(self):
+        self.assert_invalid(roots=("",))
+        self.assert_invalid(roots=("   ",))
+        self.assert_invalid(roots=(123,))
+
+    def test_roots_reject_control_characters(self):
+        self.assert_invalid(roots=("C:/Videos\n",))
+        self.assert_invalid(roots=("C:/Vid\x00eos",))
+
+    def test_max_scan_files_must_be_a_positive_integer(self):
+        self.assert_invalid(max_scan_files=0)
+        self.assert_invalid(max_scan_files=-1)
+        self.assert_invalid(max_scan_files="100")
+        self.assert_invalid(max_scan_files=None)
+
+    def test_max_scan_files_rejects_bool(self):
+        # bool is an int subclass, but True/False are never a file count.
+        self.assert_invalid(max_scan_files=True)
+        self.assert_invalid(max_scan_files=False)
 
 
 class TestSpeakerVerificationConfig(unittest.TestCase):

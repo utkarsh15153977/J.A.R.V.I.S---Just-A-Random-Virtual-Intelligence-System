@@ -90,6 +90,7 @@ from typing import Any, Callable, List, Optional
 from config import (
     AppsConfig,
     ConfigError,
+    MediaConfig,
     MemoryConfig,
     ResearchConfig,
     SpeakerVerificationConfig,
@@ -110,6 +111,14 @@ from core.app_launcher import (
 from core.builtin_tools import build_builtin_registry
 from core.executor import ExecutionResult, ExecutionStatus, ToolExecutor
 from core.log import setup_logging
+from core.media import MediaDiscovery, SubprocessMediaLauncher
+from core.media_tools import (
+    TOOL_MEDIA_CANCEL,
+    TOOL_MEDIA_PLAY,
+    TOOL_MEDIA_SELECT,
+    MediaSession,
+    register_media_tools,
+)
 from core.memory import (
     MEMORY_OPERATIONS,
     MemoryService,
@@ -199,6 +208,9 @@ _USAGE = (
     "                      saved automatically. Say 'remember that ...' to\n"
     "                      save, 'list my memories' to review, and clear with\n"
     "                      a confirmation. Stored locally as plain text.\n"
+    "  --media             Enable safe local media playback from approved\n"
+    "                      Windows folders. Requires --tools. OFF by\n"
+    "                      default; playing files requires confirmation.\n"
     "  --log-transcripts   Write full voice transcripts AND the routing\n"
     "                      outcome (which tool a command matched, or that\n"
     "                      it was unsupported) to the log file. OFF by\n"
@@ -220,6 +232,7 @@ class _Options:
     allow_apps: bool = False
     research: bool = False
     memory: bool = False
+    media: bool = False
     log_transcripts: bool = False
     speak: bool = True
     show_help: bool = False
@@ -236,6 +249,7 @@ def _parse_args(argv: List[str]) -> _Options:
         allow_apps="--allow-apps" in argv,
         research="--research" in argv,
         memory="--memory" in argv,
+        media="--media" in argv,
         log_transcripts="--log-transcripts" in argv,
         speak="--no-speech" not in argv,
         show_help=any(arg in ("-h", "--help") for arg in argv),
@@ -265,6 +279,10 @@ def _build_registry(
     research_diagnostic: Optional[Callable[[str], None]] = None,
     memory_config: Optional[MemoryConfig] = None,
     memory_service: Optional[MemoryService] = None,
+    media_config: Optional[MediaConfig] = None,
+    media_discovery: Optional[MediaDiscovery] = None,
+    media_session: Optional[MediaSession] = None,
+    media_launcher: Optional[SubprocessMediaLauncher] = None,
 ) -> ToolRegistry:
     """Return the registry of approved tools (empty unless enabled).
 
@@ -315,6 +333,15 @@ def _build_registry(
         and memory_service is not None
     ):
         register_memory_tools(registry, memory_service)
+    if (
+        media_config is not None
+        and media_config.enabled
+        and media_discovery is not None
+        and media_session is not None
+    ):
+        register_media_tools(
+            registry, media_discovery, media_session, media_launcher
+        )
     return registry
 
 
@@ -334,6 +361,7 @@ def _build_router(
     research_tool: Optional[str] = None,
     research_max_query_chars: int = 400,
     memory_tools: Optional[Mapping[str, str]] = None,
+    media_tools: Optional[Mapping[str, str]] = None,
 ) -> Router:
     """Build the deterministic router for the registered tools.
 
@@ -350,6 +378,7 @@ def _build_router(
         research_tool=research_tool,
         research_max_query_chars=research_max_query_chars,
         memory_tools=memory_tools,
+        media_tools=media_tools,
     )
 
 
@@ -595,6 +624,7 @@ def _run_loop(
     mode: ActivationMode,
     *,
     log_transcripts: bool = False,
+    on_route: Optional[Callable[[CommandRequest], None]] = None,
 ) -> int:
     while True:
         try:
@@ -647,6 +677,15 @@ def _run_loop(
             output("Sorry, I had a problem understanding that.")
             machine.to(ListeningState.IDLE)
             continue
+
+        if on_route is not None:
+            # Lets the composition root drop per-session state (for
+            # example a pending media selection) once an unrelated
+            # command arrives. Errors here must never break the loop.
+            try:
+                on_route(command)
+            except Exception:
+                logger.warning("Routing hook failed; continuing.")
 
         if log_transcripts:
             # Opt-in diagnostic: the recognised transcript and the routing
@@ -946,6 +985,10 @@ def main(
     memory_config: Optional[MemoryConfig] = None,
     memory_store: Optional[MemoryStore] = None,
     memory_service: Optional[MemoryService] = None,
+    media_config: Optional[MediaConfig] = None,
+    media_discovery: Optional[MediaDiscovery] = None,
+    media_session: Optional["MediaSession"] = None,
+    media_launcher: Optional[SubprocessMediaLauncher] = None,
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
 ) -> int:
@@ -1021,6 +1064,13 @@ def main(
         if options.memory and active_tools.enabled:
             active_memory = replace(active_memory, enabled=True)
         active_memory.validate()
+
+        active_media = (
+            media_config if media_config is not None else MediaConfig()
+        )
+        if options.media and active_tools.enabled:
+            active_media = replace(active_media, enabled=True)
+        active_media.validate()
     except ConfigError as exc:
         output(f"Invalid configuration: {exc}")
         return EXIT_CONFIG_ERROR
@@ -1060,6 +1110,10 @@ def main(
     if options.memory and not active_tools.enabled:
         output(
             "Persistent memory requires --tools; keeping it disabled."
+        )
+    if options.media and not active_tools.enabled:
+        output(
+            "Media playback requires --tools; keeping it disabled."
         )
 
     allowlist: Optional[AppAllowlist] = None
@@ -1117,6 +1171,32 @@ def main(
                 output(f"Invalid configuration: {exc}")
                 return EXIT_CONFIG_ERROR
 
+    active_media_session: Optional[MediaSession] = None
+    active_media_discovery: Optional[MediaDiscovery] = None
+    active_media_launcher: Optional[SubprocessMediaLauncher] = None
+    if active_tools.enabled and active_media.enabled:
+        if not active_media.roots:
+            output(
+                "Media playback requires at least one approved folder "
+                "(MediaConfig.roots); keeping it disabled."
+            )
+        else:
+            active_media_discovery = (
+                media_discovery
+                if media_discovery is not None
+                else MediaDiscovery(
+                    active_media.roots,
+                    max_scan=active_media.max_scan_files,
+                )
+            )
+            active_media_session = (
+                media_session if media_session is not None else MediaSession()
+            )
+            if media_launcher is not None:
+                active_media_launcher = media_launcher
+            else:
+                active_media_launcher = SubprocessMediaLauncher()
+
     registry = _build_registry(
         active_tools,
         clock,
@@ -1131,6 +1211,14 @@ def main(
         ),
         memory_config=active_memory,
         memory_service=active_memory_service,
+        media_config=active_media,
+        media_discovery=(
+            active_media_discovery if active_media_session is not None else None
+        ),
+        media_session=active_media_session,
+        media_launcher=(
+            active_media_launcher if active_media_session is not None else None
+        ),
     )
     memory_tools: Optional[Mapping[str, str]] = None
     if active_memory_service is not None:
@@ -1138,6 +1226,13 @@ def main(
             operation: tool_name
             for operation, tool_name in MEMORY_OPERATIONS.items()
             if tool_name in registry
+        }
+    media_tools: Optional[Mapping[str, str]] = None
+    if active_media_session is not None:
+        media_tools = {
+            "play": TOOL_MEDIA_PLAY,
+            "select": TOOL_MEDIA_SELECT,
+            "cancel": TOOL_MEDIA_CANCEL,
         }
     if router is None:
         research_tool = (
@@ -1148,6 +1243,7 @@ def main(
             research_tool=research_tool,
             research_max_query_chars=active_research.max_query_chars,
             memory_tools=memory_tools,
+            media_tools=media_tools,
         )
     if executor is None:
         executor = _build_executor(registry)
@@ -1244,6 +1340,22 @@ def main(
             output(f"Could not establish an activation mode: {exc}")
             return EXIT_RUNTIME_ERROR
 
+        media_tool_names = (
+            {TOOL_MEDIA_PLAY, TOOL_MEDIA_SELECT, TOOL_MEDIA_CANCEL}
+            if active_media_session is not None
+            else set()
+        )
+
+        def _drop_stale_media_selection(command: CommandRequest) -> None:
+            if active_media_session is None:
+                return
+            if (
+                command.kind is CommandKind.TOOL
+                and command.tool_name in media_tool_names
+            ):
+                return
+            active_media_session.clear()
+
         return _run_loop(
             listener,
             router,
@@ -1255,6 +1367,7 @@ def main(
             verifier,
             mode,
             log_transcripts=active_config.log_transcripts,
+            on_route=_drop_stale_media_selection,
         )
     except KeyboardInterrupt:
         output("\nInterrupted. Shutting down.")
