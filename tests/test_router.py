@@ -405,6 +405,58 @@ class TestResearchFallback(unittest.TestCase):
                 self.assertIsNone(_research_query(text))
 
 
+class TestResearchRequestBoundary(unittest.TestCase):
+    """Batch 18: keep informational questions and block action requests."""
+
+    def _router(self, **kwargs):
+        options = {
+            "available_tools": (TOOL_WEB_RESEARCH, "get_current_time"),
+            "research_tool": TOOL_WEB_RESEARCH,
+        }
+        options.update(kwargs)
+        return ToolCommandRouter(DEFAULT_TOOL_INTENTS, **options)
+
+    def test_modal_request_with_ability_filler_is_unsupported(self):
+        # An action request phrased with "able to" must not reach research.
+        self.assertIs(
+            self._router().route("are you able to open the file").kind,
+            CommandKind.UNSUPPORTED,
+        )
+
+    def test_politeness_and_filler_do_not_open_a_back_door(self):
+        for text in (
+            "could you kindly open notepad",
+            "would you please delete this file",
+            "can i just launch the calculator",
+        ):
+            with self.subTest(text=text):
+                self.assertIs(
+                    self._router().route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+    def test_wh_how_to_question_still_routes(self):
+        # A "how to" question is informational, not an imperative.
+        command = self._router().route("how to open a bank account")
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_WEB_RESEARCH)
+
+    def test_informational_question_about_an_action_word_routes(self):
+        command = self._router().route("why should I open notepad")
+        self.assertEqual(command.tool_name, TOOL_WEB_RESEARCH)
+        self.assertEqual(
+            dict(command.arguments)["query"], "why should I open notepad"
+        )
+
+    def test_modal_question_about_a_subject_still_routes(self):
+        command = self._router().route("does the library open at nine")
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_WEB_RESEARCH)
+
+    def test_fixed_intent_still_wins(self):
+        command = self._router().route("can you tell me the time")
+        self.assertEqual(command.tool_name, "get_current_time")
+
+
 class TestCommandRequest(unittest.TestCase):
     def test_defaults(self):
         command = CommandRequest(CommandKind.EXIT)

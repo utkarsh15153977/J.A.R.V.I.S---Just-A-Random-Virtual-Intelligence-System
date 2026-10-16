@@ -941,6 +941,169 @@ class TestResearchRelevance(unittest.TestCase):
         self.assertEqual(clarify, "clarify")
 
 
+class TestResearchGrounding(unittest.TestCase):
+    """Batch 18: snippet-first evidence and conservative contradictions."""
+
+    def _reply(self, query, sources, *, answer="", max_chars=400,
+               synthesizer=None):
+        return compose_reply(
+            query,
+            ResearchResult(
+                status=ResearchStatus.OK,
+                answer=answer,
+                sources=tuple(sources),
+            ),
+            max_chars=max_chars,
+            synthesizer=synthesizer,
+        )
+
+    def test_relevant_title_with_irrelevant_snippet_is_not_evidence(self):
+        reply = self._reply(
+            "what is the capital of france",
+            [
+                ResearchSource(
+                    "France capital guide",
+                    "https://spam.example/pills",
+                    "Buy cheap pills online now.",
+                )
+            ],
+        )
+        # A title that names the subject does not make an off-topic page
+        # an answer when the snippet is about something else entirely.
+        self.assertIn("couldn't find", reply.lower())
+        self.assertNotIn("pills", reply)
+
+    def test_conflicting_population_is_surfaced_not_resolved(self):
+        reply = self._reply(
+            "what is the population of rampur",
+            [
+                ResearchSource(
+                    "A", "https://a.example/rampur",
+                    "Rampur has a population of 50,000.",
+                ),
+                ResearchSource(
+                    "B", "https://b.example/rampur",
+                    "Rampur has a population of 120,000.",
+                ),
+            ],
+        )
+        self.assertIn("disagree", reply.lower())
+        self.assertIn("50,000", reply)
+        self.assertIn("120,000", reply)
+
+    def test_conflicting_years_are_surfaced(self):
+        reply = self._reply(
+            "when was the orlin bridge built",
+            [
+                ResearchSource(
+                    "A", "https://a.example/orlin",
+                    "The Orlin bridge was built in 1987.",
+                ),
+                ResearchSource(
+                    "B", "https://b.example/orlin",
+                    "The Orlin bridge was completed in 1994.",
+                ),
+            ],
+        )
+        self.assertIn("1987", reply)
+        self.assertIn("1994", reply)
+        self.assertIn("disagree", reply.lower())
+
+    def test_contradictory_status_is_surfaced(self):
+        reply = self._reply(
+            "is the orlan 9 spacecraft operational",
+            [
+                ResearchSource(
+                    "A", "https://a.example/orlan",
+                    "The Orlan 9 spacecraft is operational.",
+                ),
+                ResearchSource(
+                    "B", "https://b.example/orlan",
+                    "The Orlan 9 spacecraft was declared defunct in 2019.",
+                ),
+            ],
+        )
+        self.assertIn("operational", reply)
+        self.assertIn("defunct", reply)
+        self.assertIn("disagree", reply.lower())
+
+    def test_secondary_detail_difference_is_not_a_conflict(self):
+        reply = self._reply(
+            "when was the orlin bridge built",
+            [
+                ResearchSource(
+                    "A", "https://a.example/orlin",
+                    "The Orlin bridge was built in 1987 and carries "
+                    "1,200 vehicles.",
+                ),
+                ResearchSource(
+                    "B", "https://b.example/orlin",
+                    "The Orlin bridge opened in 1987; about 900 vehicles "
+                    "cross daily.",
+                ),
+            ],
+        )
+        # The main fact (the year) agrees, so a differing secondary
+        # number is not reported as a contradiction.
+        self.assertIn("1987", reply)
+        self.assertNotIn("disagree", reply.lower())
+
+    def test_disagreement_is_ignored_when_the_question_does_not_ask(self):
+        reply = self._reply(
+            "tell me about acme",
+            [
+                ResearchSource(
+                    "A", "https://a.example/acme",
+                    "Acme was founded in 1990.",
+                ),
+                ResearchSource(
+                    "B", "https://b.example/acme",
+                    "Acme has 1,200 employees.",
+                ),
+            ],
+        )
+        self.assertNotIn("disagree", reply.lower())
+
+    def test_conflict_is_reported_with_conflict_provenance(self):
+        _, provenance = compose_answer(
+            "what is the population of rampur",
+            ResearchResult(
+                status=ResearchStatus.OK,
+                sources=(
+                    ResearchSource(
+                        "A", "https://a.example/rampur",
+                        "Rampur has a population of 50,000.",
+                    ),
+                    ResearchSource(
+                        "B", "https://b.example/rampur",
+                        "Rampur has a population of 120,000.",
+                    ),
+                ),
+            ),
+            max_chars=400,
+        )
+        self.assertEqual(provenance, "conflict")
+
+    def test_disagreement_beats_a_synthesizer(self):
+        reply = self._reply(
+            "what is the population of rampur",
+            [
+                ResearchSource(
+                    "A", "https://a.example/rampur",
+                    "Rampur has a population of 50,000.",
+                ),
+                ResearchSource(
+                    "B", "https://b.example/rampur",
+                    "Rampur has a population of 120,000.",
+                ),
+            ],
+            synthesizer=lambda query, sources: "The population is 99,000.",
+        )
+        # A synthesizer must not paper over a material disagreement.
+        self.assertIn("disagree", reply.lower())
+        self.assertNotIn("99,000", reply)
+
+
 class TestResearchDiagnostic(unittest.TestCase):
     """Batch 17.6: opt-in per-lookup diagnostic; quiet by default."""
 

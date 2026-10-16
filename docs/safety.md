@@ -438,9 +438,12 @@ terms (short tokens and generic words are dropped) and requires a single
 source to cover a strict majority of them; only a URL overlap does not
 count as coverage. A source that runs the terms together (a place name
 like "Jinkpani" for the question "where is Jink Pani") still matches.
-When no source shares a distinctive term Jarvis says it could not find a
-clear match; when only a weak partial match exists it asks the user to
-rephrase, or to check the spelling of a place or name. It never reads an
+Coverage is judged from the **snippet** when one is present (falling back
+to the title only when there is no snippet), so a title that promises the
+topic but a snippet about something else is not counted as evidence
+(Batch 18). When no source shares a distinctive term Jarvis says it could
+not find a clear match; when only a weak partial match exists it asks the
+user to rephrase, or to check the spelling of a place or name. It never reads an
 unrelated snippet aloud, and it never pads the sources with irrelevant
 hits to look complete. A provider-supplied summary, when used, stays
 attributed to the search service (not presented as verified fact), and a
@@ -452,9 +455,27 @@ ambiguous place or name whose terms land in unrelated results (a game
 character here, a ritual there) is answered with the explicit "couldn't
 find a clear match" message rather than a guess. The source order and
 the answer's provenance (`unavailable`/`no-sources`/`no-relevant`/
-`clarify`/`no-distance`/`synthesizer`/`provider`/`extractive`) are
-reported in the structured tool result (`status`/`provenance`/`sources`)
+`clarify`/`no-distance`/`conflict`/`synthesizer`/`provider`/`extractive`)
+are reported in the structured tool result (`status`/`provenance`/`sources`)
 for diagnosis; the spoken reply stays plain text.
+
+**Material contradictions are surfaced, not resolved (Batch 18).** When
+the on-topic sources make *materially different* claims Jarvis says so
+with attribution instead of confidently choosing one. This is deliberately
+narrow and only fires for machine-checkable claim types the question
+actually asks for: a different value for the kind of quantity in the
+question (a year for "when…", a count/population for "how many…", a
+percentage, a price, a height/length) or opposite members of a small
+status-antonym set (`operational`/`defunct`, `alive`/`dead`,
+`approved`/`rejected`, `active`/`inactive`, …). A difference in a
+*secondary* detail is not a contradiction and does not suppress the
+answer, and a passing number in a source that the question did not ask
+about is ignored. When a contradiction is found the reply names the
+differing values and their domains and uses the `conflict` provenance; a
+synthesised answer is bypassed so a synthesiser cannot paper over the
+disagreement. There is no general-purpose fact-verifier here: unreliable
+comparison yields the ordinary attributed answer, never a false claim of
+agreement or disagreement.
 
 **Research diagnostics are opt-in (Batch 17.6).** With
 `--log-transcripts`, each lookup writes one short line -- the query, the
@@ -463,6 +484,16 @@ log, reusing the existing transcript opt-in. Without the flag nothing
 about the lookup is logged. The diagnostic never contains source text,
 a snippet or the API key, and a failure in the diagnostic sink can never
 break a research turn.
+
+**Answer quality is evaluated deterministically (Batch 18).** A fixed set
+of cases (exact provider output and exact transcript) is run both by the
+unit suite (`tests/test_evaluation.py`) and by a standalone runner
+(`scripts/run_evaluation.py`). It covers answerable facts, specific
+entities, ambiguous or misspelled subjects, contradictory evidence
+(value/date/status), irrelevant or adversarial sources, provider failure
+and voice-routing (including that an action request never reaches the
+provider). It uses no network, key, microphone or model and exits non-zero
+if any case regresses. See `docs/research-evaluation.md`.
 
 **Distance questions need distance evidence (Batch 17.4).** A question
 containing "distance" or "how far" is answered only from sources that
@@ -482,9 +513,14 @@ single unbroken run is hard-cut -- so a reply never ends mid-word.
 router adds one deterministic fallback that runs *after* fixed-intent
 matching: a turn is eligible only if it opens with a question word and
 its first meaningful word (after politeness words) is not an action verb.
-"open Google Chrome", "delete this file" and "run this command" therefore
-stay `UNSUPPORTED` and are never sent to a provider. Existing tool
-intents are matched first and are unchanged.
+After a yes/no modal opener ("can/could/would/is/does…") a few extra
+filler words are also skipped (Batch 18), so an action request phrased
+with a modal — "are you able to open the file" — is still `UNSUPPORTED`
+rather than being treated as a factual question, while an informational
+"how to open a bank account" still routes. "open Google Chrome", "delete
+this file" and "run this command" therefore stay `UNSUPPORTED` and are
+never sent to a provider. Existing tool intents are matched first and are
+unchanged.
 
 **Privacy.** A research request sends the recognised query text to the
 provider, and the reply is spoken through the normal speaker path.

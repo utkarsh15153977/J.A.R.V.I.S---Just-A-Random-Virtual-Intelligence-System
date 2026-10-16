@@ -107,6 +107,95 @@ _RAIL_WORDS = frozenset(
     }
 )
 
+# --- Conservative contradiction detection -------------------------------
+# When sources make *materially different* claims, Jarvis surfaces the
+# disagreement instead of confidently picking one. This is deliberately
+# narrow: only a small set of machine-checkable claim types is compared,
+# and only when the question actually asks for that kind of value. A
+# general-purpose fact-verifier is out of scope.
+_PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|percent|per cent)\b")
+_MONEY_RE = re.compile(
+    r"[$\u20b9\u00a3\u20ac]\s?(\d[\d,]*(?:\.\d+)?)"
+    r"\s*(thousand|million|billion|trillion)?\b"
+)
+_LENGTH_RE = re.compile(
+    r"(\d[\d,]*(?:\.\d+)?)\s*"
+    r"(kilometers?|kilometres?|km|miles?|meters?|metres?|feet|foot|ft)\b"
+)
+_SCALED_COUNT_RE = re.compile(
+    r"(\d[\d,]*(?:\.\d+)?)\s*(thousand|million|billion|trillion)\b"
+)
+_GROUPED_COUNT_RE = re.compile(r"\b(\d{1,3}(?:,\d{3})+)\b")
+_YEAR_RE = re.compile(r"\b(1[0-9]{3}|20[0-9]{2})\b")
+
+# Ordered so a more specific pattern "claims" its characters first and a
+# later, broader pattern cannot double-count the same number.
+_QUANTITY_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("percent", _PERCENT_RE),
+    ("money", _MONEY_RE),
+    ("length", _LENGTH_RE),
+    ("count", _SCALED_COUNT_RE),
+    ("count", _GROUPED_COUNT_RE),
+    ("year", _YEAR_RE),
+)
+
+_SCALE_FACTORS = {
+    "thousand": 1_000.0,
+    "million": 1_000_000.0,
+    "billion": 1_000_000_000.0,
+    "trillion": 1_000_000_000_000.0,
+}
+
+# Normalised to kilometres.
+_LENGTH_FACTORS = {
+    "km": 1.0,
+    "kilometer": 1.0,
+    "kilometers": 1.0,
+    "kilometre": 1.0,
+    "kilometres": 1.0,
+    "mile": 1.609344,
+    "miles": 1.609344,
+    "meter": 0.001,
+    "meters": 0.001,
+    "metre": 0.001,
+    "metres": 0.001,
+    "foot": 0.0003048,
+    "feet": 0.0003048,
+    "ft": 0.0003048,
+}
+
+# A quantity only counts as "the answer" when the question asks for that
+# kind of value; otherwise a passing number in a source is ignored.
+_ATTRIBUTE_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("year", ("what year", "which year", "in what year", "when")),
+    ("count", ("how many", "population", "number of")),
+    ("percent", ("percent", "percentage")),
+    ("money", ("cost", "price", "how much does", "how expensive")),
+    (
+        "length",
+        (
+            "how tall", "how high", "how deep", "how long",
+            "height", "elevation", "altitude",
+        ),
+    ),
+)
+
+_QUANTITY_KIND_ORDER = ("year", "count", "percent", "money", "length")
+
+# Antonym pairs that signal a factual *status* disagreement between
+# sources. Each side must be a whole token, and the two sides must appear
+# in different sources, so one page mentioning both is not a conflict.
+_STATUS_ANTONYMS: tuple[tuple[str, str], ...] = (
+    ("alive", "dead"),
+    ("operational", "defunct"),
+    ("active", "inactive"),
+    ("approved", "rejected"),
+    ("passed", "failed"),
+    ("confirmed", "denied"),
+    ("legal", "illegal"),
+    ("valid", "invalid"),
+)
+
 
 class ResearchStatus(Enum):
     """Outcome category of one research attempt."""
@@ -256,6 +345,19 @@ def _content_tokens(source: ResearchSource) -> set[str]:
     return set(_tokens(" ".join((source.title, source.snippet))))
 
 
+def _evidence_tokens(source: ResearchSource) -> set[str]:
+    """Tokens that count as *evidence* that a page is on topic.
+
+    The snippet is preferred: a title can promise a topic the page does
+    not deliver (clickbait, a navigation label, a disambiguation page), so
+    when a snippet is present only its words count. A source with no
+    snippet falls back to its title, since that is all there is to go on.
+    """
+    if source.snippet:
+        return set(_tokens(source.snippet))
+    return set(_tokens(source.title))
+
+
 def _distinctive_terms(text: str) -> tuple[str, ...]:
     """Ordered identifiers that are likely to name the *subject*.
 
@@ -345,13 +447,14 @@ def _assess_relevance(
     """Judge whether the sources plausibly concern the question's subject.
 
     A query term counts as covered only when it appears in a source's
-    content (title/snippet), never merely its URL. The compact form of
-    the terms (their letters joined) is also matched, so a single word
-    that runs the identifiers together -- a place name like ``jinkpani``
-    for the question "where is Jink Pani" -- still counts as covering all
-    of them. A source must cover a strict majority of the subject terms on
-    its own for the result to be answering-worthy; otherwise the caller
-    asks for clarification rather than presenting loosely-related pages.
+    *evidence* text (its snippet, or its title when there is no snippet),
+    never merely its URL. The compact form of the terms (their letters
+    joined) is also matched, so a single word that runs the identifiers
+    together -- a place name like ``jinkpani`` for the question "where is
+    Jink Pani" -- still counts as covering all of them. A source must
+    cover a strict majority of the subject terms on its own for the result
+    to be answering-worthy; otherwise the caller asks for clarification
+    rather than presenting loosely-related pages.
     """
     terms = _distinctive_terms(query)
     subjects = frozenset(terms)
@@ -363,7 +466,7 @@ def _assess_relevance(
     relevant: list[ResearchSource] = []
     best = 0
     for source in sources:
-        tokens = _content_tokens(source)
+        tokens = _evidence_tokens(source)
         matched = subjects & tokens
         if compact and any(compact in token for token in tokens):
             matched = set(subjects)
@@ -445,6 +548,153 @@ def _distance_conflict_note(
         return ""
     listed = ", ".join(f"{value} km" for value in distinct)
     return f"Note: sources give different figures ({listed})."
+
+
+def _claim_text(source: ResearchSource) -> str:
+    """The text in which a source makes a factual claim (no URL)."""
+    return " ".join((source.title, source.snippet))
+
+
+def _requested_quantity_kinds(query: str) -> tuple[str, ...]:
+    """Quantity kinds the question asks for, in a stable order."""
+    lowered = (query or "").lower()
+    requested = [
+        kind
+        for kind, phrases in _ATTRIBUTE_HINTS
+        if any(phrase in lowered for phrase in phrases)
+    ]
+    return tuple(k for k in _QUANTITY_KIND_ORDER if k in requested)
+
+
+def _quantity_value(
+    kind: str, match: "re.Match[str]"
+) -> Optional[float]:
+    """Normalise one regex match to a comparable number (or ``None``)."""
+    try:
+        number = float(match.group(1).replace(",", ""))
+    except (ValueError, IndexError):
+        return None
+    groups = match.groups()
+    scale = groups[1] if len(groups) > 1 else None
+    if kind == "percent":
+        return number
+    if kind == "year":
+        year = int(number)
+        return float(year) if 1000 <= year <= 2099 else None
+    if kind == "money":
+        return number * _SCALE_FACTORS.get(scale or "", 1.0)
+    if kind == "length":
+        factor = _LENGTH_FACTORS.get(scale or "")
+        return number * factor if factor is not None else None
+    if kind == "count":
+        return number * _SCALE_FACTORS.get(scale or "", 1.0)
+    return None
+
+
+def _quantities(
+    text: str,
+) -> tuple[tuple[str, str, float], ...]:
+    """Extract ``(kind, raw_text, normalised_value)`` factual quantities.
+
+    Deterministic and local. A match "consumes" its characters so the
+    same digits are never counted twice by two overlapping patterns.
+    """
+    lowered = (text or "").lower()
+    if not lowered:
+        return ()
+    used = [False] * len(lowered)
+    found: list[tuple[str, str, float]] = []
+    for kind, pattern in _QUANTITY_PATTERNS:
+        for match in pattern.finditer(lowered):
+            start, end = match.span()
+            if any(used[start:end]):
+                continue
+            value = _quantity_value(kind, match)
+            if value is None:
+                continue
+            for index in range(start, end):
+                used[index] = True
+            found.append((kind, match.group(0).strip(), value))
+    return tuple(found)
+
+
+def _quantity_conflict_note(
+    query: str, sources: Sequence[ResearchSource]
+) -> str:
+    """A note when sources give materially different answer values."""
+    requested = _requested_quantity_kinds(query)
+    if not requested:
+        return ""
+    for kind in requested:
+        values: dict[float, str] = {}
+        domains: dict[float, str] = {}
+        sources_with_values = 0
+        for source in sources:
+            source_had_value = False
+            for found_kind, raw, value in _quantities(_claim_text(source)):
+                if found_kind != kind:
+                    continue
+                normalized = round(value, 2)
+                values.setdefault(normalized, raw)
+                domains.setdefault(normalized, _domain(source.url))
+                source_had_value = True
+            if source_had_value:
+                sources_with_values += 1
+        if sources_with_values >= 2 and len(values) >= 2:
+            listed = ", ".join(
+                f"{values[value]} ({domains[value]})"
+                for value in sorted(values)
+            )
+            return f"Sources give different values ({listed})."
+    return ""
+
+
+def _status_conflict_note(sources: Sequence[ResearchSource]) -> str:
+    """A note when two sources assert opposite, machine-checkable statuses."""
+    token_sets = [set(_tokens(_claim_text(source))) for source in sources]
+    domains = [_domain(source.url) for source in sources]
+    for positive, negative in _STATUS_ANTONYMS:
+        positive_only = [
+            index
+            for index, tokens in enumerate(token_sets)
+            if positive in tokens and negative not in tokens
+        ]
+        negative_only = [
+            index
+            for index, tokens in enumerate(token_sets)
+            if negative in tokens and positive not in tokens
+        ]
+        if positive_only and negative_only:
+            return (
+                f"One source says it is {positive} "
+                f"({domains[positive_only[0]]}) while another says it is "
+                f"{negative} ({domains[negative_only[0]]})."
+            )
+    return ""
+
+
+def _contradiction_reply(
+    query: str, sources: Sequence[ResearchSource]
+) -> str:
+    """A whole reply that surfaces a material disagreement, or ``""``.
+
+    Only surfaces a conflict when it is confident: a requested quantity
+    kind differs across sources, or two sources assert opposite statuses.
+    A secondary difference (say, a year the question did not ask about)
+    is left to the normal answer rather than being treated as a conflict.
+    """
+    notes: list[str] = []
+    quantity = _quantity_conflict_note(query, sources)
+    if quantity:
+        notes.append(quantity)
+    status = _status_conflict_note(sources)
+    if status:
+        notes.append(status)
+    if not notes:
+        return ""
+    return "The sources disagree, so I won't pick one answer: " + " ".join(
+        notes
+    )
 
 
 def extractive_answer(
@@ -696,10 +946,13 @@ def compose_answer(
     with the question the honest "couldn't find" reply is used, and when
     only a weak partial match exists a clarification is asked. Only the
     relevant sources are ever cited, so a search hit is never padded into
-    an answer to look complete. The ``provenance`` string (``unavailable``
-    /``no-sources``/``no-relevant``/``clarify``/``no-distance``/
-    ``synthesizer``/``provider``/``extractive``) records which path
-    produced the text.
+    an answer to look complete. When the relevant sources make materially
+    different claims (a different value for the quantity asked about, or
+    opposite statuses), the disagreement is surfaced with attribution
+    rather than resolved by picking one. The ``provenance`` string
+    (``unavailable``/``no-sources``/``no-relevant``/``clarify``/
+    ``no-distance``/``conflict``/``synthesizer``/``provider``/
+    ``extractive``) records which path produced the text.
     """
     if result.status is not ResearchStatus.OK:
         return _unavailable_reply(result.message), "unavailable"
@@ -731,6 +984,10 @@ def compose_answer(
             return _no_relevant_reply(), "no-relevant"
         return _clarification_reply(), "clarify"
     sources = relevance.relevant or sources
+
+    conflict = _contradiction_reply(query, sources)
+    if conflict:
+        return _truncate(conflict, max_chars), "conflict"
 
     answer = ""
     if synthesizer is not None:

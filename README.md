@@ -156,9 +156,12 @@ answer that quotes and attributes the source(s) it actually received and
 never invents a figure the provider did not return. Results are ranked
 against the question and, if none actually addresses it, Jarvis asks you
 to rephrase rather than read out an unrelated snippet; a distance question
-is answered only from road-distance sources. Action requests ("open Google
-Chrome", "delete this file", "run this command") are never treated as
-questions and stay unsupported.
+is answered only from road-distance sources. When the on-topic sources
+make *materially different* claims — a different value for the quantity
+asked about, or opposite statuses — the disagreement is surfaced with
+attribution instead of confidently picking one. Action requests ("open
+Google Chrome", "delete this file", "run this command") are never treated
+as questions and stay unsupported.
 
 The wired provider is the **Tavily search API** (`provider = "tavily"`),
 a third-party search API with a free tier and paid plans. Put your key in
@@ -519,6 +522,29 @@ key; none can run in CI, so run them by hand and record
   snippet or the API key. Without the flag nothing about the lookup is
   logged.
 
+### Batch 18 evaluation suite (offline, deterministic)
+
+Batch 18 adds a repeatable answer-quality and voice-understanding
+evaluation that needs **no network, key, microphone or model**. It is the
+same fixed cases the unit suite runs, so it can be run on demand or in CI:
+
+```
+.\.venv\Scripts\python scripts\run_evaluation.py
+.\.venv\Scripts\python scripts\run_evaluation.py --verbose
+```
+
+It prints `PASS`/`FAIL` per case and a summary, and exits `0` when every
+case passes, `1` otherwise. Fixing the exact provider output and exact
+transcript for each case is what makes it reproducible. The cases cover
+answerable factual questions, specific entities, ambiguous/misspelled
+subjects, contradictory evidence (different numbers, dates or statuses),
+irrelevant/adversarial sources, provider failure, and voice-transcription
+routing (including that action requests never reach research). See
+[`docs/research-evaluation.md`](docs/research-evaluation.md).
+
+Manual checks that still need a live Tavily key or a microphone are in the
+Batch 17 list above; these evaluation cases deliberately need neither.
+
 These exercise activation lifecycle and resource release. Items 10–13
 need a microphone; item 14 needs a legitimate enrolled voice profile.
 None were executed automatically — they must be run by hand. Where a
@@ -609,7 +635,9 @@ Jarvis/
 │   ├── enrollment.py      # voice enrolment storage + capture
 │   └── test_voice.py      # manual microphone test
 ├── scripts/
-│   └── validate_speaker_backend.py  # real-backend validation (manual)
+│   ├── validate_speaker_backend.py  # real-backend validation (manual)
+│   ├── validate_research_backend.py # live Tavily request (manual)
+│   └── run_evaluation.py            # offline answer-quality + routing suite
 ├── browser/               # (Phase 4) Playwright controller
 ├── tests/                 # automated unit tests
 ├── docs/                  # architecture and phase documentation
@@ -621,4 +649,5 @@ Jarvis/
 - [docs/voice-pipeline.md](docs/voice-pipeline.md) — how voice input works
 - [docs/voice-smoke-test.md](docs/voice-smoke-test.md) — manual Windows smoke test
 - [docs/voice-troubleshooting.md](docs/voice-troubleshooting.md) — microphone / wake-word / speech problems
+- [docs/research-evaluation.md](docs/research-evaluation.md) — deterministic answer-quality + routing evaluation
 - [docs/roadmap.md](docs/roadmap.md) — phase-by-phase plan and status

@@ -100,6 +100,24 @@ _QUESTION_OPENERS: tuple[str, ...] = (
 
 _POLITE_WORDS: FrozenSet[str] = frozenset({"please", "you", "kindly"})
 
+# Yes/no modal openers introduce an imperative request ("can you open X")
+# about as often as a real question ("does the library open at nine?").
+# For these openers only, the small set of filler words that commonly sit
+# between the opener and a command verb is skipped too, so "are you able
+# to open the file" is recognised as a request. Question words ("how to
+# open a file") keep the shallower rule, because there "to" belongs to an
+# informational phrase, not a command.
+_MODAL_OPENERS: FrozenSet[str] = frozenset(
+    {
+        "is", "are", "was", "were", "do", "does", "did",
+        "can", "could", "will", "would", "should", "shall",
+        "may", "might",
+    }
+)
+_REQUEST_FILLERS: FrozenSet[str] = _POLITE_WORDS | frozenset(
+    {"able", "to", "just", "really", "now", "u", "i"}
+)
+
 _ACTION_VERBS: FrozenSet[str] = frozenset(
     {
         "open", "launch", "start", "run", "execute", "delete",
@@ -123,6 +141,9 @@ def _research_query(normalized: str) -> Optional[str]:
     word, and the first meaningful word after it (skipping politeness
     words) must not be an action verb. Anything else returns ``None`` so
     imperative action requests stay unsupported and never reach research.
+    After a yes/no modal opener a few extra filler words are skipped (see
+    :data:`_REQUEST_FILLERS`) so "are you able to open the file" is still
+    treated as a request rather than a factual question.
     """
     words = normalized.split()
     if len(words) < 2:
@@ -134,8 +155,11 @@ def _research_query(normalized: str) -> Optional[str]:
                 opener = candidate
     if not opener:
         return None
+    fillers = (
+        _REQUEST_FILLERS if opener in _MODAL_OPENERS else _POLITE_WORDS
+    )
     rest = normalized[len(opener):].split()
-    while rest and rest[0] in _POLITE_WORDS:
+    while rest and rest[0] in fillers:
         rest = rest[1:]
     if not rest or rest[0] in _ACTION_VERBS:
         return None

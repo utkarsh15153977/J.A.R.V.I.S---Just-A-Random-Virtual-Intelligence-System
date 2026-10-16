@@ -2149,3 +2149,105 @@ New/changed tests (14 new, 732 total, from 718):
   (both "Jink" and "Pani" on one unrelated page) can still be treated as
   relevant; this is a known limit, reported rather than hidden.
 - No commit or push was made.
+
+## Z.10 Batch 18 addendum - intelligence and answer quality
+
+Batch 18 adds **no new tool and no new capability to opt into**. It
+improves question understanding and answer honesty, and it makes the
+behaviour measurable and repeatable with a deterministic evaluation suite.
+
+### Z.10.1 Changes
+
+- **`core/research.py` — snippet-first evidence.** Added
+  `_evidence_tokens`: when a source has a snippet, only the snippet counts
+  as evidence that the page is on topic (the title is used only when there
+  is no snippet). `_assess_relevance` now screens on `_evidence_tokens`, so
+  a relevant-looking title with an unrelated snippet is no longer accepted
+  as an answer. A joined form (e.g. "Jinkpani") still matches.
+- **`core/research.py` — conservative contradiction detection.** Added
+  ordered quantity patterns (`_PERCENT_RE`/`_MONEY_RE`/`_LENGTH_RE`/
+  `_SCALED_COUNT_RE`/`_GROUPED_COUNT_RE`/`_YEAR_RE`) with span-consuming
+  `_quantities`, `_requested_quantity_kinds` (year/count/percent/money/
+  length, driven by the question wording), `_quantity_conflict_note`,
+  `_status_conflict_note` over a small `_STATUS_ANTONYMS` set, and
+  `_contradiction_reply`. `compose_answer` now computes the contradiction
+  after relevance screening and, when one is found, returns the attributed
+  disagreement with the new **`conflict`** provenance **before** the
+  synthesiser/provider/extract paths, so no confident single value (and no
+  synthesiser) can paper over a material disagreement. The
+  `compose_answer` docstring records the new provenance.
+- **`core/router.py` — request/action boundary.** Added `_MODAL_OPENERS`
+  and `_REQUEST_FILLERS`; after a yes/no modal opener a few filler words
+  are skipped before the action-verb check, so "are you able to open the
+  file" is `UNSUPPORTED` while "how to open a bank account" still routes.
+  `_research_query`'s docstring records the rule.
+- **Evaluation suite.** New `tests/fixtures/__init__.py` and
+  `tests/fixtures/research_evaluation_cases.py` (14 research + 9 routing
+  cases, `ResearchCase`/`RoutingCase`/`Failure`/`EvaluationReport`,
+  `evaluate_research_case`/`evaluate_routing_case`/`run_evaluation`), new
+  `tests/test_evaluation.py`, and new `scripts/run_evaluation.py` CLI
+  (exit `0`/`1`). No network, key, microphone or model is used.
+- **Tests.** `tests/test_research.py` gains `TestResearchGrounding`
+  (snippet-first grounding, each contradiction path, `conflict`
+  provenance, secondary-detail non-conflict, synthesiser bypassed).
+  `tests/test_router.py` gains `TestResearchRequestBoundary`.
+  `tests/test_app.py` gains `TestVoiceUnderstandingRegressions` and
+  `TestResearchSecurityRegressions`.
+- **Docs.** `README.md` (research paragraph + Batch 18 evaluation
+  section), `docs/safety.md` (grounding, contradiction, router-boundary
+  and evaluation paragraphs), `docs/roadmap.md` (Batch 18 note) and this
+  addendum; new `docs/research-evaluation.md`.
+
+### Z.10.2 Batch 18 verification (actually run)
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Full suite | `python -m unittest discover -s tests` | **PASS** - 760 tests, OK (skipped=3) |
+| Compile | `python -m compileall -q .` | **PASS** - exit 0 |
+| Lint | `ruff check .` | **PASS** - All checks passed |
+| Dependencies | `python -m pip check` | **PASS** - No broken requirements found |
+| Entry point | `python app.py --help` | **PASS** - usage printed, exit 0 |
+| Whitespace | `git diff --check` | **PASS** - exit 0 |
+| Evaluation runner | `python scripts/run_evaluation.py` | **PASS** - 23/23 cases, exit 0 |
+| Live validator (no key) | `python scripts/validate_research_backend.py` | **BLOCKED** - prints `[BLOCKED]`, exit 3 |
+
+- `tests/test_research.py` `TestResearchGrounding`: a relevant-looking
+  title with an unrelated snippet is not evidence; conflicting population,
+  year and status are surfaced; a secondary-detail difference is not a
+  conflict; the conflict path reports `conflict` provenance and bypasses a
+  synthesiser.
+- `tests/test_router.py` `TestResearchRequestBoundary`: a modal action
+  request ("are you able to open the file") is `UNSUPPORTED`; politeness
+  and fillers open no back door; "how to open a bank account" still
+  routes; fixed intents still win.
+- `tests/test_app.py` `TestVoiceUnderstandingRegressions`: a transcribed
+  question reaches research with the spoken query; a transcribed action
+  request stays unsupported and never reaches the provider; a
+  punctuation-carrying exit stops; silence does not nag.
+- `tests/test_app.py` `TestResearchSecurityRegressions`: an injected
+  provider answer is shown only as an unverified summary and triggers no
+  action; action requests are never sent to the provider.
+- `tests/test_evaluation.py`: the suite passes, case ids are unique, every
+  case names a known path/kind, a deliberately broken case is reported as
+  a failure, the categories cover the acceptance matrix and the CLI
+  returns `0`.
+
+**Test delta:** Batch 17.6 had 732 tests; Batch 18 adds 28 -> 760 (3
+skipped, unchanged).
+
+### Z.10.3 Not run / remaining limitations (Batch 18)
+
+- **No live Tavily call — BLOCKED.** `TAVILY_API_KEY` is not set here, so
+  `scripts/validate_research_backend.py` printed `[BLOCKED]` and exited
+  `3`. Live behaviour against real results remains **unverified** here.
+- **No live microphone verification here** (`Microphone error: no
+  device`); the voice-routing cases use injected transcription outcomes.
+- Relevance and contradiction detection remain deterministic token/regex
+  logic, not a semantic model. A page that mentions the subject terms but
+  concerns a different entity can still look relevant; a status word used
+  in an unrelated sense on two pages can still register as an antonym
+  clash; and the contradiction detector covers only the kinds it models
+  (year/count/percent/price/length and a small status-antonym set).
+  Unreliable comparison falls back to the ordinary attributed answer
+  rather than guessing.
+- No commit or push was made.

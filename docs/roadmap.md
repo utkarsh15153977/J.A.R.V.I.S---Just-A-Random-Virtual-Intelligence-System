@@ -727,3 +727,51 @@ Security posture: the new tool is `SAFE` and read-only; it is the only
 tool that touches the network, it is doubly opt-in (`--tools --research`)
 and it accepts no system target, path, command or option. See section Z
 of [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 18 note (intelligence and answer quality)
+
+Batch 18 adds no new tool and no capability the user has to opt into; it
+improves how well Jarvis understands a question and how honestly it
+answers when the evidence is thin, split or contradictory. It also makes
+the behaviour **measurable and repeatable** for the first time.
+
+- **Deterministic evaluation suite.** `tests/fixtures/research_evaluation_cases.py`
+  is plain data plus pure helpers: 14 answer-quality cases and 9
+  voice-routing cases with fixed provider output and fixed transcripts.
+  `tests/test_evaluation.py` runs them in the unit suite and
+  `scripts/run_evaluation.py` runs the same set standalone (exit `0`/`1`).
+  No network, key, microphone or model is touched, so the result is
+  reproducible anywhere. See `docs/research-evaluation.md`.
+- **Question understanding.** The research fallback now also skips a few
+  filler words after a yes/no modal opener, so "are you able to open the
+  file" is treated as a request (`UNSUPPORTED`) while an informational
+  "how to open a bank account" still routes to research.
+- **Grounding.** Relevance is judged from the snippet when one exists
+  (falling back to the title only when there is none), so a page whose
+  title names the subject but whose snippet is about something else is not
+  used as an answer.
+- **Contradictions.** When the on-topic sources give materially different
+  values for the quantity the question asks about (year/count/percent/
+  price/length) or assert opposite statuses (`operational`/`defunct`,
+  `alive`/`dead`, …), Jarvis surfaces the disagreement with attribution
+  and the new `conflict` provenance instead of picking one. Differences in
+  a *secondary* detail are not contradictions; a synthesised answer is
+  bypassed when a real disagreement exists. This is narrow and
+  machine-checkable — not a general fact-verifier — and unreliable
+  comparison falls back to the ordinary attributed answer.
+- **Uncertainty.** The existing response states are preserved and pinned
+  by tests (`unavailable`, `no-sources`, `no-relevant`, `clarify`,
+  `no-distance`, `conflict`), and there are no numeric confidence scores.
+- **Regression coverage.** New tests pin snippet-first grounding, each
+  contradiction path and provenance, the router request/action boundary,
+  transcription-to-routing behaviour (exit, tool, research, action
+  request, punctuation, silence) and the security property that retrieved
+  or injected text grants no authority.
+
+Remaining limits (reported, not hidden): relevance and contradiction
+detection are still deterministic token/regex logic, not semantic
+understanding; a page that mentions the subject terms but concerns a
+different entity can still look relevant, and a status word used in an
+unrelated sense on two pages can still register as an antonym clash. No
+live Tavily call or microphone run was possible in this environment, so
+live behaviour stays **unverified/blocked** here.
