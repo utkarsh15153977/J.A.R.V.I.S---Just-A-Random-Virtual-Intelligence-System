@@ -198,13 +198,17 @@ confirmation. Memory is entirely user-started: Jarvis never saves a
 conversation, transcript or tool output on its own, and a memory is only
 ever a short piece of text you explicitly asked to remember. Memories live
 in a single small JSON file under a per-user application-data directory
-(written atomically, with owner-only permissions where the platform supports
-it); nothing is written when the capability is off, and with `--memory`
-but no `--tools` it reports that it stays disabled. Remembered text is
+(written atomically through a uniquely named temp file and `os.replace`,
+with owner-only permissions where the platform supports it); nothing is
+written when the capability is off, and with `--memory` but no `--tools`
+it reports that it stays disabled. An unusable storage path or a bad
+limit fails closed at startup with `Invalid configuration: …` and exit
+code `2`, before any memory tool is registered. Remembered text is
 treated as data, never as an instruction: it can never approve a
 confirmation, grant a permission or trigger a tool, and it is never used to
 answer a question unless you ask for it. See
-[docs/memory.md](docs/memory.md) for the full design and limits.
+[docs/memory.md](docs/memory.md) for the full design, the limits and the
+manual test procedure.
 
 By default Jarvis listens immediately (manual/always-listening mode).
 With `--wake-word` it waits in `IDLE` until a wake-word engine reports
@@ -388,6 +392,18 @@ Tests cover record validation, the store's atomic write and corruption
 handling, dedup and caps, the confirmation round-trips, and that remembered
 text can never become an instruction — all with injected stores and clamps
 (no file, microphone, model or network). See section Z.12 of
+[docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md).
+
+Batch 19.1 hardens that memory and adds the verification for the full set
+of required scenarios: wrong-typed caps are a `ConfigError` instead of a
+`TypeError`, `data_dir` rejects control characters, the store validates its
+path at construction, the write path uses a uniquely named `mkstemp` temp
+file that survives a failing `os.replace` byte-for-byte, and `app.py` turns
+all of it into `Invalid configuration: …` (exit `2`) before any memory tool
+is registered. New tests cover restart persistence, unsafe paths, corrupt
+store immutability, shutdown, approval binding and injection/routing, plus a
+documented manual procedure in [docs/memory.md](docs/memory.md). The suite
+is now 896 tests (3 skipped). See section Z.13 of
 [docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md).
 
 ## Quality checks

@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from core.executor import ExecutionStatus, ToolExecutor
 from core.memory import (
@@ -81,6 +82,25 @@ class RecordingApprovals:
         return ApprovalResult(self.outcome, "", request.token)
 
 
+class UnboundApprovals:
+    """Approves but never echoes the minted ticket token."""
+
+    def request(self, request):
+        return ApprovalResult(ApprovalOutcome.APPROVED, "", "wrong-token")
+
+
+class BlockingRule:
+    """Risk rule that escalates one named tool to BLOCKED."""
+
+    def __init__(self, tool_name):
+        self._tool_name = tool_name
+
+    def evaluate(self, spec, args):
+        if spec.name == self._tool_name:
+            return PermissionLevel.BLOCKED
+        return None
+
+
 def make_executor(registry, outcome=ApprovalOutcome.APPROVED):
     return ToolExecutor(
         registry, PermissionPolicy(), RecordingApprovals(outcome)
@@ -128,6 +148,25 @@ class TestMemoryRecord(unittest.TestCase):
 
     def test_value_length_is_bounded(self):
         self.assert_invalid(value="x" * 501)
+
+    def test_value_must_be_printable(self):
+        self.assert_invalid(value="line one\nline two")
+
+    def test_category_must_match_the_stored_charset(self):
+        self.assert_invalid(category="General")
+        self.assert_invalid(category="cat!")
+
+    def test_from_dict_rejects_a_non_printable_value(self):
+        with self.assertRaises(MemoryStoreError):
+            MemoryRecord.from_dict(
+                {"id": "a1b2c3d4", "value": "a\nb", "category": "general"}
+            )
+
+    def test_from_dict_rejects_an_invalid_category(self):
+        with self.assertRaises(MemoryStoreError):
+            MemoryRecord.from_dict(
+                {"id": "a1b2c3d4", "value": "x", "category": "Bad!"}
+            )
 
     def test_roundtrip(self):
         record = MemoryRecord("a1b2c3d4", "likes tea", "general", "t", "t")
@@ -220,6 +259,59 @@ class TestJsonMemoryStore(unittest.TestCase):
         )
         with self.assertRaises(MemoryStoreError):
             store.load()
+
+    def test_control_characters_in_the_path_are_rejected(self):
+        with self.assertRaises(MemoryStoreError):
+            JsonMemoryStore("bad\x00dir")
+
+    def test_a_base_dir_that_is_a_file_is_rejected(self):
+        target = Path(self.dir) / "not-a-dir"
+        target.write_text("x", encoding="utf-8")
+        with self.assertRaises(MemoryStoreError):
+            JsonMemoryStore(str(target))
+
+    def test_a_memory_file_that_is_a_directory_is_rejected(self):
+        (Path(self.dir) / "memories.json").mkdir()
+        with self.assertRaises(MemoryStoreError):
+            JsonMemoryStore(self.dir)
+
+    def test_a_missing_directory_is_created_on_demand(self):
+        target = Path(self.dir) / "nested" / "memory"
+        store = JsonMemoryStore(str(target))
+        self.assertFalse(target.exists())
+        store.save([MemoryRecord("a1b2c3d4", "x", "general", "t", "t")])
+        self.assertEqual(JsonMemoryStore(str(target)).load()[0].value, "x")
+
+    def test_failed_replace_leaves_the_original_and_no_temporary(self):
+        store = self._store()
+        first = MemoryRecord("a1b2c3d4", "first", "general", "t", "t")
+        store.save([first])
+        before = store.path.read_text(encoding="utf-8")
+        with mock.patch(
+            "core.memory_store.os.replace", side_effect=OSError("boom")
+        ):
+            with self.assertRaises(MemoryStoreError):
+                store.save(
+                    [MemoryRecord("b1b2c3d4", "second", "general", "t", "t")]
+                )
+        self.assertEqual(store.path.read_text(encoding="utf-8"), before)
+        self.assertEqual(self._store().load(), (first,))
+        self.assertEqual(
+            [name for name in os.listdir(self.dir) if name.endswith(".tmp")],
+            [],
+        )
+
+    def test_a_failing_temporary_file_is_reported_safely(self):
+        store = self._store()
+        with mock.patch(
+            "core.memory_store.tempfile.mkstemp",
+            side_effect=OSError("nope"),
+        ):
+            with self.assertRaises(MemoryStoreError):
+                store.save(
+                    [MemoryRecord("a1b2c3d4", "x", "general", "t", "t")]
+                )
+        self.assertFalse(store.exists())
 
     def test_default_memory_dir_is_a_string(self):
         self.assertIsInstance(default_memory_dir(), str)
@@ -348,6 +440,47 @@ class TestMemoryService(unittest.TestCase):
             service.list()
         with self.assertRaises(MemoryStoreError):
             service.save("x")
+
+    def test_construction_rejects_unusable_limits(self):
+        for kwargs in (
+            {"max_records": 0},
+            {"max_records": 201},
+            {"max_value_chars": 0},
+            {"max_value_chars": 501},
+            {"max_category_chars": 0},
+            {"max_category_chars": 33},
+            {"max_records": "100"},
+            {"max_records": None},
+            {"max_records": 10.5},
+            {"max_records": True},
+        ):
+            with self.subTest(**kwargs):
+                with self.assertRaises(ValueError):
+                    MemoryService(FakeStore(), **kwargs)
+
+    def test_memories_persist_across_reconstruction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = MemoryService(
+                JsonMemoryStore(directory),
+                clock=_clock,
+                id_factory=_ids("00000001"),
+            )
+            record, _ = first.save("my editor is Vim")
+            second = MemoryService(JsonMemoryStore(directory))
+            self.assertEqual(second.find(record.identifier), (record,))
+
+    def test_a_corrupt_store_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonMemoryStore(directory)
+            store.path.write_text("{ broken", encoding="utf-8")
+            service = MemoryService(store)
+            with self.assertRaises(MemoryStoreError):
+                service.save("anything")
+            with self.assertRaises(MemoryStoreError):
+                service.clear()
+            self.assertEqual(
+                store.path.read_text(encoding="utf-8"), "{ broken"
+            )
 
     def test_construction_creates_no_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -478,6 +611,119 @@ class TestMemoryTools(unittest.TestCase):
         result = executor.execute(TOOL_MEMORY_LIST)
         self.assertIs(result.status, ExecutionStatus.OK)
         self.assertIn("damaged", result.value["text"])
+
+    def test_duplicate_save_reports_the_existing_memory(self):
+        self._setup()
+        executor = make_executor(self.registry)
+        executor.execute(TOOL_MEMORY_SAVE, {"value": "likes tea"})
+        result = executor.execute(TOOL_MEMORY_SAVE, {"value": "Likes Tea"})
+        self.assertIs(result.status, ExecutionStatus.OK)
+        self.assertFalse(result.value["saved"])
+        self.assertEqual(len(self.service.list()), 1)
+
+    def test_oversized_save_is_invalid(self):
+        self._setup()
+        executor = make_executor(self.registry)
+        result = executor.execute(TOOL_MEMORY_SAVE, {"value": "x" * 501})
+        self.assertIs(result.status, ExecutionStatus.INVALID)
+        self.assertEqual(self.service.list(), ())
+
+    def test_malformed_selector_is_invalid(self):
+        self._setup()
+        executor = make_executor(self.registry)
+        self.assertIs(
+            executor.execute(TOOL_MEMORY_GET, {"selector": 5}).status,
+            ExecutionStatus.INVALID,
+        )
+        self.assertIs(
+            executor.execute(
+                TOOL_MEMORY_DELETE, {"selector": "x" * 501}
+            ).status,
+            ExecutionStatus.INVALID,
+        )
+
+    def test_list_reports_only_ids_and_values(self):
+        record = MemoryRecord(
+            "00000001",
+            "likes tea",
+            "secretcat",
+            "2020-01-01T00:00:00+00:00",
+            "2020-01-01T00:00:00+00:00",
+        )
+        self.store = FakeStore([record])
+        service = MemoryService(self.store, clock=_clock)
+        executor = make_executor(make_registry(service))
+        result = executor.execute(TOOL_MEMORY_LIST)
+        text = result.value["text"]
+        self.assertIn("00000001: likes tea", text)
+        self.assertNotIn("secretcat", text)
+        self.assertNotIn("2020-01-01", text)
+        self.assertNotIn("memories.json", text)
+
+    def test_ambiguous_get_and_delete_ask_for_an_id(self):
+        self.store = FakeStore(
+            [
+                MemoryRecord("00000001", "likes tea", "general", "t", "t"),
+                MemoryRecord("00000002", "likes tea", "general", "t", "t"),
+            ]
+        )
+        service = MemoryService(self.store, clock=_clock)
+        executor = make_executor(make_registry(service))
+        get_result = executor.execute(
+            TOOL_MEMORY_GET, {"selector": "likes tea"}
+        )
+        self.assertIn("memory id", get_result.value["text"])
+        delete_result = executor.execute(
+            TOOL_MEMORY_DELETE, {"selector": "likes tea"}
+        )
+        self.assertIn("nothing was deleted", delete_result.value["text"])
+        self.assertEqual(len(service.list()), 2)
+
+    def test_save_is_blocked_by_policy_without_a_write(self):
+        self._setup()
+        executor = ToolExecutor(
+            self.registry,
+            PermissionPolicy([BlockingRule(TOOL_MEMORY_SAVE)]),
+            RecordingApprovals(),
+        )
+        result = executor.execute(TOOL_MEMORY_SAVE, {"value": "x"})
+        self.assertIs(result.status, ExecutionStatus.BLOCKED)
+        self.assertEqual(self.service.list(), ())
+        self.assertEqual(self.store.saves, 0)
+
+    def test_delete_denied_when_the_approval_is_not_bound(self):
+        self._setup()
+        record, _ = self.service.save("likes tea")
+        executor = ToolExecutor(
+            self.registry, PermissionPolicy(), UnboundApprovals()
+        )
+        result = executor.execute(
+            TOOL_MEMORY_DELETE, {"selector": record.identifier}
+        )
+        self.assertIs(result.status, ExecutionStatus.DENIED)
+        self.assertEqual(len(self.service.list()), 1)
+
+    def test_shutdown_denies_memory_operations(self):
+        self._setup()
+        record, _ = self.service.save("likes tea")
+        executor = make_executor(self.registry)
+        executor.close()
+        self.assertIs(
+            executor.execute(TOOL_MEMORY_SAVE, {"value": "x"}).status,
+            ExecutionStatus.DENIED,
+        )
+        self.assertIs(
+            executor.execute(
+                TOOL_MEMORY_DELETE, {"selector": record.identifier}
+            ).status,
+            ExecutionStatus.DENIED,
+        )
+        self.assertIs(
+            executor.execute(TOOL_MEMORY_CLEAR).status,
+            ExecutionStatus.DENIED,
+        )
+        self.assertEqual(len(self.service.list()), 1)
+        self.assertEqual(self.store.saves, 1)
 
     def test_operation_map_matches_tool_names(self):
         self.assertEqual(

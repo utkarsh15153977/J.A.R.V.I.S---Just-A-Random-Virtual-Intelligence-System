@@ -53,8 +53,9 @@ MEMORY_OPERATIONS: Mapping[str, str] = {
 
 DEFAULT_CATEGORY = "general"
 
-# Absolute upper bounds. ``MemoryConfig`` cannot raise a limit above these;
-# they exist so a corrupt or hostile store cannot produce unbounded records.
+# Absolute upper bounds. Neither ``MemoryConfig`` nor ``MemoryService``
+# can raise a per-store limit above these; they exist so a corrupt or
+# hostile store cannot produce unbounded records.
 MAX_VALUE_CHARS = 500
 MAX_CATEGORY_CHARS = 32
 MAX_RECORDS = 200
@@ -160,10 +161,22 @@ class MemoryRecord:
             raise MemoryValidationError("memory value must not be empty")
         if len(self.value) > MAX_VALUE_CHARS:
             raise MemoryValidationError("memory value is too long")
+        if not self.value.isprintable():
+            # Values from the service are always cleaned (whitespace
+            # collapsed, control characters dropped); a stored value
+            # with a newline or other non-printable content can only
+            # come from a hand-edited or damaged file, so it is refused
+            # rather than accepted and later echoed.
+            raise MemoryValidationError("memory value must be printable text")
         if not isinstance(self.category, str) or not self.category.strip():
             raise MemoryValidationError("memory category must not be empty")
         if len(self.category) > MAX_CATEGORY_CHARS:
             raise MemoryValidationError("memory category is too long")
+        if not _CATEGORY_RE.fullmatch(self.category):
+            # Categories are normalised to the same character set the
+            # service accepts, so a stored value cannot smuggle in
+            # punctuation or control characters.
+            raise MemoryValidationError("memory category is invalid")
         if not isinstance(self.created_at, str) or not isinstance(
             self.updated_at, str
         ):
@@ -217,6 +230,22 @@ def _default_identifier() -> str:
     return secrets.token_hex(4)
 
 
+def _bounded_limit(name: str, value: Any, ceiling: int) -> int:
+    """Return a valid per-service limit, or raise ``ValueError``.
+
+    A limit must be a real integer in ``1..ceiling``; a wrong type
+    (including ``bool``) or an out-of-range value is refused rather than
+    silently coerced or clamped, so a misconfiguration can never raise
+    the store above the module's absolute caps. It fails before any data
+    is read or written.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer between 1 and {ceiling}")
+    if not 1 <= value <= ceiling:
+        raise ValueError(f"{name} must be between 1 and {ceiling}")
+    return value
+
+
 def _iso(moment: datetime) -> str:
     return moment.replace(microsecond=0).isoformat()
 
@@ -241,9 +270,15 @@ class MemoryService:
         clock: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self._store = store
-        self._max_records = max(1, int(max_records))
-        self._max_value_chars = max(1, int(max_value_chars))
-        self._max_category_chars = max(1, int(max_category_chars))
+        self._max_records = _bounded_limit(
+            "max_records", max_records, MAX_RECORDS
+        )
+        self._max_value_chars = _bounded_limit(
+            "max_value_chars", max_value_chars, MAX_VALUE_CHARS
+        )
+        self._max_category_chars = _bounded_limit(
+            "max_category_chars", max_category_chars, MAX_CATEGORY_CHARS
+        )
         self._new_id = id_factory if id_factory is not None else (
             _default_identifier
         )

@@ -176,6 +176,23 @@ class TestMemoryConfig(unittest.TestCase):
         self.assert_invalid(max_value_chars=501)
         self.assert_invalid(max_category_chars=33)
 
+    def test_non_integer_caps_raise_config_error_not_type_error(self):
+        for name in ("max_records", "max_value_chars", "max_category_chars"):
+            for value in ("100", None, 10.5, True):
+                with self.subTest(name=name, value=value):
+                    self.assert_invalid(**{name: value})
+
+    def test_control_characters_in_data_dir_rejected(self):
+        for value in ("bad\x00dir", "a\nb", "a\tb", "a\x7fb"):
+            with self.subTest(value=value):
+                self.assert_invalid(data_dir=value)
+
+    def test_whitespace_only_data_dir_rejected(self):
+        self.assert_invalid(data_dir="   ")
+
+    def test_empty_data_dir_stays_valid(self):
+        self.assertIs(MemoryConfig(data_dir="").validate().data_dir, "")
+
 
 class TestSpeakerVerificationConfig(unittest.TestCase):
     def test_defaults_are_valid(self):

@@ -114,6 +114,7 @@ from core.memory import (
     MEMORY_OPERATIONS,
     MemoryService,
     MemoryStore,
+    MemoryStoreError,
     register_memory_tools,
 )
 from core.memory_store import JsonMemoryStore, default_memory_dir
@@ -1096,17 +1097,25 @@ def main(
         if memory_service is not None:
             active_memory_service = memory_service
         else:
-            store = memory_store
-            if store is None:
-                store = JsonMemoryStore(
-                    active_memory.data_dir or default_memory_dir()
+            try:
+                store = memory_store
+                if store is None:
+                    store = JsonMemoryStore(
+                        active_memory.data_dir or default_memory_dir()
+                    )
+                active_memory_service = MemoryService(
+                    store,
+                    max_records=active_memory.max_records,
+                    max_value_chars=active_memory.max_value_chars,
+                    max_category_chars=active_memory.max_category_chars,
                 )
-            active_memory_service = MemoryService(
-                store,
-                max_records=active_memory.max_records,
-                max_value_chars=active_memory.max_value_chars,
-                max_category_chars=active_memory.max_category_chars,
-            )
+            except (MemoryStoreError, ValueError, OSError) as exc:
+                # An unusable storage path or limit fails closed here
+                # instead of surfacing as a traceback or a half-built
+                # capability. No file or directory is created by this
+                # failure and no memory tool is registered.
+                output(f"Invalid configuration: {exc}")
+                return EXIT_CONFIG_ERROR
 
     registry = _build_registry(
         active_tools,

@@ -5,6 +5,7 @@ numbers and tests can inject their own configuration.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 
 class ConfigError(ValueError):
@@ -383,25 +384,80 @@ class MemoryConfig:
     max_category_chars: int = 32
 
     def validate(self) -> "MemoryConfig":
-        """Check every value and return self, or raise ConfigError."""
+        """Check every value and return self, or raise ConfigError.
+
+        Every check fails with :class:`ConfigError` — never with a raw
+        ``TypeError`` — so a wrong-typed value from code (a string, a
+        ``None``, a ``bool`` or a float standing in for a count) is a
+        clean configuration error at startup instead of a traceback.
+        ``data_dir`` is also rejected early when it contains control
+        characters (including an embedded NUL, which would otherwise
+        only fail deep inside a filesystem call) or is whitespace-only.
+        A path that does not exist yet stays valid: the directory is
+        created on demand, and the store refuses a path that exists as
+        something other than a directory when it is constructed.
+        """
         problems = []
 
         if not isinstance(self.enabled, bool):
             problems.append("enabled must be a boolean")
         if not isinstance(self.data_dir, str):
             problems.append("data_dir must be a string")
-        if not 1 <= self.max_records <= 200:
-            problems.append("max_records must be between 1 and 200")
-        if not 1 <= self.max_value_chars <= 500:
-            problems.append("max_value_chars must be between 1 and 500")
-        if not 1 <= self.max_category_chars <= 32:
-            problems.append("max_category_chars must be between 1 and 32")
+        else:
+            problems.extend(_validate_storage_dir_string(self.data_dir))
+        problems.extend(
+            _validate_bound(
+                "max_records", self.max_records, 1, 200
+            )
+        )
+        problems.extend(
+            _validate_bound(
+                "max_value_chars", self.max_value_chars, 1, 500
+            )
+        )
+        problems.extend(
+            _validate_bound(
+                "max_category_chars", self.max_category_chars, 1, 32
+            )
+        )
 
         if problems:
             raise ConfigError("; ".join(problems))
 
         return self
 
+
+def _validate_bound(name: str, value: Any, low: int, high: int) -> list[str]:
+    """Return one problem string for an out-of-range or wrong-typed cap."""
+    # bool is an int subclass, but True/False are never meaningful sizes.
+    if isinstance(value, bool) or not isinstance(value, int):
+        return [f"{name} must be an integer between {low} and {high}"]
+    if not low <= value <= high:
+        return [f"{name} must be between {low} and {high}"]
+    return []
+
+
+def _validate_storage_dir_string(data_dir: str) -> list[str]:
+    """Return problems for an unusable storage-directory string.
+
+    Only string shape is checked here (no filesystem access): control
+    characters such as an embedded NUL or a newline make a path
+    meaningless or dangerous to pass on, and a whitespace-only value
+    would silently resolve to an unintended directory name. Whether an
+    existing path *is* a directory is checked by the store when it is
+    constructed, so configuration validation stays free of I/O.
+    """
+    if data_dir and not data_dir.strip():
+        # "" is valid: it selects the per-user default directory.
+        return ["data_dir must not be whitespace-only"]
+    if any(_is_control(character) for character in data_dir):
+        return ["data_dir must not contain control characters"]
+    return []
+
+
+def _is_control(character: str) -> bool:
+    code = ord(character)
+    return code < 32 or code == 127
 
 @dataclass(frozen=True)
 class SpeechConfig:

@@ -858,3 +858,75 @@ not store secrets. There is no edit or search command and no age/size
 eviction, and recognition of the save phrase depends on the same speech
 transcription as every other command. Live microphone and live provider
 checks remain unverified in this environment.
+
+## Batch 19.1 note (memory hardening and verification)
+
+Batch 19.1 hardens the Batch 19 memory without changing its behaviour or
+its security architecture: still off by default, still doubly opt-in
+(`--tools` **and** `--memory`), still only reachable through the single
+`ToolExecutor`, still no auto-save, still `CONFIRM` for delete/clear, and
+still no claim of encryption. Four latent fail-open/rough-edge findings
+were fixed and the required 14 scenarios are now covered by tests plus a
+documented manual procedure.
+
+Findings fixed:
+
+- **Wrong-typed caps escaped as `TypeError`.**
+  `MemoryConfig.validate()` now rejects values that are not plain
+  integers — a string, `None`, a float or a bool is a `ConfigError`
+  handled by `app.py`, never a traceback. It also rejects `data_dir`
+  values containing control characters (NUL, newline, tab, DEL) and
+  whitespace-only strings, while `""` (the default) stays valid.
+- **Unusable storage paths failed mid-flight.** `JsonMemoryStore`
+  validates its path at construction: a path with control characters, a
+  base directory that exists but is not a directory, or a `memories.json`
+  that exists but is not a regular file, all raise `MemoryStoreError`
+  before anything is read or written. `MemoryService` re-applies the same
+  bounds to its own limits (`ValueError` at construction).
+- **Predictable, crash-prone temp file.** The write path now uses a
+  uniquely named `mkstemp` file (`memories.json.*.tmp`), flushes and
+  `fsync`s it, applies owner-only permissions, and moves it into place
+  with `os.replace`. Every failure — including a failing `os.replace` —
+  removes the temp file, leaves the original byte-for-byte untouched and
+  raises `MemoryStoreError`.
+- **Composition root now fails safe.** `app.py` wraps store/service
+  construction in `except (MemoryStoreError, ValueError, OSError)` and
+  reports `Invalid configuration: …` with exit code `2` before any memory
+  tool is registered: no traceback, no file created, no half-built
+  capability.
+
+Verification: **896 tests OK (3 skipped)**, `ruff check` clean,
+`compileall` clean (+32 tests over Batch 19's 864: `tests/test_memory.py`
+69, `TestMemoryConfig` in `tests/test_config.py` 50,
+`TestMemoryIntegration` in `tests/test_app.py` 17 — unsafe paths, corrupt
+store immutability, restart persistence, `os.replace` failure, shutdown and
+approval binding, injection/recall/routing, fail-safe configuration).
+A step-by-step manual procedure is documented in
+[docs/memory.md](memory.md#manual-test-procedure).
+
+## Recommended next batches
+
+Ordered by user value against risk; each keeps the Batch 9 permission
+model, the Batch 16 phrase-set routing and the Batch 19 fail-closed
+composition-root style.
+
+- **Batch 20 — media playback (`play`/`pause`/`next`/`volume`).**
+  Read-only-ish state transitions over a single local audio device,
+  allowlisted media sources only, `CONFIRM` for anything that opens or
+  downloads content, no shell, no arbitrary URL. Volume and pause are
+  natural first `SAFE` actions.
+- **Batch 21 — wake-word / voice activation reliability.**
+  No new capability, a hardening pass: activation lifecycle regressions,
+  false-trigger and missed-trigger behaviour, and explicit states for
+  "microphone lost" / "model not loaded", following the Batch 14 and 15
+  audit style. Low risk, high daily value.
+- **Batch 22 — daily briefing.** A single, opt-in, read-only rollup of
+  local time, weather (reusing the research path) and the memory listing,
+  assembled from registered tools only, read aloud through the normal
+  reply path, and only when the user asks for it — never on a timer and
+  never with memory contents shown beyond the existing list bounds.
+- **Batch 23 — desktop assistance (search, open, typed input).** The
+  highest-risk batch: Playwright/DOM first, GUI automation only where
+  unavoidable, every action behind the existing permission layer with an
+  explicit allowlist, and `CONFIRM` for anything that types, clicks or
+  writes. Ship last and audit it like Batch 11 did.

@@ -2450,3 +2450,111 @@ skipped, unchanged).
 - Matching is a fixed whole-word phrase set; there is no fuzzy or semantic
   matching, so a mis-heard phrase is not corrected.
 - No commit or push was made.
+
+## Z.13 Batch 19.1 addendum - memory hardening and scenario coverage
+
+Batch 19.1 hardens the Batch 19 memory and closes the gaps in its
+verification. The security architecture is unchanged: memory is still off
+by default and doubly opt-in (`--tools` **and** `--memory`), every memory
+operation still goes through the single `ToolExecutor`, delete/clear are
+still `CONFIRM`, stored content is still data and never an instruction,
+there is still no auto-save, and **no encryption is claimed anywhere**.
+
+### Z.13.1 Findings and fixes
+
+| Id | Finding | Fix |
+| --- | --- | --- |
+| F-1 | `MemoryConfig.validate()` raised a raw `TypeError` (which `app.main` does not catch) for wrong-typed caps such as `max_records="100"` or `max_value_chars=None`, and silently accepted `bool` (`True`) and `float` (`10.5`) caps. | `MemoryConfig.validate()` now type-checks every numeric bound: non-`int`, `bool`, `None`, out-of-range and non-finite values are a `ConfigError`, reported as `Invalid configuration: …` with exit `2`. |
+| F-2 | `MemoryConfig.data_dir` accepted NUL/newline/tab/whitespace-only values; a NUL reached `JsonMemoryStore.save()` as `ValueError: mkdir: embedded null character in path`, escaping the `MemoryStoreError` contract. | `data_dir` is rejected at validation when it contains control characters or is whitespace-only (`""` stays valid). `JsonMemoryStore` additionally validates its path at construction (control characters; base dir that exists but is not a directory; `memories.json` that exists but is not a regular file) and every write wraps `(OSError, ValueError)` in `MemoryStoreError`. |
+| F-3 | The write used a fixed, predictable temp name (`memories.json.tmp`), so two concurrent writers (or a leftover file) could collide and a crash could strand it. | The write now uses `tempfile.mkstemp(prefix="memories.json.", suffix=".tmp", dir=…)`: unique per write, descriptor always closed, `flush` + `os.fsync`, owner-only mode via `_restrict`, then `os.replace`. Every failure path unlinks the temp file and raises `MemoryStoreError`. |
+| F-4 | `MemoryService(max_records=None)` / `"100"` raised `TypeError` (uncaught) and `int()` silently coerced strings; `MemoryRecord` accepted non-printable values and categories outside the stored charset. | `MemoryService` bounds its three limits through `_bounded_limit` (`ValueError`, never coercion); `MemoryRecord.__post_init__` rejects non-printable values and categories that fail `_CATEGORY_RE.fullmatch`; `from_dict` wraps both in `MemoryStoreError`. |
+| F-5 | `app.py` composed store/service without a guard, so any of the above became a traceback instead of a configuration error. | Store/service construction is wrapped in `except (MemoryStoreError, ValueError, OSError)`: `Invalid configuration: …`, `EXIT_CONFIG_ERROR` (exit `2`), before any memory tool is registered and before the listening loop starts. |
+
+No behaviour change for correct configurations: the same records, tools,
+phrases, permission levels and confirmation flow as Batch 19.
+
+### Z.13.2 Changes
+
+- **`config.py`.** `MemoryConfig.validate()` gained `_validate_bound`
+  (type- and range-safe numeric checks) and
+  `_validate_storage_dir_string` (control characters and whitespace-only
+  rejected, `""` valid); docstrings updated.
+- **`core/memory_store.py`.** New `_validate_path`,
+  `_has_control_characters`, `_create_temporary`, `_write_and_sync`,
+  `_restrict` and `_safe_unlink`; `load()` also wraps `ValueError`;
+  `save()` now performs the unique-temp + `fsync` + `os.replace` sequence
+  described in F-3.
+- **`core/memory.py`.** New `_bounded_limit` used for all three service
+  limits; `MemoryRecord.__post_init__` rejects non-printable values and
+  invalid category charset.
+- **`app.py`.** `MemoryStoreError` imported; store/service construction
+  fails safe (F-5).
+- **Tests.** +32 (see Z.13.4).
+- **Docs.** `docs/memory.md` (validation, storage-path checks, fail-safe
+  behaviour, a step-by-step **manual test procedure**), `docs/safety.md`
+  (new fail-safe bullet, updated testing paragraph), `docs/roadmap.md`
+  (Batch 19.1 note and four recommended next batches: media playback,
+  voice-activation reliability, daily briefing, desktop assistance),
+  `README.md` (memory paragraph + Batch 19.1 test note) and this addendum.
+
+### Z.13.3 The 14 required scenarios and where they are tested
+
+| # | Scenario | Test(s) |
+| --- | --- | --- |
+| 1 | Save a memory only from an explicit user phrase | `test_app.TestMemoryIntegration.test_save_list_and_retrieve_end_to_end`, `test_general_statements_are_not_saved`, `test_save_reply_does_not_echo_the_value` |
+| 2 | List memories without exposing paths, categories or timestamps | `test_memory.TestMemoryTools.test_list_reports_only_ids_and_values` |
+| 3 | Retrieve the correct memory by id or supported lookup | `test_memory.TestMemoryService.test_find_by_id`, `test_find_by_value_is_case_insensitive`, `test_ambiguous_get_and_delete_ask_for_an_id` |
+| 4 | Memories survive a restart | `test_memory.TestMemoryService.test_memories_persist_across_reconstruction`, `test_app.TestMemoryIntegration.test_memories_persist_across_restart` |
+| 5 | Saving a duplicate is a no-op that reports the existing id | `test_memory.TestMemoryTools.test_duplicate_save_reports_the_existing_memory`, `test_memory.TestMemoryService.test_duplicate_save_is_a_noop` |
+| 6 | An ambiguous get/delete deletes nothing and asks for an id | `test_memory.TestMemoryTools.test_ambiguous_get_and_delete_ask_for_an_id`, `test_memory.TestMemoryService.test_delete_is_ambiguous_safe` |
+| 7 | A corrupt store is reported on read and never overwritten | `test_memory.TestMemoryTools.test_corrupt_store_is_reported_as_text`, `test_memory.TestJsonMemoryStore.test_corrupt_json_is_reported_and_not_overwritten`, `test_app.TestMemoryIntegration.test_corrupt_store_is_reported_and_left_untouched` |
+| 8 | Save/clear against a corrupt store fail without writing | `test_memory.TestMemoryService.test_a_corrupt_store_is_never_overwritten` |
+| 9 | Unsafe storage paths are rejected (control chars, file-as-dir) | `test_memory.TestJsonMemoryStore.test_control_characters_in_the_path_are_rejected`, `test_a_base_dir_that_is_a_file_is_rejected`, `test_a_memory_file_that_is_a_directory_is_rejected`, `test_config.TestMemoryConfig.test_control_characters_in_data_dir_rejected`, `test_app.TestMemoryIntegration.test_unusable_storage_path_fails_configuration` |
+| 10 | Badly typed or out-of-range limits fail safe, never as `TypeError` | `test_config.TestMemoryConfig.test_non_integer_caps_raise_config_error_not_type_error`, `test_memory.TestMemoryService.test_construction_rejects_unusable_limits` |
+| 11 | Remembered text and other tool output are data, never re-routed as commands | `test_app.TestMemoryIntegration.test_recalled_instruction_is_data_not_an_action`, `test_tool_output_is_never_re_routed`, `test_research_answer_with_memory_phrases_changes_nothing` |
+| 12 | No permission or confirmation bypass (BLOCKED, unbound token, denied approval) | `test_memory.TestMemoryTools.test_save_is_blocked_by_policy_without_a_write`, `test_delete_denied_when_the_approval_is_not_bound`, `test_delete_is_denied_without_approval`, `test_clear_is_denied_without_approval` |
+| 13 | After shutdown every memory operation is denied | `test_memory.TestMemoryTools.test_shutdown_denies_memory_operations` |
+| 14 | Writes are atomic: a failing `os.replace` or temp write leaves the original intact and no temp file behind | `test_memory.TestJsonMemoryStore.test_failed_replace_leaves_the_original_and_no_temporary`, `test_a_failing_temporary_file_is_reported_safely` |
+
+Also covered: unusable limits never register a tool
+(`test_app.TestMemoryIntegration.test_memory_tools_are_not_registered_without_tools`),
+duplicate/oversized/malformed inputs are `INVALID`
+(`test_oversized_save_is_invalid`, `test_malformed_selector_is_invalid`),
+and non-printable or wrongly categorized records are refused at both ends
+(`test_value_must_be_printable`, `test_category_must_match_the_stored_charset`,
+`test_from_dict_rejects_a_non_printable_value`,
+`test_from_dict_rejects_an_invalid_category`).
+
+### Z.13.4 Batch 19.1 verification (actually run)
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Full suite | `python -m unittest discover -s tests` | **PASS** - 896 tests, OK (skipped=3) |
+| Compile | `python -m compileall -q app.py core voice config.py scripts tests` | **PASS** - exit 0 |
+| Lint | `ruff check .` | **PASS** - All checks passed |
+| Dependencies | `python -m pip check` | **PASS** - No broken requirements found |
+| Entry point | `python app.py --help` | **PASS** - usage printed, exit 0 |
+| Whitespace | `git diff --check` | **PASS** - exit 0 (LF->CRLF notices only) |
+| Evaluation runner | `python scripts/run_evaluation.py` | **PASS** - 34/34 cases (research=19, routing=15), exit 0 |
+| Memory tests | `python -m unittest tests.test_memory` | **PASS** - 69 tests, OK |
+| Config tests | `python -m unittest tests.test_config` | **PASS** - 50 tests, OK |
+| App memory tests | `python -m unittest tests.test_app.TestMemoryIntegration` | **PASS** - 17 tests, OK |
+| Router memory tests | `python -m unittest tests.test_router.TestMemoryRouting` | **PASS** - 17 tests, OK (unchanged) |
+| Real store untouched | `Test-Path $env:LOCALAPPDATA\Jarvis\memories.json` after the full suite | **PASS** - `False` (no file created) |
+
+**Test delta:** Batch 19 had 864 tests; Batch 19.1 adds 32 -> 896 (3
+skipped, unchanged): `tests/test_memory.py` 48 -> 69 (+21),
+`TestMemoryConfig` in `tests/test_config.py` 46 -> 50 (+4),
+`TestMemoryIntegration` in `tests/test_app.py` 10 -> 17 (+7).
+
+### Z.13.5 Not run / remaining limitations (Batch 19.1)
+
+- **No live microphone verification here** (`Microphone error: no
+  device`); the manual procedure in `docs/memory.md` is the checklist for
+  a real install and is not executed in this environment.
+- **No live Tavily call - BLOCKED** (`TAVILY_API_KEY` unset); the
+  research-injection cases use an injected result.
+- The store is still **plain text and not encrypted**, and owner-only
+  permissions are still best-effort (`os.chmod`, not an NTFS ACL on
+  Windows).
+- No commit or push was made.

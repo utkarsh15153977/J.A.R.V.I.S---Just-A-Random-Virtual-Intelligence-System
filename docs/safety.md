@@ -614,6 +614,17 @@ Properties:
   (and nothing is created until the first save). A file that is unreadable,
   malformed or fails validation raises `MemoryStoreError`; the tool reports
   it as text and **never** silently overwrites or discards existing data.
+- **Fail-safe on an unusable storage path or limit.** `JsonMemoryStore`
+  validates its path when it is constructed (control characters rejected, a
+  base directory that exists but is not a directory rejected, a
+  `memories.json` that exists but is not a regular file rejected) and every
+  write uses a uniquely named `mkstemp` temp file that is `fsync`ed, made
+  owner-only and moved into place with `os.replace`. `MemoryConfig.validate`
+  rejects out-of-range or wrongly typed caps with `ConfigError` and
+  `MemoryService` rejects them with `ValueError`, so a bad limit can never
+  reach a half-built service. `app.py` catches all of this and reports
+  `Invalid configuration: …` with exit code `2` before any memory tool is
+  registered: no traceback, no file created, no partial capability.
 - **No fuzzy or semantic matching.** List, get, delete and clear run on a
   fixed, enumerated set of whole-word phrases; there is no prefix, regex,
   embedding or LLM selector, so a mis-heard phrase cannot widen a match.
@@ -625,12 +636,15 @@ Properties:
   id and outcome, never the value), and transcript logging stays off unless
   separately opted in.
 
-**Testing.** `tests/test_memory.py`, `tests/test_router.py` and
-`tests/test_app.py` exercise record validation, the store's atomic write
-and corruption handling, dedup and caps, listing/get by id, the
-confirmation round-trips for delete and clear, and the invariant that a
-remembered value cannot become an instruction — all with injected stores
-and clocks (no file, microphone, model or network).
+**Testing.** `tests/test_memory.py`, `tests/test_router.py`,
+`tests/test_app.py` and `tests/test_config.py` exercise record validation,
+the store's atomic write and corruption handling (including an unsafe path
+and a failing `os.replace`), dedup and caps, restart persistence,
+listing/get by id, the confirmation round-trips for delete and clear,
+shutdown and approval binding, and the invariant that a remembered value
+or a research answer cannot become an instruction — all with injected
+stores and clocks (no file, microphone, model or network). A step-by-step
+manual procedure is in `docs/memory.md`.
 
 ## Speech output
 
