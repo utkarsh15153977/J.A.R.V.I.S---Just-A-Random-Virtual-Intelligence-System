@@ -292,6 +292,17 @@ SpeechBrain adapter avoids the Windows symlink fetch path; and tests
 cover every refusal path, including that no model or microphone listener
 is initialised when a gate fails.
 
+Batch 14 audits the end-to-end activation lifecycle and hardens resource
+ownership without adding features. The wake-word session is released even
+when a detector fails during `start()`; an activation whose audio session
+has ended stops cleanly instead of spinning; a verifier that cannot be
+constructed releases its already-loaded embedding model; and cleanup
+failures name the resource type (never its data). A dedicated
+`tests/test_lifecycle.py` exercises successful, rejected, failed,
+partially-initialised, interrupted and repeated activations entirely
+through injected fakes — no microphone, speaker, model file, network or
+external process. See section T of [docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md).
+
 ## Quality checks
 
 Linting is configured with [Ruff](https://docs.astral.sh/ruff/) in
@@ -399,6 +410,47 @@ Expected tool replies with `--tools`: time ("It's 3:45 PM."), date
 ("Today is Thursday, October 15, 2026."), system status ("System status:
 Windows, Python 3.x.x."), disk space ("Disk space: N GB free of M GB.")
 and battery status ("Battery is at N% (…).").
+
+### Batch 14 lifecycle checks
+
+These exercise activation lifecycle and resource release. Items 10–13
+need a microphone; item 14 needs a legitimate enrolled voice profile.
+None were executed automatically — they must be run by hand. Where a
+prerequisite is missing, record the outcome as **unverified/blocked**,
+not passing.
+
+10. Repeated wake sessions release the microphone (hardware): with the
+    wake-word engine available (see item 7 — otherwise **blocked**), say
+    the wake phrase plus a command twice; confirm the microphone is
+    released between sessions and re-armed without a restart. If the
+    engine reports its session ended, the process stops cleanly instead
+    of spinning.
+11. Shutdown during partial startup (software): run
+    `app.py --wake-word` and press Ctrl+C before speaking; the process
+    must exit cleanly with no traceback and the microphone available
+    afterwards.
+12. Failed activation holds no microphone (hardware): with the wake-word
+    engine available, trigger an activation and immediately Ctrl+C;
+    re-run and confirm the microphone is available and the console shows
+    a clean shutdown.
+13. Speaker verification rejected does not run a tool (hardware +
+    profile): with an enrolled voice, run
+    `app.py --wake-word --verify-speaker` and speak a command in a
+    different voice; expect "did not match", no tool executed, and the
+    microphone released for the next attempt. Without a legitimate
+    profile, mark **unverified** (do not run `--enroll-speaker` just for
+    this).
+14. Speaker verification accepted (hardware + profile): with the enrolled
+    voice, run the same command and confirm it executes. Real human
+    speaker verification was **not** performed during Batch 14 — mark
+    **unverified** unless you run it with an existing legitimate profile.
+15. Cleanup errors stay diagnosable (software): if a resource fails to
+    release, the log names the resource type (e.g. "Error while
+    releasing OpenWakeWordDetector.") and the original error is still
+    shown.
+16. Speech failure keeps state consistent (software + speaker): with
+    `pyttsx3` unavailable the reply is printed only and the loop
+    continues; on "exit" the process shuts down cleanly.
 
 ## Project structure
 

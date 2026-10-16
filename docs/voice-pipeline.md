@@ -174,6 +174,10 @@ speaker matching, **not** liveness or anti-spoofing.
 | Verification enabled but model unavailable/incompatible | reported; **refuses to start**, exit code 1 (model closed again) |
 | Verification mismatch / unusable audio | activation refused (stays `IDLE`); never bypassed |
 | Verification error during activation | `SpeakerVerificationError` reported, clean runtime-error exit (code 1) |
+| Wake detector `start()` fails after opening the stream | stream released by the `finally`; error reported, no microphone left held (Batch 14) |
+| Wake detector reports its session ended (`session_open is False`) | activation stops with `WakeWordUnavailableError` instead of busy-looping (Batch 14) |
+| Unexpected non-domain detector error | every resource released, state machine reaches terminal `STOPPED`, error propagates (Batch 14) |
+| Verifier construction fails after the model loaded | model closed, refuses to start (Batch 14) |
 | Stored enrolment missing | "not enrolled": refuses to start if verification is required, otherwise manual mode is unaffected |
 | Stored enrolment corrupt / model mismatch | `EnrollmentError`; treated as not enrolled (refuse when verification is required) |
 | Enrolment sample too short / silent | rejected and re-prompted; never stored |
@@ -200,6 +204,34 @@ machine (start/silence/reset/finish), capture acceptance gates, config
 validation, transcript joining, the manual-test shutdown paths, the
 activation-mode refusals, and speaker verification / enrolment against
 fake embedding backends (no microphone, no model files, no network).
+
+`tests/test_lifecycle.py` (Batch 14) adds the full activation lifecycle
+with injected fakes: wake-session release on `start()` failure, the
+closed-session guard, cleanup after an unexpected detector error, release
+before every transcription, partial-initialisation cleanup, verifier
+construction cleanup, rejection blocking the executor, audio/speech
+failure recovery, idempotent close, and admin commands building no heavy
+components — still with no hardware, model file, network or subprocess.
+
+### Activation lifecycle (Batch 14)
+
+One activation is `start → detect → release → listen → stop`:
+
+1. `app.py` resolves exactly one mode (`MANUAL`/`WAKE`/`WAKE_VERIFIED`)
+   at startup and refuses to start if a requested gate is unavailable.
+2. `_activate` opens the detector session **inside** a `try/finally`, so
+   the session is released on detection failure, an engine error, a
+   closed session and Ctrl+C alike.
+3. The session is released **before** the listener captures the command,
+   so only one input stream is ever open and the microphone is free
+   during processing and speech.
+4. A rejected or failed activation returns to `IDLE` without running any
+   tool; only a successful activation moves to `LISTENING`.
+5. On shutdown every owned resource (detector, verifier, listener,
+   speaker, executor) is closed once; repeated `close()` is safe.
+
+The `--speaker-status` and `--reset-speaker` admin commands never build a
+listener, speaker or embedding model.
 
 Real embedding backend (manual, needs the optional package installed):
 

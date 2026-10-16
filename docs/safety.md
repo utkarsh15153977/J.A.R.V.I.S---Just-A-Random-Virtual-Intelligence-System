@@ -471,6 +471,13 @@ Safety properties:
   failure, engine error and Ctrl+C included — so two input streams are
   never open at once and the device is never left held. The stream
   factory is injectable, so this lifecycle is unit-tested with fakes.
+  *(Batch 14 hardening: `start()` now runs **inside** the `try`, so a
+  detector that opens or partially opens the microphone and then raises is
+  still released; and an activation whose session ends without activating
+  stops with `WakeWordUnavailableError` instead of busy-looping on
+  `while not detect()`. A verifier that cannot be constructed closes its
+  loaded embedding model, and a cleanup failure logs the resource type
+  only. See section T of [AUDIT_REPORT.md](AUDIT_REPORT.md).)*
 
 ## Speaker verification (Batch 12)
 
@@ -683,6 +690,23 @@ missing file → `None`, corrupt/malformed/non-finite/zero-sample files and
 model mismatch → `EnrollmentError`, atomic owner-only write, `clear`, and
 the `enroll_speaker` flow (confirm-before-overwrite, retries, unusable
 rejection, abort on backend error, minimum-sample gate, centroid stored).
+
+`tests/test_lifecycle.py` (Batch 14) — the end-to-end activation
+lifecycle through injected fakes only: a detector that raises during
+`start()` still releases its session; a detector whose session is closed
+stops the attempt instead of busy-looping (with a `detect_calls` failsafe
+so a regression fails rather than hangs); an unexpected non-domain
+detector error releases every resource and reaches the terminal `STOPPED`
+state; the microphone session is released before every transcription
+across repeated activations; a partially-initialised startup (verifier
+built, listener construction fails) closes the verifier and its embedding
+model; a `SpeakerVerifier` construction failure closes the just-loaded
+model; a rejected verification runs no tool (`executor.calls == []`,
+listener `transcribe_calls == 0`) and never enters `LISTENING`; audio and
+speech failures keep the loop and state consistent; repeated `close()` is
+safe; and status/reset admin commands build no listener, speaker or
+embedding model. No microphone, speaker, model file, network or external
+process is used.
 
 `tests/test_speaker_backend.py` (Batch 12) — the SpeechBrain ECAPA
 adapter against an injected loader (sample-rate validation, model-id
