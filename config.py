@@ -295,6 +295,69 @@ class AppsConfig:
 
 
 @dataclass(frozen=True)
+class ResearchConfig:
+    """Settings for the optional, read-only web research capability.
+
+    Web research is **off by default** and **requires**
+    :class:`ToolsConfig` to be enabled too. It is deliberately kept behind
+    an injected provider so the network backend can be swapped without
+    touching the router or the executor, and so tests never touch the
+    network. When no credentials are configured the capability reports
+    itself as unavailable; every existing command keeps working.
+    """
+
+    enabled: bool = False
+
+    # Which provider backend to use. "tavily" (the Tavily search API) is
+    # the wired-up implementation; the seam exists so another backend can
+    # be added without touching the router or the executor.
+    provider: str = "tavily"
+
+    # Name of the environment variable that holds the provider API key.
+    # The key is read from the environment at startup and is never stored
+    # in configuration or written to a log.
+    api_key_env: str = "TAVILY_API_KEY"
+
+    # Upper bound on how many organic results are requested and used.
+    max_results: int = 5
+
+    # Upper bound on the length of a single research query (the original
+    # recognised utterance) and of the composed spoken answer.
+    max_query_chars: int = 400
+    max_answer_chars: int = 500
+
+    # Per-request network timeout in seconds. Bounded so a stalled
+    # request can never hang the listening loop.
+    request_timeout: float = 10.0
+
+    _PROVIDERS = ("tavily",)
+
+    def validate(self) -> "ResearchConfig":
+        """Check every value and return self, or raise ConfigError."""
+        problems = []
+
+        if not isinstance(self.enabled, bool):
+            problems.append("enabled must be a boolean")
+        if self.provider not in self._PROVIDERS:
+            problems.append("provider must be 'tavily'")
+        if not isinstance(self.api_key_env, str) or not self.api_key_env.strip():
+            problems.append("api_key_env must be a non-empty string")
+        if not 1 <= self.max_results <= 10:
+            problems.append("max_results must be between 1 and 10")
+        if self.max_query_chars < 1:
+            problems.append("max_query_chars must be positive")
+        if self.max_answer_chars < 1:
+            problems.append("max_answer_chars must be positive")
+        if not 0.0 < self.request_timeout <= 60.0:
+            problems.append("request_timeout must be between 0 and 60 seconds")
+
+        if problems:
+            raise ConfigError("; ".join(problems))
+
+        return self
+
+
+@dataclass(frozen=True)
 class SpeechConfig:
     """Settings for the text-to-speech output pipeline."""
 

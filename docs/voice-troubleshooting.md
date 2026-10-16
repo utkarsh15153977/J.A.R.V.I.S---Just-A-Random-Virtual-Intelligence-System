@@ -45,8 +45,39 @@ The same wording reaches the console for the manual test
 | "Speaker verification could not start." | The enrolled voice used a different model, or the profile is unreadable | Re-run `--enroll-speaker` with the current model. |
 | Replies are never spoken | `pyttsx3` unavailable or a voice failed | Replies are printed; install/fix `pyttsx3` to restore speech. This never stops the loop. |
 | Every phrase is "I can't do that yet." | Tools are off | Run with `--tools` (and `--allow-apps` plus an allowlist for launching). |
+| A phrase you expect to work still says "I can't do that yet." with `--tools` on | The recognised wording did not match a known phrase (routing matches an exact normalised phrase) | Re-run with `--log-transcripts` and read the `Recognized ...; routing outcome:` line (see below); the tool set is fixed and off-by-default, and unknown wording stays unsupported by design. |
 | "I had a problem hearing you." then a clean shutdown | Capture/transcription provider failed unexpectedly | Re-run; if it repeats, include `logs/jarvis.log`. |
 | Microphone stays busy after exit | A previous process did not release the device | Confirm no other Jarvis is running; the mic is released on every shutdown path (including Ctrl+C). |
+
+## Diagnosing a command that falls through
+
+The pipeline already transcribes and routes; when a command you expect to
+work replies "I can't do that yet", you need the **actual** recognised
+text — not a guess. Opt in to transcript + routing logging and reproduce:
+
+```powershell
+.\.venv\Scripts\python app.py --tools --no-speech --log-transcripts
+```
+
+For every turn, `logs/jarvis.log` now records one line:
+
+```
+YYYY-MM-DD HH:MM:SS INFO jarvis.app: Recognized '<what Whisper heard>'; routing outcome: kind=...
+```
+
+The routing outcome is one of:
+
+- `kind=tool tool=<id>` — matched and executed the named read-only tool;
+- `kind=exit` — a stop word (`exit`/`quit`/`stop`);
+- `kind=clarify` — nothing recognisable was captured;
+- `kind=unsupported` — text was heard but did not match any known phrase.
+
+So `kind=unsupported` with `Recognized 'hey jarvis what time is it'` tells
+you the transcript included the wake phrase/name as well as the command
+(routing matches the command wording exactly). Logging is **off by
+default**; the startup message warns while it is on, and the flag can be
+omitted again to disable it. Only the transcript and the routing outcome
+are added — never raw audio, arguments or handler values.
 
 ## Diagnostics
 
@@ -69,9 +100,11 @@ Run the plain manual test to see the classified microphone messages:
 ## Logs
 
 Runtime logs are written to `logs/jarvis.log` (timestamped). Transcripts
-are **not** logged unless `--transcripts` is enabled; otherwise only the
-captured text's length is logged. Include the relevant log lines (they
-contain no raw audio) when reporting a problem.
+are **not** logged unless `--log-transcripts` is enabled; otherwise only
+the captured text's length is logged. When it is enabled, the matched
+routing outcome is logged alongside the transcript (see "Diagnosing a
+command that falls through"). Include the relevant log lines (they contain
+no raw audio) when reporting a problem.
 
 ## What the tests cover
 

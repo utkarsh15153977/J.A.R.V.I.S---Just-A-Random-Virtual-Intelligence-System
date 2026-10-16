@@ -18,7 +18,8 @@ explicit listening states:
 
 The production tool registry is empty by default. Passing ``--tools``
 registers a small, fixed set of approved, deterministic, read-only tools
-(the time, the date, system status, disk space, battery status). No
+(the time, the date, the date and time together, system status, disk
+space, battery status). No
 operating system, shell, browser, filesystem contents, email or other
 real action is registered, and nothing dangerous is ever available.
 
@@ -41,6 +42,13 @@ session starts. It also never authorises an action; a match only allows
 listening, and every command still passes through the router and the
 guarded executor.
 
+Web research is an optional, opt-in capability (``--research``, which
+also requires ``--tools``). It adds a single read-only ``web_research``
+tool backed by an injected provider; unmatched *general questions* may
+be routed to it, and a query is sent to the configured provider. Without
+credentials the capability reports itself unavailable and every existing
+command keeps working. It never executes anything itself.
+
 Activation is always one of three explicit modes, decided at startup:
 
     MANUAL          no wake word, no verification: always-listen (default)
@@ -54,8 +62,11 @@ downgrading to a mode the user did not ask for. Manual activation is
 never substituted for a requested, unavailable gate.
 
 Privacy: transcripts are not logged unless ``--log-transcripts`` is
-given. Raw audio and handler return values are never logged. Enrolment
-stores only a centroid embedding, never the raw recordings.
+given; that opt-in also records the routing outcome (matched tool id or
+"unsupported"), so a command that falls through can be diagnosed from
+the log rather than guessed. Raw audio and handler return values are
+never logged. Enrolment stores only a centroid embedding, never the raw
+recordings.
 """
 
 from __future__ import annotations
@@ -71,6 +82,7 @@ from typing import Any, Callable, List, Optional
 from config import (
     AppsConfig,
     ConfigError,
+    ResearchConfig,
     SpeakerVerificationConfig,
     SpeechConfig,
     ToolsConfig,
@@ -90,6 +102,13 @@ from core.builtin_tools import build_builtin_registry
 from core.executor import ExecutionResult, ExecutionStatus, ToolExecutor
 from core.log import setup_logging
 from core.permissions import ConsoleApprovalProvider, PermissionPolicy
+from core.research import (
+    TOOL_WEB_RESEARCH,
+    AnswerSynthesizer,
+    ResearchProvider,
+    build_default_provider,
+    register_research_tool,
+)
 from core.router import (
     DEFAULT_TOOL_INTENTS,
     CommandKind,
@@ -104,7 +123,12 @@ from voice.enrollment import (
     enroll_speaker,
     microphone_capture,
 )
-from voice.listener import Listener, MicrophoneError, ModelLoadError
+from voice.listener import (
+    Listener,
+    MicrophoneError,
+    ModelLoadError,
+    TranscriptionStatus,
+)
 from voice.speaker import Speaker, SpeechError
 from voice.speaker_verification import (
     SpeakerVerificationError,
@@ -141,15 +165,22 @@ _USAGE = (
     "  --reset-speaker     Delete the stored voice enrolment, then exit.\n"
     "  --speaker-status    Print the stored enrolment status, then exit.\n"
     "  --tools             Enable the built-in read-only tools (for example\n"
-    "                      the time, the date, system status, disk space or\n"
-    "                      battery status).\n"
+    "                      the time, the date, the date and time together,\n"
+    "                      system status, disk space or battery status).\n"
     "                      OFF by default: the tool registry stays empty.\n"
     "  --allow-apps        Enable launching allowlisted applications (for\n"
     "                      example Notepad or Calculator). Requires --tools\n"
     "                      AND an explicit allowlist in configuration; OFF\n"
     "                      by default, and every launch needs confirmation.\n"
-    "  --log-transcripts   Write full voice transcripts to the log file.\n"
-    "                      OFF by default: spoken commands may contain\n"
+    "  --research          Enable read-only web research for general\n"
+    "                      questions. Requires --tools and a Tavily API key\n"
+    "                      in the TAVILY_API_KEY environment variable; OFF\n"
+    "                      by default. General questions are sent to the\n"
+    "                      search provider and answers cite their sources.\n"
+    "  --log-transcripts   Write full voice transcripts AND the routing\n"
+    "                      outcome (which tool a command matched, or that\n"
+    "                      it was unsupported) to the log file. OFF by\n"
+    "                      default: spoken commands may contain\n"
     "                      sensitive information.\n"
     "  --no-speech         Text-only mode: never produce speech output.\n"
     "  -h, --help          Show this message and exit.\n"
@@ -165,6 +196,7 @@ class _Options:
     speaker_status: bool = False
     tools: bool = False
     allow_apps: bool = False
+    research: bool = False
     log_transcripts: bool = False
     speak: bool = True
     show_help: bool = False
@@ -179,6 +211,7 @@ def _parse_args(argv: List[str]) -> _Options:
         speaker_status="--speaker-status" in argv,
         tools="--tools" in argv,
         allow_apps="--allow-apps" in argv,
+        research="--research" in argv,
         log_transcripts="--log-transcripts" in argv,
         speak="--no-speech" not in argv,
         show_help=any(arg in ("-h", "--help") for arg in argv),
@@ -202,6 +235,10 @@ def _build_registry(
     apps_config: Optional[AppsConfig] = None,
     allowlist: Optional[AppAllowlist] = None,
     launcher: Optional[ProcessLauncher] = None,
+    research_config: Optional[ResearchConfig] = None,
+    research_provider: Optional[ResearchProvider] = None,
+    research_synthesizer: Optional[AnswerSynthesizer] = None,
+    research_diagnostic: Optional[Callable[[str], None]] = None,
 ) -> ToolRegistry:
     """Return the registry of approved tools (empty unless enabled).
 
@@ -209,7 +246,10 @@ def _build_registry(
     read-only built-ins, and only when tools have been opted into. The
     ``launch_application`` tool is added only when apps are enabled too
     **and** a non-empty allowlist was resolved; otherwise no launch tool
-    exists at all.
+    exists at all. The ``web_research`` tool is added only when research
+    is enabled too and a provider was supplied. ``research_diagnostic``
+    is the optional opt-in sink for per-lookup lines (``None`` keeps
+    research quiet, the default).
     """
     if not tools_config.enabled:
         logger.info("Tools disabled; the tool registry is empty.")
@@ -228,6 +268,21 @@ def _build_registry(
                 launcher if launcher is not None else SubprocessLauncher()
             ),
         )
+    if (
+        research_config is not None
+        and research_config.enabled
+        and research_provider is not None
+    ):
+        register_research_tool(
+            registry,
+            research_provider,
+            max_results=research_config.max_results,
+            max_query_chars=research_config.max_query_chars,
+            max_answer_chars=research_config.max_answer_chars,
+            timeout=research_config.request_timeout + 2.0,
+            synthesizer=research_synthesizer,
+            diagnostic=research_diagnostic,
+        )
     return registry
 
 
@@ -241,16 +296,25 @@ def _build_executor(registry: ToolRegistry) -> ToolExecutor:
     )
 
 
-def _build_router(registry: ToolRegistry) -> Router:
+def _build_router(
+    registry: ToolRegistry,
+    *,
+    research_tool: Optional[str] = None,
+    research_max_query_chars: int = 400,
+) -> Router:
     """Build the deterministic router for the registered tools.
 
     With an empty registry this degrades to the placeholder behaviour
     (only exit words are recognised). Application-launch phrases are
-    inert unless the launch tool is actually registered.
+    inert unless the launch tool is actually registered, and the
+    general-question fallback is inert unless ``research_tool`` names a
+    registered tool.
     """
     return ToolCommandRouter(
         DEFAULT_TOOL_INTENTS + APP_LAUNCH_INTENTS,
         available_tools=registry.names(),
+        research_tool=research_tool,
+        research_max_query_chars=research_max_query_chars,
     )
 
 
@@ -273,6 +337,21 @@ def _describe_result(result: ExecutionResult) -> str:
     # Executor/validator messages are developer-authored and contain no
     # raw arguments or handler return values.
     return result.message or "I couldn't complete that."
+
+
+def _route_diagnostic(command: Any) -> str:
+    """One developer-authored line describing a routing decision.
+
+    Used only by the opt-in transcript/route diagnostics. It carries the
+    decision kind and, for a tool request, the registered tool name — never
+    the transcript and never tool arguments. A malformed result is
+    reported as ``invalid`` rather than hidden.
+    """
+    if not isinstance(command, CommandRequest):
+        return "kind=invalid"
+    if command.kind is CommandKind.TOOL:
+        return f"kind=tool tool={command.tool_name or '<none>'}"
+    return f"kind={command.kind.value}"
 
 
 def _respond(
@@ -452,6 +531,23 @@ def _activate(
     return True
 
 
+def _read_transcription(listener: Any) -> "tuple[str, Any]":
+    """Read one transcription and its outcome from any listener.
+
+    The production :class:`voice.listener.Listener` exposes
+    ``transcribe_result`` (text + a :class:`TranscriptionStatus`); older
+    or faked listeners expose only ``transcribe`` and report no status.
+    """
+    reader = getattr(listener, "transcribe_result", None)
+    if callable(reader):
+        result = reader()
+        return (
+            getattr(result, "text", "") or "",
+            getattr(result, "status", None),
+        )
+    return listener.transcribe(), None
+
+
 def _run_loop(
     listener: Any,
     router: Router,
@@ -462,6 +558,8 @@ def _run_loop(
     detector: Any,
     verifier: Any,
     mode: ActivationMode,
+    *,
+    log_transcripts: bool = False,
 ) -> int:
     while True:
         try:
@@ -482,18 +580,29 @@ def _run_loop(
             continue
 
         try:
-            text = listener.transcribe()
+            text, status = _read_transcription(listener)
         except MicrophoneError as exc:
             output(f"Microphone error: {exc}")
             machine.close()
             return EXIT_RUNTIME_ERROR
         except Exception:
-            # The listener already degrades a bad transcription to ""; an
-            # unexpected error here means capture/provider itself failed.
-            # Fail closed with one clean message instead of a traceback.
+            # An unexpected error here means capture itself failed. Fail
+            # closed with one clean message instead of a traceback.
             output("Sorry, I had a problem hearing you.")
             machine.close()
             return EXIT_RUNTIME_ERROR
+
+        if status is TranscriptionStatus.SILENCE:
+            # Ordinary silence: say nothing and go back to waiting. This
+            # avoids a repetitive "I didn't catch that" between commands.
+            machine.to(ListeningState.IDLE)
+            continue
+        if status is TranscriptionStatus.FAILED:
+            # A failed transcription is reported once, then listening
+            # continues instead of ending the session.
+            output("Sorry, I had a problem hearing you.")
+            machine.to(ListeningState.IDLE)
+            continue
 
         machine.to(ListeningState.PROCESSING)
 
@@ -503,6 +612,16 @@ def _run_loop(
             output("Sorry, I had a problem understanding that.")
             machine.to(ListeningState.IDLE)
             continue
+
+        if log_transcripts:
+            # Opt-in diagnostic: the recognised transcript and the routing
+            # decision together, so a fall-through can be diagnosed from
+            # the log instead of guessed. Never enabled by default.
+            logger.info(
+                "Recognized %r; routing outcome: %s",
+                text,
+                _route_diagnostic(command),
+            )
 
         outcome, reply = _resolve(command, executor)
 
@@ -786,6 +905,9 @@ def main(
     ] = None,
     clock: Optional[Callable[[], datetime]] = None,
     state_machine: Optional[ListeningStateMachine] = None,
+    research_config: Optional[ResearchConfig] = None,
+    research_provider: Optional[ResearchProvider] = None,
+    research_synthesizer: Optional[AnswerSynthesizer] = None,
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
 ) -> int:
@@ -847,6 +969,13 @@ def main(
         if options.allow_apps and active_tools.enabled:
             active_apps = replace(active_apps, enabled=True)
         active_apps.validate()
+
+        active_research = (
+            research_config if research_config is not None else ResearchConfig()
+        )
+        if options.research and active_tools.enabled:
+            active_research = replace(active_research, enabled=True)
+        active_research.validate()
     except ConfigError as exc:
         output(f"Invalid configuration: {exc}")
         return EXIT_CONFIG_ERROR
@@ -879,6 +1008,10 @@ def main(
         output(
             "App launching requires --tools; keeping it disabled."
         )
+    if options.research and not active_tools.enabled:
+        output(
+            "Web research requires --tools; keeping it disabled."
+        )
 
     allowlist: Optional[AppAllowlist] = None
     if active_tools.enabled and active_apps.enabled:
@@ -891,15 +1024,47 @@ def main(
                 output(f"Invalid configuration: {exc}")
                 return EXIT_CONFIG_ERROR
 
+    provider = research_provider
+    if provider is None and active_tools.enabled and active_research.enabled:
+        provider = build_default_provider(
+            provider=active_research.provider,
+            api_key_env=active_research.api_key_env,
+            timeout=active_research.request_timeout,
+        )
+    if (
+        active_tools.enabled
+        and active_research.enabled
+        and provider is not None
+        and not getattr(provider, "available", True)
+    ):
+        output(
+            "Web research is enabled but no API key was found in "
+            f"{active_research.api_key_env}; research requests will report "
+            "that it is unavailable."
+        )
+
     registry = _build_registry(
         active_tools,
         clock,
         apps_config=active_apps,
         allowlist=allowlist,
         launcher=app_launcher,
+        research_config=active_research,
+        research_provider=provider,
+        research_synthesizer=research_synthesizer,
+        research_diagnostic=(
+            logger.info if active_config.log_transcripts else None
+        ),
     )
     if router is None:
-        router = _build_router(registry)
+        research_tool = (
+            TOOL_WEB_RESEARCH if TOOL_WEB_RESEARCH in registry else None
+        )
+        router = _build_router(
+            registry,
+            research_tool=research_tool,
+            research_max_query_chars=active_research.max_query_chars,
+        )
     if executor is None:
         executor = _build_executor(registry)
 
@@ -952,7 +1117,8 @@ def main(
         if active_tools.enabled:
             output(
                 "Read-only tools are ON. You can ask for the time, the "
-                "date, the system status, disk space or battery status."
+                "date, the date and time, the system status, disk space "
+                "or battery status."
             )
 
         if allowlist is not None and len(allowlist) > 0:
@@ -997,6 +1163,7 @@ def main(
             detector,
             verifier,
             mode,
+            log_transcripts=active_config.log_transcripts,
         )
     except KeyboardInterrupt:
         output("\nInterrupted. Shutting down.")

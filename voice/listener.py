@@ -13,6 +13,8 @@ Flow of one capture attempt:
 import logging
 import time
 from collections import deque
+from dataclasses import dataclass
+from enum import Enum
 from typing import Iterable, Optional
 
 import numpy as np
@@ -44,6 +46,28 @@ class ModelLoadError(RuntimeError):
     problems) so the entry point can present one actionable message
     instead of a raw traceback.
     """
+
+
+class TranscriptionStatus(str, Enum):
+    """Outcome of one transcription attempt.
+
+    Distinguishing these lets the app react sensibly: ordinary silence
+    should not produce a repetitive "I didn't catch that", while a failed
+    transcription is reported once.
+    """
+
+    HEARD = "heard"  # usable speech was transcribed
+    SILENCE = "silence"  # no usable speech was captured
+    NO_TEXT = "no_text"  # speech was captured but nothing was transcribed
+    FAILED = "failed"  # transcription raised
+
+
+@dataclass(frozen=True)
+class Transcription:
+    """A transcription result plus how it turned out."""
+
+    text: str = ""
+    status: TranscriptionStatus = TranscriptionStatus.SILENCE
 
 
 def join_segments(segments: Iterable) -> str:
@@ -288,13 +312,18 @@ class Listener:
     # ------------------------------------------------------------------
     # Transcription
     # ------------------------------------------------------------------
-    def transcribe(self) -> str:
-        """Record one utterance and return lower-cased text ("" if none)."""
+    def transcribe_result(self) -> Transcription:
+        """Record one utterance and report text + outcome.
+
+        Silence, captured-but-empty speech and a failed transcription are
+        distinguished rather than all collapsed to an empty string, so the
+        caller can avoid nagging the user during ordinary silence.
+        """
         audio = self.record_until_silence()
 
         if audio is None:
             logger.info("No speech captured; nothing to transcribe.")
-            return ""
+            return Transcription(status=TranscriptionStatus.SILENCE)
 
         # faster-whisper expects float32 audio in [-1.0, 1.0].
         waveform = audio.astype(np.float32) / 32768.0
@@ -310,17 +339,23 @@ class Listener:
             text = join_segments(segments)
         except Exception:
             logger.exception("Whisper transcription failed.")
-            return ""
+            return Transcription(status=TranscriptionStatus.FAILED)
         took = time.perf_counter() - started
         logger.info("Transcription finished in %.2f s.", took)
 
         if not text:
             logger.info("Whisper returned no text for this recording.")
-            return ""
+            return Transcription(status=TranscriptionStatus.NO_TEXT)
 
         if self.config.log_transcripts:
             logger.info("YOU: %s", text)
         else:
             # Transcript content is private by default; log only its size.
             logger.info("Transcription captured (%d characters).", len(text))
-        return text.lower()
+        return Transcription(
+            text=text.lower(), status=TranscriptionStatus.HEARD
+        )
+
+    def transcribe(self) -> str:
+        """Record one utterance and return lower-cased text ("" if none)."""
+        return self.transcribe_result().text

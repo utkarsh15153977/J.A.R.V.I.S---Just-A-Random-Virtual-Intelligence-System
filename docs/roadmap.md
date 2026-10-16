@@ -488,3 +488,242 @@ Security posture: unchanged. The new code only *describes* failures that
 already happened and never grants access; `audio_errors.py` operates on
 error text only, never on audio, transcripts or embeddings. See section U
 of [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 16 note (read-only tool routing coverage)
+
+Batch 16 adds no new capability and no new tool. A live run showed that
+the current date and time routed correctly while system status, disk
+space and battery status fell through to the generic "I can't do that
+yet" reply. The audit found the pipeline itself is sound — the five
+built-in ToolSpecs register under `--tools` with the exact IDs the
+intents reference, validation passes and execution succeeds — but the
+router matches phrases by **exact normalised equality**, and the phrase
+sets for those three tools were too narrow to cover common, unambiguous
+variants (for example "check the system status", "how much space
+is left", "what's my battery", "battery percentage").
+
+- **Root cause.** Exact-match routing plus uneven phrase coverage: every
+  unmapped variant becomes `CommandKind.UNSUPPORTED` and prints the
+  generic response. Time/date escaped this only because their lists were
+  already broad.
+- **Fix (`core/router.py`).** The explicit `DEFAULT_TOOL_INTENTS` phrase
+  sets were expanded for all four categories (time, date, system status,
+  disk space, battery). Matching stays deterministic, exact and
+  data-driven; no fuzzy/normalised-prefix matching and no LLM selector.
+  A phrase still routes only to a registered tool, spoken text is never
+  copied into arguments, and the existing duplicate-phrase guard in
+  `tests/test_builtin_tools.py` keeps the table unambiguous.
+- **Failure handling (unchanged, re-verified).** An absent battery or
+  unavailable disk reports a plain "not available" message (tool
+  succeeded at reporting); a reader/handler exception becomes
+  `ExecutionStatus.ERROR` ("tool execution failed") and is never reported
+  as success.
+- **Tests.** +14 tests (607 → 621), in `tests/test_builtin_tools.py`:
+  per-category variant coverage, normalisation tolerance, unknown phrases
+  staying unsupported, exit words unaffected, variants inert when tools
+  are disabled, and graceful battery/disk/reader/handler failure paths.
+  All use injected fakes; no hardware, model file or process is used.
+- **Not changed.** Exit-command behaviour, permission/confirmation
+  behaviour, wake-word/speaker verification, default-off tools, the
+  application-launch allowlist, and the `av<19` constraint.
+
+Security posture: unchanged. See section V of
+[docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 16.1 note (diagnosing live routing fall-through)
+
+Batch 16.1 adds no capability and no new tool. It responds to the live
+report that, in a `--tools` run, one system-status command routed while
+later commands fell through to the generic "I can't do that yet" reply.
+
+The audit found the *pipeline* is sound but the *failure was
+undiagnosable*: `logs/jarvis.log` proved transcripts were produced (it
+logged their length) and one turn reached `jarvis.executor:
+tool=get_system_status status=ok`, but the recognised text and the
+routing decision were never recorded, so the exact failing wording could
+only be guessed at.
+
+- **Fix — opt-in route diagnostics (`app.py`).** When (and only when)
+  `--log-transcripts` is given, each turn now logs one line:
+  `Recognized '<transcript>'; routing outcome: kind=tool tool=<id>` (or
+  `kind=exit`/`kind=clarify`/`kind=unsupported`). `_route_diagnostic`
+  builds the outcome from the `CommandRequest` and never includes
+  arguments or handler values. Off by default; documented in `--help`,
+  `README.md`, `docs/voice-troubleshooting.md` and `docs/safety.md`.
+- **Deterministic finding.** A probe with the real router + registry shows
+  every common natural-language variant routes correctly, but any turn
+  whose transcript carries a leading filler or the assistant's name
+  (`hey jarvis ...`, `jarvis ...`, `um ...`) is `unsupported`, because
+  routing matches the whole normalised phrase. This is the leading
+  hypothesis for the live failures and is stated without guessing;
+  confirming it needs the captured transcript from the new logging.
+  No fuzzy matching and no guessing-based phrase padding were added.
+- **Tests.** +6 (`tests/test_app.py::TestRoutingDiagnostics`): the
+  diagnostic summary never leaks arguments/text; the outcome is logged
+  only when opted in; an unsupported turn is diagnosable; and, through
+  the real router + executor (readers injected), a time/date/status/disk/
+  battery variant each executes while variants stay unsupported with
+  tools off.
+- **Not changed.** Phrase tables (already broad from Batch 16), the
+  executor, permissions/confirmation, wake-word/speaker verification, the
+  default-off posture, and `requirements.txt`.
+
+Security posture: unchanged. The diagnostic is off by default, adds no
+authority, and reveals only what the user explicitly opted to record. See
+section W of [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 16.2 note (confirmed live fall-through fixed)
+
+Batch 16.2 acts on the transcript captured by the Batch 16.1 diagnostics
+in a real Windows mic run
+(`app.py --tools --no-speech --log-transcripts`):
+
+| Recognised transcript | Before | After |
+|---|---|---|
+| `what is the system status?` | `tool=get_system_status` | unchanged (worked) |
+| `what is the disk space?` | `kind=unsupported` | `tool=get_disk_space` |
+| `what is the battery status?` | `kind=unsupported` | `tool=get_battery_status` |
+
+Root cause: routing matches the whole normalised phrase, and the disk and
+battery sets listed "how much …" / "what is the … level" variants but not
+the plain "what is the … space/status" wording.
+
+- **Fix (`core/router.py`, data only).** Two phrases each added:
+  `what is the disk space` / `what's the disk space` and
+  `what is the battery status` / `what's the battery status`. Existing
+  normalisation strips case, edge punctuation and apostrophes, so the
+  transcribed `…?` forms match. No routing logic changed.
+- **Tests (`tests/test_builtin_tools.py`).** New phrases added to
+  `test_disk_space_variants` / `test_battery_status_variants`; the exact
+  live utterances (punctuation included) added to
+  `test_variants_tolerate_case_punctuation_and_apostrophes`; a dedicated
+  `test_batch_16_2_live_transcripts_route`; and both phrases added to the
+  tools-disabled inertness check.
+- **Not changed.** No fuzzy matching, no LLM selector, no new tool, no
+  dependencies, no calibration change; executor, permissions,
+  confirmation and transcript-logging default untouched.
+
+Security posture: unchanged. See section X of
+[docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 16.3 note (combined date/time and laptop status)
+
+A further live mic run captured two more unsupported turns:
+
+| Recognised transcript | Before | After |
+|---|---|---|
+| `what is the date and time?` | `kind=unsupported` | `tool=get_current_datetime` |
+| `what is the current status of the laptop?` | `kind=unsupported` | `tool=get_system_status` |
+
+- **`get_current_datetime` (new combined tool).** A single command can
+  reasonably ask for the date *and* the time. `IntentRule` maps one
+  phrase to exactly **one** tool and multi-tool shortcuts are forbidden,
+  so rather than orchestrating two tools the change adds one more fixed,
+  zero-argument, `SAFE`, read-only tool that reuses the existing
+  `_format_date` / `_format_time` helpers and runs through the same
+  `ToolExecutor` path. It returns e.g. *"It's 3:45 PM on Thursday,
+  October 15, 2026."* Registered only under the existing `--tools`
+  opt-in, exactly like the other built-ins.
+- **Laptop status.** `get_system_status` already reports OS name and
+  Python version and is a reasonable synonym, so the exact phrase (plus
+  `…status of my laptop`, `laptop status`, `how is my laptop`, etc.) maps
+  to it. No new meaning, no battery/disk/network/process detail added.
+- **Tests.** `TestCurrentDatetime` (formatting of both date and time, SAFE
+  zero-arg validation, route+execute through the executor); datetime
+  variants and laptop variants in `TestVoicePhraseCoverage`;
+  `test_batch_16_3_live_transcripts_route`; new negative phrases; the new
+  phrases added to the tools-disabled inertness check plus a check that
+  the combined tool is absent from an empty registry; and app-level tests
+  in `tests/test_app.py` for both phrases (and that the date/time phrase
+  is inert without `--tools`).
+- **Not changed.** No fuzzy matching, no LLM selector, no shell/Python
+  execution, no dependencies, no calibration or transcript-logging change;
+  executor, permission policy and confirmation untouched.
+
+Security posture: unchanged; the added tool is
+`SAFE`, argumentless and read-only. See section Y of
+[docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+## Batch 17 note (general-question web research)
+
+The next capability is answering general factual questions ("what is the
+distance between Ranchi and Dhanbad", "why is the sky blue", "who
+directed the movie Dhurandhar") that no fixed phrase matches, instead of
+returning `kind=unsupported`. It is added as one more **read-only** tool
+behind an injected provider, with a deterministic routing fallback.
+
+- **New module `core/research.py`.** A `ResearchProvider` protocol, a
+  standard-library Tavily search provider, a `web_research` `ToolSpec`
+  (single bounded `query` argument, `SAFE`, timeout), a deterministic
+  extractive answer builder, and an optional injectable synthesiser.
+- **`web_research` tool.** The only tool that takes input (the user's own
+  question); that input is the point of the feature, so it is bounded by
+  `max_query_chars` and used only as a search string. It runs through the
+  same `ToolExecutor` gate as everything else.
+- **Router fallback, not phrases.** `ToolCommandRouter` gains an optional
+  `research_tool`. When it names a registered tool, unmatched turns that
+  *open with a question word* and whose first meaningful word is not an
+  action verb route to research with the recognised utterance as the
+  query. Fixed intents still win, and action requests ("open Google
+  Chrome", "delete this file", "run this command") stay `UNSUPPORTED`.
+  With no research tool configured, routing is byte-for-byte unchanged.
+- **New config `ResearchConfig`** (`enabled`, `provider`, `api_key_env`,
+  `max_results`, `max_query_chars`, `max_answer_chars`, `request_timeout`)
+  and a `--research` flag that **requires `--tools`**; off by default and
+  disabled when no credential is present. The key comes from the
+  environment (`TAVILY_API_KEY`), never from config or a log.
+- **Provider seam + no new dependency.** Standard-library `urllib` over
+  HTTPS with a bounded timeout; the key is sent in the `Authorization`
+  request header, never in the URL. Failure modes (missing key,
+  429/432/433, timeout, malformed reply) become structured statuses and
+  fixed messages; the handler never fabricates a value it did not receive
+  and attributes every answer to its source.
+- **Docs.** `docs/safety.md` gains a "Web research (Batch 17)" section
+  and updated limitations; `README.md` documents setup, the environment
+  variable, the disabled-by-default behaviour and a manual check list.
+- **Known follow-ups (not implemented here).** *Distance:* the generic
+  answer is not a routing/ETA number — a Google Maps Routes API provider
+  (separate key, billing) is the correct source and is left for a later
+  batch. *Movies:* a search extract is not a verified rating — a dedicated
+  movie-data provider is the follow-up. Neither is faked or hard-coded,
+  and no scraping of search-result pages is done.
+
+Cost/usage: Tavily is a third-party service with a limited free tier and
+per-credit billing beyond it, behind the user's own key; nothing here
+bundles or ships a key. Batch 17.1 replaces the earlier SerpApi backend
+with Tavily (same injected provider seam, same tool, same safety
+posture). Batch 17.2 hardens the Tavily seam and adds a live validator:
+every transport/parse failure (`401`/`403`, `429`/`432`/`433`, other HTTP
+codes incl. `5xx`, timeouts, other socket errors, malformed URLs,
+truncated/chunked replies and invalid JSON) becomes a fixed status with
+the key never exposed, and `scripts/validate_research_backend.py` runs one
+real request by hand and reports status/sources/answer only. Batch 17.3
+sanitises retrieved text before it is shown or spoken (whitespace is
+collapsed and C0/C1 control characters are dropped), so an untrusted page
+cannot inject ANSI escape sequences or null bytes, and pins with tests
+that content embedded in a retrieved page is treated as data -- it grants
+no approval and invokes no command. Batch 17.4 improves answer quality:
+sources are ranked by subject overlap, off-topic results trigger a
+rephrase request instead of an unrelated snippet, distance questions
+accept only road-distance evidence (rail-only sources are rejected and
+disagreeing figures are surfaced), provider answers are attributed as a
+summary, and replies are cut on a sentence/word boundary rather than
+mid-word. Voice reliability is improved in the same batch: the listener
+reports silence, no-text and failure distinctly, so ordinary silence no
+longer produces a repetitive "I didn't catch that" and a failed
+transcription is reported once. Batch 17.6 tightens grounding and adds
+an opt-in diagnostic: non-distance questions extract the *distinctive*
+terms (short/generic words dropped) and require a single source to cover
+a strict majority of them, counting only the title/snippet (never the
+URL) as coverage, so unrelated search hits are neither spoken nor cited
+to pad the answer, and an ambiguous place or name whose terms land in
+unrelated pages gets an explicit "couldn't find a clear match" reply
+instead of a guess (a joined form like "Jinkpani" still matches). With
+`--log-transcripts`, each lookup logs one line (query, status, answer
+path, source count) to the same opt-in sink -- never source text or the
+key -- and stays silent by default.
+
+Security posture: the new tool is `SAFE` and read-only; it is the only
+tool that touches the network, it is doubly opt-in (`--tools --research`)
+and it accepts no system target, path, command or option. See section Z
+of [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).

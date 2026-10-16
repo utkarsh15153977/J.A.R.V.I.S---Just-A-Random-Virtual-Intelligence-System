@@ -4,12 +4,15 @@ import dataclasses
 import unittest
 
 from core.app_launcher import APP_LAUNCH_INTENTS, TOOL_LAUNCH_APPLICATION
+from core.research import TOOL_WEB_RESEARCH
 from core.router import (
+    DEFAULT_TOOL_INTENTS,
     CommandKind,
     CommandRequest,
     IntentRule,
     PlaceholderRouter,
     ToolCommandRouter,
+    _research_query,
 )
 
 
@@ -318,6 +321,88 @@ class TestAppLaunchIntents(unittest.TestCase):
                     router.route(spoken).kind, CommandKind.UNSUPPORTED
                 )
 
+
+
+class TestResearchFallback(unittest.TestCase):
+    def _router(self, **kwargs):
+        options = {
+            "available_tools": (TOOL_WEB_RESEARCH, "get_current_time"),
+            "research_tool": TOOL_WEB_RESEARCH,
+        }
+        options.update(kwargs)
+        return ToolCommandRouter(DEFAULT_TOOL_INTENTS, **options)
+
+    def test_eligible_questions_route_with_the_spoken_query(self):
+        router = self._router()
+        for text in (
+            "What is the distance between Ranchi and Dhanbad?",
+            "why is the sky blue",
+            "who directed the movie Dhurandhar",
+            "tell me about the eiffel tower",
+        ):
+            with self.subTest(text=text):
+                command = router.route(text)
+                self.assertIs(command.kind, CommandKind.TOOL)
+                self.assertEqual(command.tool_name, TOOL_WEB_RESEARCH)
+                self.assertEqual(dict(command.arguments), {"query": text})
+                self.assertEqual(command.text, "")
+
+    def test_fixed_intents_win_over_research(self):
+        command = self._router().route("what time is it")
+        self.assertEqual(command.tool_name, "get_current_time")
+        self.assertEqual(dict(command.arguments), {})
+
+    def test_action_requests_stay_unsupported(self):
+        router = self._router()
+        for text in (
+            "open google chrome",
+            "delete this file",
+            "run this command",
+            "can you open notepad",
+            "could you please launch calculator",
+            "please delete it",
+        ):
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+    def test_non_questions_stay_unsupported(self):
+        router = self._router()
+        for text in ("the weather is nice", "hello there", "why"):
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+    def test_query_is_bounded(self):
+        command = self._router(research_max_query_chars=10).route(
+            "what is the distance between two very distant places"
+        )
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(len(dict(command.arguments)["query"]), 10)
+
+    def test_fallback_is_inert_without_a_research_tool(self):
+        router = self._router(research_tool=None)
+        self.assertIs(
+            router.route("what is the distance").kind,
+            CommandKind.UNSUPPORTED,
+        )
+
+    def test_fallback_is_inert_when_the_tool_is_not_registered(self):
+        router = self._router(available_tools=("get_current_time",))
+        self.assertIs(
+            router.route("what is the distance").kind,
+            CommandKind.UNSUPPORTED,
+        )
+
+    def test_research_query_predicate(self):
+        for text in ("what is a", "is it going to rain", "who won"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(_research_query(text))
+        for text in ("", "why", "open chrome", "delete this file"):
+            with self.subTest(text=text):
+                self.assertIsNone(_research_query(text))
 
 
 class TestCommandRequest(unittest.TestCase):

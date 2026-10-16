@@ -17,6 +17,7 @@ from voice.listener import (
     Listener,
     MicrophoneError,
     ModelLoadError,
+    TranscriptionStatus,
     join_segments,
 )
 
@@ -245,6 +246,57 @@ class FakeStreamForRead:
 
     def read(self, _samples):
         raise self._error
+
+
+class TestTranscriptionResult(unittest.TestCase):
+    """``transcribe_result`` distinguishes silence, no text and failure."""
+
+    def _listener(self, model):
+        fake = SimpleNamespace(WhisperModel=lambda *args, **kwargs: model)
+        with patch.dict(sys.modules, {"faster_whisper": fake}):
+            return Listener(VoiceConfig())
+
+    def _run(self, model, audio):
+        listener = self._listener(model)
+        with patch.object(
+            listener, "record_until_silence", return_value=audio
+        ):
+            return listener.transcribe_result()
+
+    def test_silence_when_nothing_captured(self):
+        result = self._run(_FakeWhisperModel("exit"), None)
+        self.assertIs(result.status, TranscriptionStatus.SILENCE)
+        self.assertEqual(result.text, "")
+
+    def test_heard_text_is_lower_cased(self):
+        audio = np.zeros(1600, dtype=np.int16)
+        result = self._run(_FakeWhisperModel("Hello World"), audio)
+        self.assertIs(result.status, TranscriptionStatus.HEARD)
+        self.assertEqual(result.text, "hello world")
+
+    def test_no_text_when_whisper_returns_nothing(self):
+        audio = np.zeros(1600, dtype=np.int16)
+        result = self._run(_FakeWhisperModel("   "), audio)
+        self.assertIs(result.status, TranscriptionStatus.NO_TEXT)
+        self.assertEqual(result.text, "")
+
+    def test_failed_when_whisper_raises(self):
+        class BoomModel:
+            def transcribe(self, waveform, **kwargs):
+                raise RuntimeError("boom")
+
+        audio = np.zeros(1600, dtype=np.int16)
+        result = self._run(BoomModel(), audio)
+        self.assertIs(result.status, TranscriptionStatus.FAILED)
+        self.assertEqual(result.text, "")
+
+    def test_transcribe_returns_result_text(self):
+        audio = np.zeros(1600, dtype=np.int16)
+        listener = self._listener(_FakeWhisperModel("Exit"))
+        with patch.object(
+            listener, "record_until_silence", return_value=audio
+        ):
+            self.assertEqual(listener.transcribe(), "exit")
 
 
 if __name__ == "__main__":

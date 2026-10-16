@@ -76,7 +76,8 @@ with PyAV 19.
 .\.venv\Scripts\python scripts\validate_speaker_backend.py --record 4 --consent
 
 # Enable the built-in read-only tools (OFF by default). Ask for "the
-# time", "the date", "system status", "disk space" or "battery status".
+# time", "the date", "the date and time", "system status", "disk space"
+# or "battery status".
 .\.venv\Scripts\python app.py --tools
 
 # Additionally allow launching allowlisted applications (OFF by default;
@@ -84,8 +85,16 @@ with PyAV 19.
 # notepad" or "open calculator"; each launch asks for confirmation.
 .\.venv\Scripts\python app.py --tools --allow-apps
 
-# Opt in to writing full voice transcripts to the log (OFF by default,
-# because spoken commands may contain sensitive information)
+# Additionally enable read-only web research for general questions (OFF
+# by default; requires --tools). It reads the Tavily API key from the
+# TAVILY_API_KEY environment variable; with no key it simply reports
+# that research is unavailable and every other command still works.
+$env:TAVILY_API_KEY = "tvly-your-key"
+.\.venv\Scripts\python app.py --tools --research
+
+# Opt in to writing full voice transcripts AND the routing outcome
+# (which tool a command matched, or that it was unsupported) to the log
+# (OFF by default, because spoken commands may contain sensitive info)
 .\.venv\Scripts\python app.py --log-transcripts
 
 # Manual microphone test (hardware test)
@@ -103,8 +112,8 @@ all work.
 Without `--tools` the registry is empty, so anything other than a stop
 word gets a short "I can't do that yet" reply. With `--tools`, a fixed
 set of phrasings maps to a small set of read-only tools — for example
-"what time is it", "what's the date", "system status", "disk space" or
-"battery status". These are
+"what time is it", "what's the date", "what's the date and time",
+"system status", "disk space" or "battery status". These are
 `SAFE`, take no arguments, need no approval, and read no file contents,
 network or private system details (the disk tool reports only aggregate
 capacity; the battery tool only the power state, on Windows); everything
@@ -116,6 +125,12 @@ source (a spoken "yes" is not accepted yet). Startup problems exit with a
 clear message and a
 status code (`1` runtime/microphone/model error, `2` invalid
 configuration).
+
+If a command that *should* work still replies "I can't do that yet",
+re-run with `--tools --log-transcripts` and read `logs/jarvis.log`: each
+turn logs `Recognized '<what was heard>'; routing outcome: kind=...`. The
+matched tool id (or `kind=unsupported`) shows exactly what the router saw,
+so the cause is diagnosed from the real transcript rather than guessed.
 
 Application launching is a separate, **doubly opt-in** ability that
 requires **both** `--tools` and `--allow-apps`, plus at least one
@@ -129,6 +144,40 @@ every launch needs a fresh, single-use confirmation whose prompt names
 the exact application, and the process is started fire-and-forget with
 an argument list and `shell=False` (no shell, no arbitrary arguments,
 never waited for or terminated).
+
+Web research is a third opt-in capability, **off by default**, that
+requires **both** `--tools` and `--research` (or `ResearchConfig.enabled`).
+It adds one additional read-only tool, `web_research`, and routes only
+*general questions* that no fixed phrase matched — for example "what is
+the distance between Ranchi and Dhanbad", "why is the sky blue" or "who
+directed the movie Dhurandhar". The recognised utterance is sent, as a
+bounded search query, to the configured provider; the reply is a short
+answer that quotes and attributes the source(s) it actually received and
+never invents a figure the provider did not return. Results are ranked
+against the question and, if none actually addresses it, Jarvis asks you
+to rephrase rather than read out an unrelated snippet; a distance question
+is answered only from road-distance sources. Action requests ("open Google
+Chrome", "delete this file", "run this command") are never treated as
+questions and stay unsupported.
+
+The wired provider is the **Tavily search API** (`provider = "tavily"`),
+a third-party search API with a free tier and paid plans. Put your key in
+the environment variable named by `ResearchConfig.api_key_env` (default
+`TAVILY_API_KEY`) and **never** commit it. When the key is missing the
+capability reports itself unavailable and every existing command keeps
+working; when a live request fails (timeout, rate limit, plan limit,
+malformed reply) the reply says so instead of guessing. The provider seam
+is injected, so a different backend can be added without touching the
+router or the executor. Standard-library HTTP is used (the key is sent in
+the `Authorization` header, never the URL), so `--research` adds **no**
+new dependency. Retrieved text is untrusted: snippets are quoted and
+attributed, whitespace is collapsed, and control characters (ANSI escapes,
+NULs) are stripped before anything is shown or spoken, and content
+embedded in a page is never treated as a command. Query text is sent to
+the provider, so treat it like any
+other third-party search box; transcript logging stays off unless you opt
+in. See [`docs/safety.md`](docs/safety.md) for the full design and
+limitations.
 
 By default Jarvis listens immediately (manual/always-listening mode).
 With `--wake-word` it waits in `IDLE` until a wake-word engine reports
@@ -407,11 +456,68 @@ the automated verification and must be checked by hand.
    were run as well and returned exit 0/1/1/1 as specified.)*
 
 Expected tool replies with `--tools`: time ("It's 3:45 PM."), date
-("Today is Thursday, October 15, 2026."), system status ("System status:
+("Today is Thursday, October 15, 2026."), date and time ("It's 3:45 PM on
+Thursday, October 15, 2026."), system status ("System status:
 Windows, Python 3.x.x."), disk space ("Disk space: N GB free of M GB.")
-and battery status ("Battery is at N% (…).").
+and battery status ("Battery is at N% (…)."). With `--tools --research`
+a general question replies with an attributed web answer, e.g.
+"According to example.com: … (Other sources: …)"; without a configured
+key it replies "I can't do web research right now: Web research is not
+configured."
 
-### Batch 14 lifecycle checks
+### Batch 17 research checks
+
+These need network access and (for the first two) a valid Tavily API
+key; none can run in CI, so run them by hand and record
+**unverified/blocked** where the prerequisite is missing.
+
+- One live request, scripted (Batch 17.2). Set the key for this terminal
+  session only, then run:
+  ```
+  $env:TAVILY_API_KEY = "tvly-..."
+  .\.venv\Scripts\python scripts\validate_research_backend.py
+  Remove-Item Env:TAVILY_API_KEY
+  ```
+  It prints `PASS`/`FAIL`/`BLOCKED`, the status, the source count/domains
+  and a truncated answer, and exits `0`/`1`/`3`; the key is sent only in
+  the `Authorization` header and is never printed. *(not run in CI. Run on
+  this machine for Batch 17.2: **blocked** — no `TAVILY_API_KEY` is set
+  here, so no live request was made and no live success is claimed.)*
+- With no key set, run `.\.venv\Scripts\python app.py --tools --research`
+  and ask a general question: it must say research is unavailable and
+  every other tool must still work.
+- With `$env:TAVILY_API_KEY = "tvly-…"` set, ask "what is the distance
+  between Ranchi and Dhanbad" and "why is the sky blue": each must return
+  a short, source-attributed answer drawn from the provider.
+- With the same setup, say "open Google Chrome": it must stay "I can't
+  do that yet" and never be sent to the provider.
+- Unplug the network (or use a bad key) and ask a question: the reply
+  must report the failure, not fabricate an answer. A rejected/expired
+  key, a `429`/`432`/`433` rate limit, a server error, a timeout, a
+  malformed reply and a truncated reply are each reported as such — never
+  as a fact and never with the key in the text.
+- Relevance (Batch 17.4): with `--tools --research`, ask a question whose
+  results are partly off-topic (e.g. "who is the CEO of <obscure company>
+  in 2026"). The reply must either answer from an on-topic source or ask
+  you to rephrase -- it must not recount an unrelated snippet verbatim.
+- Distance (Batch 17.4): ask "how far is Ranchi from Dhanbad". The reply
+  must give a road distance (or say no distance was found); it must not
+  present a train-track kilometre figure as the road distance. If sources
+  disagree, the different figures are named.
+- Voice reliability (Batch 17.4, needs a microphone): stay silent for a
+  few seconds. Jarvis must not repeat "I didn't catch that" for plain
+  silence; it should simply keep waiting. A capture that produced speech
+  but no text still asks you to repeat.
+- Ambiguity and grounding (Batch 17.6): ask about an unusual place or
+  name (e.g. "where is Jink Pani?"). If the results do not clearly match,
+  the reply must say it could not find a clear match, or ask you to
+  rephrase and check the spelling -- it must not recount an unrelated
+  page instead. A genuine match is still answered and cited.
+- Research diagnostics (Batch 17.6): with `--tools --research
+  --log-transcripts`, each lookup logs one short line (the query, the
+  provider status, the answer path and the source count) and never a
+  snippet or the API key. Without the flag nothing about the lookup is
+  logged.
 
 These exercise activation lifecycle and resource release. Items 10–13
 need a microphone; item 14 needs a legitimate enrolled voice profile.
@@ -479,15 +585,16 @@ are in [docs/voice-troubleshooting.md](docs/voice-troubleshooting.md).
 ```
 Jarvis/
 ├── app.py                 # main entry point (composition root)
-├── config.py              # validated config (VoiceConfig, SpeechConfig, WakeConfig, SpeakerVerificationConfig, ToolsConfig, AppsConfig)
+├── config.py              # validated config (VoiceConfig, SpeechConfig, WakeConfig, SpeakerVerificationConfig, ToolsConfig, AppsConfig, ResearchConfig)
 ├── requirements.txt
 ├── core/
 │   ├── log.py             # shared console + file logging
 │   ├── permissions.py     # permission levels, policy, approvals
 │   ├── confirmation.py    # bound, single-use confirmation tickets
 │   ├── tools.py           # ToolSpec, ToolRegistry, validation
-│   ├── builtin_tools.py   # read-only tools (time, date, status, disk, battery)
+│   ├── builtin_tools.py   # read-only tools (time, date, date+time, status, disk, battery)
 │   ├── app_launcher.py    # allowlisted, confirmed application launcher
+│   ├── research.py        # optional read-only web research (injected provider)
 │   ├── executor.py        # the single guarded execution gate
 │   └── router.py          # text -> structured command (no execution)
 ├── voice/

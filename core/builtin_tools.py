@@ -33,6 +33,7 @@ from core.tools import ToolRegistry, ToolSpec, validate_mapping
 
 TOOL_GET_CURRENT_TIME = "get_current_time"
 TOOL_GET_CURRENT_DATE = "get_current_date"
+TOOL_GET_CURRENT_DATETIME = "get_current_datetime"
 TOOL_GET_SYSTEM_STATUS = "get_system_status"
 TOOL_GET_DISK_SPACE = "get_disk_space"
 TOOL_GET_BATTERY_STATUS = "get_battery_status"
@@ -41,6 +42,7 @@ TOOL_GET_BATTERY_STATUS = "get_battery_status"
 BUILTIN_TOOL_NAMES = (
     TOOL_GET_CURRENT_TIME,
     TOOL_GET_CURRENT_DATE,
+    TOOL_GET_CURRENT_DATETIME,
     TOOL_GET_SYSTEM_STATUS,
     TOOL_GET_DISK_SPACE,
     TOOL_GET_BATTERY_STATUS,
@@ -118,6 +120,30 @@ def make_get_current_date(clock: Clock) -> Callable[[], dict]:
         return {
             "text": f"Today is {_format_date(moment)}.",
             "date": moment.date().isoformat(),
+        }
+
+    return handler
+
+
+def make_get_current_datetime(clock: Clock) -> Callable[[], dict]:
+    """Build the combined ``get_current_datetime`` handler.
+
+    A spoken command can reasonably ask for the date *and* the time at
+    once ("what is the date and time?"). Rather than inventing a
+    multi-tool shortcut, this is a single, fixed, read-only tool that
+    reuses the same ``_format_date`` / ``_format_time`` helpers -- one
+    SAFE read through the clock, exactly like the others, so nothing
+    bypasses ``ToolExecutor``.
+    """
+
+    def handler() -> dict:
+        moment = clock()
+        date_text = _format_date(moment)
+        time_text = _format_time(moment)
+        return {
+            "text": f"It's {time_text} on {date_text}.",
+            "date": moment.date().isoformat(),
+            "time": time_text,
         }
 
     return handler
@@ -272,6 +298,13 @@ def build_builtin_specs(
             permission=PermissionLevel.SAFE,
             validate=_reject_arguments,
             handler=make_get_current_date(active_clock),
+        ),
+        ToolSpec(
+            name=TOOL_GET_CURRENT_DATETIME,
+            description="report the current local date and time",
+            permission=PermissionLevel.SAFE,
+            validate=_reject_arguments,
+            handler=make_get_current_datetime(active_clock),
         ),
         ToolSpec(
             name=TOOL_GET_SYSTEM_STATUS,

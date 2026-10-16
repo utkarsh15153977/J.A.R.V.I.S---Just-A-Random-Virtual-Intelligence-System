@@ -238,8 +238,10 @@ those tools).
   passwords, names and other sensitive data, so the listener logs only
   the character count instead of the text.
 - `app.py --log-transcripts` (or `VoiceConfig(log_transcripts=True)`)
-  opts in to logging full transcripts; it is off unless explicitly
-  enabled, and the startup message warns when it is on.
+  opts in to logging full transcripts **and the routing outcome** (the
+  matched tool id, or that the turn was `unsupported`); it is off unless
+  explicitly enabled, and the startup message warns when it is on. The
+  routing outcome contains no arguments and no transcript text of its own.
 - Raw arguments and handler return values are never logged.
 - Handler failures log the tool name and the exception **class** only;
   the exception message (which may embed data) is not logged.
@@ -283,6 +285,7 @@ those tools).
 |---|---|---|
 | `get_current_time` | the local clock (injected) | touch files/network/shell |
 | `get_current_date` | the local clock (injected) | touch files/network/shell |
+| `get_current_datetime` | the local clock (injected) | touch files/network/shell |
 | `get_system_status` | OS name + Python version | read env, user or host name |
 | `get_disk_space` | aggregate capacity of the home filesystem (`shutil.disk_usage`) | open/read files, traverse paths |
 | `get_battery_status` | power state via `ctypes`/`GetSystemPowerStatus` (Windows only; `None` elsewhere) | install packages, read env |
@@ -298,11 +301,13 @@ Safety properties:
 - **Single gate.** Every call still passes through
   `ToolExecutor.execute`; SAFE tools need no approval but the
   registered → validated → classified → run order is unchanged.
-- **No private data.** No tool reads file *contents*, the environment,
-  user/host name, or the network, and none runs a shell or process. The
-  disk tool reports only aggregate filesystem capacity for one fixed
-  target (the user's home directory / filesystem); the battery tool
-  reports only the power state. Both are read-only.
+- **No private data.** No *built-in* tool reads file *contents*, the
+  environment, user/host name, or the network, and none runs a shell or
+  process. The disk tool reports only aggregate filesystem capacity for
+  one fixed target (the user's home directory / filesystem); the battery
+  tool reports only the power state. Both are read-only. (The optional
+  `web_research` tool is the one tool that uses the network; it is
+  described separately below and is never registered by `--tools` alone.)
 - **Standard library only.** Disk uses `shutil`; battery uses `ctypes`.
   No package is installed or changed.
 - **Safe output only.** A tool returns a structured mapping; only its
@@ -364,6 +369,128 @@ process execution. The child is never waited for, tracked or terminated.
 
 **Tested with a fake launcher.** All automated tests inject a fake
 `ProcessLauncher`; no real application is ever started in a test.
+
+## Web research (Batch 17)
+
+`core/research.py` adds an optional **read-only** capability that answers
+general factual questions by querying a search provider. It is the only
+tool that uses the network, and it is deliberately narrow.
+
+**Injected provider only.** The router and the executor never know which
+backend is used; only the provider performs I/O. The wired backend is the
+Tavily search API (`provider = "tavily"`), a third-party service; the key
+is read from the environment variable named by
+`ResearchConfig.api_key_env` (default `TAVILY_API_KEY`) and is never
+stored in configuration or written to a log. It is sent in the
+`Authorization` request header, never in the URL. Standard-library HTTP
+(`urllib`) is used over HTTPS with a bounded timeout, so `--research`
+adds **no** new dependency.
+
+**Opt-in and doubly gated.** Off by default. The `web_research` tool is
+registered only when **both** `--tools` and `--research` (or
+`ResearchConfig(enabled=True)`) are given; `--research` without `--tools`
+is reported and stays disabled. With no credentials the capability
+returns a clear "not configured" reply and every existing command keeps
+working.
+
+**Bounds.** The query is the original recognised utterance, truncated to
+`max_query_chars` (default 400) by the router and re-validated by the
+tool; results are capped at `max_results` (default 5, hard cap 10); a
+provider-supplied answer and the composed reply are both truncated; and
+the tool spec carries a timeout. A stalled request cannot hang the loop.
+
+**Honest, attributed output.** A provider returns a structured
+`ResearchResult` instead of raising (missing credentials → `UNAVAILABLE`,
+HTTP 429/432/433 → `RATE_LIMITED`, timeout → `TIMEOUT`, unreadable reply
+→ `ERROR`). Every non-`OK` status becomes a fixed, non-sensitive reply; a
+result with no sources is reported as "I couldn't find a reliable
+answer"; the handler never invents a figure the provider did not return,
+and a misbehaving optional synthesiser is caught and the deterministic
+extract is used instead. A provider's own generated answer is used only
+when the provider actually returned one **and** results were returned to
+cite it, and it is attributed as a summary (`The search service
+summarised: …`), never presented as a locally verified fact. Source
+titles/snippets are untrusted text: they are quoted and
+attributed (`According to <domain>: … (Source: <url>)`) and are never
+treated as instructions or fed back into routing. Retrieved text is also
+sanitised before it is shown or spoken (Batch 17.3): runs of whitespace
+are collapsed and C0/C1 control characters (ANSI escapes, NULs, ...) are
+dropped, so a page cannot inject terminal escape sequences or null bytes
+into the console or the speaker. Printable text, including non-ASCII
+letters, is left intact.
+
+**Failure modes are total (Batch 17.2).** Every transport and parse
+failure maps to a fixed status, never an exception escaping the handler:
+`401`/`403` → `UNAVAILABLE`, `429`/`432`/`433` → `RATE_LIMITED`, other
+HTTP codes (including `400`/`422` and `5xx`) → `ERROR`, a socket timeout
+→ `TIMEOUT`, and any other socket error, malformed URL, truncated/chunked
+reply (`http.client.HTTPException`) or unreadable/invalid JSON → `ERROR`.
+The key is present only in the `Authorization` header — never in the URL,
+the JSON body, a status message, the reply text or a log. A live check is
+available as `scripts/validate_research_backend.py` (Batch 17.2), which
+reads the key from the environment and prints status/sources/answer only.
+
+**Relevance, not just keyword luck (Batch 17.4/17.6).** Sources are
+ranked by how much they overlap the question's *subject*, with common
+question words ("distance", "movie", "who", …) down-weighted. For a
+question that is not about distance, Jarvis extracts the *distinctive*
+terms (short tokens and generic words are dropped) and requires a single
+source to cover a strict majority of them; only a URL overlap does not
+count as coverage. A source that runs the terms together (a place name
+like "Jinkpani" for the question "where is Jink Pani") still matches.
+When no source shares a distinctive term Jarvis says it could not find a
+clear match; when only a weak partial match exists it asks the user to
+rephrase, or to check the spelling of a place or name. It never reads an
+unrelated snippet aloud, and it never pads the sources with irrelevant
+hits to look complete. A provider-supplied summary, when used, stays
+attributed to the search service (not presented as verified fact), and a
+synthesised or extracted answer is always attributed to its source.
+
+**Ambiguity is handled conservatively (Batch 17.6).** Terms spread
+across several loosely-related pages are not treated as one answer: an
+ambiguous place or name whose terms land in unrelated results (a game
+character here, a ritual there) is answered with the explicit "couldn't
+find a clear match" message rather than a guess. The source order and
+the answer's provenance (`unavailable`/`no-sources`/`no-relevant`/
+`clarify`/`no-distance`/`synthesizer`/`provider`/`extractive`) are
+reported in the structured tool result (`status`/`provenance`/`sources`)
+for diagnosis; the spoken reply stays plain text.
+
+**Research diagnostics are opt-in (Batch 17.6).** With
+`--log-transcripts`, each lookup writes one short line -- the query, the
+provider status, the answer path and how many sources came back -- to the
+log, reusing the existing transcript opt-in. Without the flag nothing
+about the lookup is logged. The diagnostic never contains source text,
+a snippet or the API key, and a failure in the diagnostic sink can never
+break a research turn.
+
+**Distance questions need distance evidence (Batch 17.4).** A question
+containing "distance" or "how far" is answered only from sources that
+carry a road/route distance. Rail-only sources (which frequently quote
+track kilometres) are de-prioritised and rejected as evidence, and if no
+source supplies a usable distance Jarvis says so rather than voicing an
+unrelated figure. When sources disagree, the differing figures are
+surfaced (`Note: sources give different figures (… km).`) instead of
+silently picking one.
+
+**Bounded, sentence-aware replies (Batch 17.4).** A reply that must be
+cut is trimmed at a sentence end when one falls in the second half of the
+budget, otherwise at the last whole word (with an ellipsis), and only a
+single unbroken run is hard-cut -- so a reply never ends mid-word.
+
+**Only general questions, never actions.** When research is enabled, the
+router adds one deterministic fallback that runs *after* fixed-intent
+matching: a turn is eligible only if it opens with a question word and
+its first meaningful word (after politeness words) is not an action verb.
+"open Google Chrome", "delete this file" and "run this command" therefore
+stay `UNSUPPORTED` and are never sent to a provider. Existing tool
+intents are matched first and are unchanged.
+
+**Privacy.** A research request sends the recognised query text to the
+provider, and the reply is spoken through the normal speaker path.
+Transcript logging stays off unless separately opted in. See
+`docs/roadmap.md` (Batch 17) for the Tavily pricing/usage note and the
+distance/movie follow-ups.
 
 ## Speech output
 
@@ -796,13 +923,15 @@ calls a handler directly.
 
 ## Known limitations
 
-- Five read-only tools exist (`get_current_time`,
-  `get_current_date`, `get_system_status`, `get_disk_space`,
-  `get_battery_status`); the registry ships **empty by default** and holds
-  those five only when `--tools` is given. The only side-effecting tool is
-  the application launcher (`launch_application`), which is additionally
-  gated behind `--allow-apps` plus a non-empty configured allowlist and
-  always requires a fresh confirmation.
+- Six fixed read-only tools exist (`get_current_time`,
+  `get_current_date`, `get_current_datetime`, `get_system_status`,
+  `get_disk_space`, `get_battery_status`); the registry ships **empty by
+  default** and holds those six only when `--tools` is given. A seventh
+  read-only tool, `web_research`, is added only when `--research` is also
+  given and a provider is supplied. The only side-effecting tool is the
+  application launcher (`launch_application`), which is additionally gated
+  behind `--allow-apps` plus a non-empty configured allowlist and always
+  requires a fresh confirmation.
 - The application catalog is tiny and Windows-only (Notepad and
   Calculator), and its active allowlist is empty by default. Launching is
   fire-and-forget: Jarvis does not know whether the app opened, and it
@@ -810,6 +939,18 @@ calls a handler directly.
   exercised against a real process in automated tests (an injected fake
   launcher is used instead); only its argv construction and `shell=False`
   are asserted.
+- Web research is **optional, off by default and not exercised against a
+  live provider in CI**: every test injects a fake provider, so request
+  shaping, parsing, bounding, error mapping and routing are covered but no
+  real network call is made. The Tavily backend is a third-party service
+  with its own pricing, credits and rate limits, and no key is bundled.
+  The answer is the provider's own generated answer (when returned) or a
+  short extractive quote of the top search result, plus source links, not
+  a verified fact: results can be wrong, stale or ambiguous, and the
+  router cannot tell one "Dhurandhar" from another. Dedicated structured
+  providers (Google Maps Routes for travel distance, a movie database for
+  film facts) are noted as follow-ups in `docs/roadmap.md` (Batch 17)
+  rather than implemented here.
 - Battery status is Windows-only (read through `ctypes`); on other
   platforms the tool reports that battery status is unavailable. The
   battery and disk values reported on this machine were read live and are

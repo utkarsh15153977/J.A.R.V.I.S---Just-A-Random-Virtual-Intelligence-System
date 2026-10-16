@@ -14,6 +14,7 @@ from core.builtin_tools import (
     BUILTIN_TOOL_NAMES,
     TOOL_GET_BATTERY_STATUS,
     TOOL_GET_CURRENT_DATE,
+    TOOL_GET_CURRENT_DATETIME,
     TOOL_GET_CURRENT_TIME,
     TOOL_GET_DISK_SPACE,
     TOOL_GET_SYSTEM_STATUS,
@@ -21,6 +22,7 @@ from core.builtin_tools import (
     build_builtin_registry,
     build_builtin_specs,
     make_get_battery_status,
+    make_get_current_datetime,
     make_get_disk_space,
     register_builtin_tools,
 )
@@ -37,7 +39,7 @@ from core.router import (
     ToolCommandRouter,
     _normalize_phrase,
 )
-from core.tools import ToolInputError, ToolRegistry
+from core.tools import ToolInputError, ToolRegistry, ToolSpec
 
 
 def fixed_clock():
@@ -170,6 +172,51 @@ class TestTimeAndDateFormatting(unittest.TestCase):
     def test_results_are_deterministic(self):
         moment = datetime(2026, 10, 15, 15, 45)
         self.assertEqual(self._time_text(moment), self._time_text(moment))
+
+
+class TestCurrentDateTime(unittest.TestCase):
+    """Batch 16.3: the combined date-and-time read-only tool."""
+
+    def test_handler_reports_both_date_and_time(self):
+        handler = make_get_current_datetime(
+            lambda: datetime(2026, 10, 15, 15, 45, 30)
+        )
+        value = handler()
+        self.assertEqual(value["date"], "2026-10-15")
+        self.assertEqual(value["time"], "3:45 PM")
+        self.assertIn("3:45 PM", value["text"])
+        self.assertIn("Thursday, October 15, 2026", value["text"])
+
+    def test_registered_handler_uses_injected_clock(self):
+        registry = build_builtin_registry(fixed_clock)
+        result = registry.get(TOOL_GET_CURRENT_DATETIME).handler()
+        self.assertEqual(result["date"], "2026-10-15")
+        self.assertIn("3:45 PM", result["text"])
+        self.assertIn("Thursday, October 15, 2026", result["text"])
+
+    def test_combined_tool_is_safe_and_rejects_arguments(self):
+        specs = {spec.name: spec for spec in build_builtin_specs(fixed_clock)}
+        spec = specs[TOOL_GET_CURRENT_DATETIME]
+        self.assertIs(spec.permission, PermissionLevel.SAFE)
+        self.assertEqual(spec.validate({}), {})
+        with self.assertRaises(ToolInputError):
+            spec.validate({"date": "2020-01-01"})
+
+    def test_combined_phrase_routes_and_runs_through_executor(self):
+        registry = build_builtin_registry(fixed_clock)
+        executor = ToolExecutor(
+            registry, PermissionPolicy(), RecordingApprovals()
+        )
+        router = ToolCommandRouter(
+            DEFAULT_TOOL_INTENTS, available_tools=registry.names()
+        )
+        command = router.route("what is the date and time?")
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_GET_CURRENT_DATETIME)
+        result = executor.execute(command.tool_name, command.arguments)
+        self.assertIs(result.status, ExecutionStatus.OK)
+        self.assertIn("3:45 PM", result.value["text"])
+        self.assertIn("Thursday, October 15, 2026", result.value["text"])
 
 
 class TestSystemStatus(unittest.TestCase):
@@ -348,6 +395,315 @@ class TestGuardedExecution(unittest.TestCase):
                     command = self.router.route(phrase)
                     self.assertIs(command.kind, CommandKind.TOOL)
                     self.assertEqual(command.tool_name, rule.tool_name)
+
+
+class TestVoicePhraseCoverage(unittest.TestCase):
+    """Batch 16: common, unambiguous spoken variants reach the right tool.
+
+    The router matches by exact normalised phrase, so these lists are the
+    regression guard for the actual spoken coverage of each read-only
+    tool. Fakes only: no hardware, no microphone, no process.
+    """
+
+    def setUp(self):
+        self.router = ToolCommandRouter(
+            DEFAULT_TOOL_INTENTS, available_tools=BUILTIN_TOOL_NAMES
+        )
+
+    def assert_routes(self, phrases, tool_name):
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                command = self.router.route(phrase)
+                self.assertIs(command.kind, CommandKind.TOOL)
+                self.assertEqual(command.tool_name, tool_name)
+                self.assertEqual(dict(command.arguments), {})
+                self.assertEqual(command.text, "")
+
+    def test_time_variants(self):
+        self.assert_routes(
+            (
+                "what time is it",
+                "what's the time",
+                "what is the current time",
+                "tell me the time",
+                "do you have the time",
+                "what time do you have",
+                "time please",
+                "TIME NOW?",
+            ),
+            TOOL_GET_CURRENT_TIME,
+        )
+
+    def test_date_variants(self):
+        self.assert_routes(
+            (
+                "what is the date",
+                "what's today's date",
+                "what's the current date",
+                "what date is it today",
+                "what day is it",
+                "tell me the date",
+                "today's date",
+                "what's the day",
+            ),
+            TOOL_GET_CURRENT_DATE,
+        )
+
+    def test_datetime_variants(self):
+        self.assert_routes(
+            (
+                "what is the date and time",
+                "what's the date and time",
+                "what is the current date and time",
+                "what's the current date and time",
+                "what is the time and date",
+                "date and time",
+                "the date and time",
+                "current date and time",
+                "tell me the date and time",
+                "what's today's date and time",
+            ),
+            TOOL_GET_CURRENT_DATETIME,
+        )
+
+    def test_system_status_variants(self):
+        self.assert_routes(
+            (
+                "system status",
+                "check the system status",
+                "what's my system status",
+                "system check",
+                "status report",
+                "how is the system",
+                "how is my computer",
+                "computer status",
+                "laptop status",
+                "how is my laptop",
+                "what is the current status of the laptop",
+                "what's the status of my laptop",
+                "is the system ok",
+                "system information",
+            ),
+            TOOL_GET_SYSTEM_STATUS,
+        )
+
+    def test_disk_space_variants(self):
+        self.assert_routes(
+            (
+                "disk space",
+                "check the disk space",
+                "how much disk space do i have",
+                "how much space is left",
+                "how much free space",
+                "free space",
+                "disk usage",
+                "storage space",
+                "hard drive space",
+                "how full is my hard drive",
+                "what is the disk space",
+                "what's the disk space",
+            ),
+            TOOL_GET_DISK_SPACE,
+        )
+
+    def test_battery_status_variants(self):
+        self.assert_routes(
+            (
+                "battery status",
+                "check the battery",
+                "battery percentage",
+                "battery life",
+                "what is the battery status",
+                "what's the battery status",
+                "how much battery do i have",
+                "how much charge is left",
+                "what's my battery",
+                "am i plugged in",
+                "power status",
+                "is the battery charged",
+            ),
+            TOOL_GET_BATTERY_STATUS,
+        )
+
+    def test_variants_tolerate_case_punctuation_and_apostrophes(self):
+        for text, tool_name in (
+            ("WHAT'S THE BATTERY LEVEL?", TOOL_GET_BATTERY_STATUS),
+            ("Check   the   disk space!", TOOL_GET_DISK_SPACE),
+            ("What is the system status.", TOOL_GET_SYSTEM_STATUS),
+            ("What\u2019s today\u2019s date?", TOOL_GET_CURRENT_DATE),
+            ("what is the disk space?", TOOL_GET_DISK_SPACE),
+            ("what is the battery status?", TOOL_GET_BATTERY_STATUS),
+            ("WHAT IS THE DISK SPACE?", TOOL_GET_DISK_SPACE),
+            ("What's the battery status?", TOOL_GET_BATTERY_STATUS),
+            ("What is the date and time?", TOOL_GET_CURRENT_DATETIME),
+            ("WHAT IS THE CURRENT STATUS OF THE LAPTOP?",
+             TOOL_GET_SYSTEM_STATUS),
+            ("what's the date and time?", TOOL_GET_CURRENT_DATETIME),
+            ("What is the current status of my laptop?",
+             TOOL_GET_SYSTEM_STATUS),
+        ):
+            with self.subTest(text=text):
+                command = self.router.route(text)
+                self.assertIs(command.kind, CommandKind.TOOL)
+                self.assertEqual(command.tool_name, tool_name)
+
+    def test_batch_16_2_live_transcripts_route(self):
+        """Exact utterances captured from a live mic run (Batch 16.2).
+
+        `what is the system status?` already worked; `what is the disk
+        space?` and `what is the battery status?` fell through as
+        unsupported. These are the real recognised texts, punctuation
+        included, and must route.
+        """
+        self.assert_routes(
+            ("what is the disk space?",), TOOL_GET_DISK_SPACE
+        )
+        self.assert_routes(
+            ("what is the battery status?",), TOOL_GET_BATTERY_STATUS
+        )
+
+    def test_batch_16_3_live_transcripts_route(self):
+        """Exact utterances captured from a live mic run (Batch 16.3).
+
+        `what is the date and time?` must reach the combined date/time
+        tool (not only the date or only the time), and
+        `what is the current status of the laptop?` must reach the
+        existing system-status tool.
+        """
+        self.assert_routes(
+            ("what is the date and time?",), TOOL_GET_CURRENT_DATETIME
+        )
+        self.assert_routes(
+            ("what is the current status of the laptop?",),
+            TOOL_GET_SYSTEM_STATUS,
+        )
+
+    def test_unknown_phrases_remain_unsupported(self):
+        for text in (
+            "open youtube",
+            "book a flight",
+            "delete everything",
+            "how much battery is in my phone",
+            "disk space on the server",
+            "what is the date and time in tokyo",
+            "what is the current status of the server",
+            "laptop battery status",
+        ):
+            with self.subTest(text=text):
+                command = self.router.route(text)
+                self.assertIs(command.kind, CommandKind.UNSUPPORTED)
+                self.assertNotIn(text, command.response)
+
+    def test_exit_words_are_unaffected(self):
+        for word in ("exit", "quit", "stop", "shut down"):
+            with self.subTest(word=word):
+                self.assertIs(
+                    self.router.route(word).kind, CommandKind.EXIT
+                )
+
+    def test_variants_are_inert_when_tools_are_disabled(self):
+        router = ToolCommandRouter(DEFAULT_TOOL_INTENTS, available_tools=())
+        for text in (
+            "what time is it",
+            "what's today's date",
+            "check the system status",
+            "how much free space",
+            "what's my battery",
+            "what is the disk space?",
+            "what is the battery status?",
+            "what is the date and time?",
+            "what is the current status of the laptop?",
+        ):
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+    def test_combined_datetime_tool_absent_when_tools_disabled(self):
+        router = ToolCommandRouter(DEFAULT_TOOL_INTENTS, available_tools=())
+        self.assertIs(
+            router.route("what is the date and time?").kind,
+            CommandKind.UNSUPPORTED,
+        )
+        registry = ToolRegistry()
+        self.assertIsNone(registry.get(TOOL_GET_CURRENT_DATETIME))
+        self.assertNotIn(TOOL_GET_CURRENT_DATETIME, registry.names())
+
+
+class TestReadOnlyToolFailureHandling(unittest.TestCase):
+    """Batch 16: unavailable hardware/readers never report success."""
+
+    def _executor(self, *, disk_reader=None, battery_reader=None):
+        registry = build_builtin_registry(
+            fixed_clock,
+            disk_reader=disk_reader,
+            battery_reader=battery_reader,
+        )
+        return ToolExecutor(
+            registry, PermissionPolicy(), RecordingApprovals()
+        )
+
+    def test_battery_absent_is_reported_without_crashing(self):
+        executor = self._executor(battery_reader=lambda: None)
+        result = executor.execute(TOOL_GET_BATTERY_STATUS, {})
+        self.assertIs(result.status, ExecutionStatus.OK)
+        self.assertEqual(
+            result.value["text"],
+            "Battery status is not available on this system.",
+        )
+
+    def test_disk_unavailable_is_reported_without_crashing(self):
+        executor = self._executor(disk_reader=lambda: None)
+        result = executor.execute(TOOL_GET_DISK_SPACE, {})
+        self.assertIs(result.status, ExecutionStatus.OK)
+        self.assertEqual(
+            result.value["text"], "Disk information is not available."
+        )
+
+    def test_reader_exception_is_an_error_not_a_success(self):
+        def boom():
+            raise OSError("no such filesystem")
+
+        executor = self._executor(disk_reader=boom)
+        result = executor.execute(TOOL_GET_DISK_SPACE, {})
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertFalse(result.ok)
+        self.assertNotIn("no such filesystem", result.message)
+
+    def test_handler_exception_is_an_error_not_a_success(self):
+        def boom():
+            raise RuntimeError("device vanished")
+
+        spec = ToolSpec(
+            name="demo",
+            description="raise",
+            permission=PermissionLevel.SAFE,
+            validate=lambda raw: {},
+            handler=boom,
+        )
+        registry = ToolRegistry()
+        registry.register(spec)
+        executor = ToolExecutor(
+            registry, PermissionPolicy(), RecordingApprovals()
+        )
+        result = executor.execute("demo", {})
+        self.assertIs(result.status, ExecutionStatus.ERROR)
+        self.assertFalse(result.ok)
+
+    def test_safe_tools_still_never_need_approval(self):
+        approvals = RecordingApprovals()
+        registry = build_builtin_registry(
+            fixed_clock,
+            disk_reader=fixed_disk,
+            battery_reader=fixed_battery,
+        )
+        executor = ToolExecutor(registry, PermissionPolicy(), approvals)
+        for name in BUILTIN_TOOL_NAMES:
+            with self.subTest(tool=name):
+                self.assertIs(
+                    executor.execute(name, {}).status, ExecutionStatus.OK
+                )
+        self.assertEqual(approvals.calls, [])
 
 
 if __name__ == "__main__":
