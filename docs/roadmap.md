@@ -943,24 +943,123 @@ skipped on this host because creating symlinks is not permitted). No real
 microphone, speaker, media player or movie library was touched; the
 real-Windows playback check is a manual step.
 
+## Batch 21 note (daily briefing: Google Calendar, Tasks & priorities)
+
+Batch 21 adds an optional, **read-only daily briefing** that summarises
+today's Google Calendar events and incomplete Google Tasks when the user
+asks ("brief me on today", "what's my schedule today", "what should I
+prioritize today", "what are my tasks today"). It keeps the Batch 9
+permission model, the Batch 16 phrase-set routing and the Batch 19
+fail-closed composition-root style: off by default, doubly opt-in
+(`--tools` **and** `--briefing`, plus a one-time `--briefing-auth`), and
+the single `daily_briefing` tool still runs only through the single
+`ToolExecutor`.
+
+- **Provider-independent core.** `core/briefing.py` defines the typed
+  `CalendarEvent` / `BriefingTask` records, the `CalendarProvider` /
+  `TaskProvider` protocols, deterministic mock providers and a
+  `DailyBriefingService` with an injected clock. Priorities are fixed,
+  auditable rules (overdue, then due today, then upcoming, then undated)
+  — never a model — so the same data always produces the same briefing.
+- **Two read-only Google adapters.** `core/google_calendar.py` and
+  `core/google_tasks.py` read through tiny injected API protocols; only
+  `GoogleCalendarApi` / `GoogleTasksApi` touch a `googleapiclient` service.
+  The adapters expand recurring events (`singleEvents=True`), drop
+  cancelled and completed entries, page with a bounded page count, de-dupe
+  occurrences and normalise missing fields. The calendar and tasks fail
+  independently, so one provider failing does not destroy the other's
+  results, and a failed source is never reported as empty.
+- **Lazy, user-started OAuth.** `core/google_auth.py` is the only place
+  credentials are handled. It imports the Google libraries lazily, requests
+  only the read-only scopes (`calendar.events.readonly`, `tasks.readonly`),
+  opens a browser only for the explicit `--briefing-auth` command, stores
+  the token outside tracked source under a per-user directory with
+  best-effort owner-only permissions, and never logs or speaks a secret.
+  A normal run (and importing `app.py`) never starts OAuth.
+- **Explicit flag and bounded output.** `app.py` gained `--briefing`,
+  `--briefing-auth`, the `BriefingConfig` wiring, the printed help and the
+  "Daily briefing requires --tools; …" fail-closed message. Event count,
+  task count and spoken length are capped; control characters are stripped
+  and long descriptions are not read aloud.
+
+Verification: **1084 tests OK (4 skipped)**, `ruff check` clean,
+`compileall` clean, `pip check` clean, the offline evaluation suite PASS
+(+123 tests over Batch 20's 961: 56 in `tests/test_briefing.py`, 21 in
+`tests/test_google_calendar.py`, 19 in `tests/test_google_tasks.py`, 15 in
+`tests/test_google_auth.py` and 12 `BriefingConfig` tests in
+`tests/test_config.py`). **No live Google account, OAuth consent or API
+call was performed**; the optional Google libraries are not installed on
+this host, so the adapters and the OAuth helper are verified only against
+fakes. The real Google Cloud setup and consent are manual steps documented
+in [docs/briefing.md](briefing.md).
+
+## Batch 22 note (calendar event creation: first write capability)
+
+Batch 22 adds Jarvis's first **write** action: opt-in Google Calendar event
+creation by voice ("schedule a meeting with bob tomorrow at 3pm for 30
+minutes"). It keeps the Batch 9 permission model, the Batch 16 phrase-set
+routing and the Batch 19 fail-closed composition-root style: off by default,
+doubly opt-in (`--tools` **and** `--calendar-write`, plus a one-time
+`--calendar-write-auth`), and the single `create_calendar_event` tool is
+`CONFIRM`, so it runs only through the single `ToolExecutor` after an exact
+approval.
+
+- **Deterministic, timezone-robust domain.** `core/calendar_create.py`
+  parses the request into a typed `ProposedEvent` (title, date, start, end,
+  timezone) with fixed rules — relative dates, weekday names, 12/24-hour
+  times, `noon`/`midnight`, durations — and never guesses: an incomplete or
+  past request is refused and a clarification asked for. Timezone resolution
+  degrades to a fixed offset when `tzdata`/`ZoneInfo` is unavailable (a
+  default Windows install), so it never raises on that path.
+- **Separate write OAuth and token.** `core/google_auth_write.py` mirrors the
+  read-only helper but requests only the narrow
+  `https://www.googleapis.com/auth/calendar.events` scope and stores its own
+  `token_calendar_write.json`, kept strictly apart from the briefing's
+  `token.json`. Libraries load lazily; a browser opens only for
+  `--calendar-write-auth`; a normal run never starts OAuth.
+- **Write adapter kept apart from the read path.**
+  `core/google_calendar_write.py` wraps a tiny injected `events.insert`
+  protocol and maps HTTP 401 to "re-authorisation required" and 403/429/other
+  to a generic failure; `core/google_calendar.py` is untouched.
+- **Confirmed tool with verify-before-report.** `core/calendar_write_tools.py`
+  builds the `CONFIRM` prompt from the trusted normalised proposal (never the
+  transcript), adds an **advisory-only** conflict note, refuses a stale/past
+  proposal, and — on an ambiguous failure — reads the day back and reports
+  whether the event appears, **never** retrying, so a duplicate cannot be
+  created.
+- **Explicit flag and routing separation.** `app.py` gained
+  `--calendar-write`, `--calendar-write-auth`, the `CalendarWriteConfig`
+  wiring, the printed help, the startup announcement and the
+  "Calendar event creation requires --tools; …" fail-closed message.
+  `core/router.py` recognises creation only from an explicit creation phrase
+  (a strong verb, or a weak verb plus a calendar noun) and never turns a
+  briefing phrase into a creation.
+
+Verification: **1167 tests OK (4 skipped)**, `ruff check` clean,
+`compileall` clean, the offline evaluation suite PASS (+83 tests over
+Batch 21's 1084: 63 in `tests/test_calendar_write.py` and 20 in
+`tests/test_google_auth_write.py`). **No live Google account, OAuth consent
+or `events.insert` was performed**; the optional Google libraries are not
+installed on this host, so the write adapter and the write OAuth helper are
+verified only against fakes. The real Google Cloud setup and consent are
+manual steps documented in
+[docs/briefing.md](briefing.md#calendar-event-creation-opt-in-write).
+
 ## Recommended next batches
 
 Ordered by user value against risk; each keeps the Batch 9 permission
 model, the Batch 16 phrase-set routing and the Batch 19 fail-closed
-composition-root style. (Batch 20, local media playback, is now
-implemented — see the note above.)
+composition-root style. (Batch 20, local media playback; Batch 21, the
+daily briefing; and Batch 22, calendar event creation, are now
+implemented — see the notes above.) The batches below keep their original
+ordering idea; the numbers are advisory.
 
-- **Batch 21 — wake-word / voice activation reliability.**
+- **Batch 23 — wake-word / voice activation reliability.**
   No new capability, a hardening pass: activation lifecycle regressions,
   false-trigger and missed-trigger behaviour, and explicit states for
   "microphone lost" / "model not loaded", following the Batch 14 and 15
   audit style. Low risk, high daily value.
-- **Batch 22 — daily briefing.** A single, opt-in, read-only rollup of
-  local time, weather (reusing the research path) and the memory listing,
-  assembled from registered tools only, read aloud through the normal
-  reply path, and only when the user asks for it — never on a timer and
-  never with memory contents shown beyond the existing list bounds.
-- **Batch 23 — desktop assistance (search, open, typed input).** The
+- **Batch 24 — desktop assistance (search, open, typed input).** The
   highest-risk batch: Playwright/DOM first, GUI automation only where
   unavoidable, every action behind the existing permission layer with an
   explicit allowlist, and `CONFIRM` for anything that types, clicks or

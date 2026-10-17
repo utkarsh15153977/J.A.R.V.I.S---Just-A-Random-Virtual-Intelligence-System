@@ -5,3 +5,9 @@ sounddevice
 numpy
 pyttsx3
 playwright
+# Optional: read-only daily briefing (Google Calendar + Tasks). Installed
+# with the rest so --briefing-auth works out of the box; the briefing is
+# still OFF by default and only ever reads.
+google-api-python-client
+google-auth-oauthlib
+

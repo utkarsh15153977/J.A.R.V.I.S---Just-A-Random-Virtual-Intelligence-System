@@ -20,8 +20,22 @@ anything.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
-from typing import Any, FrozenSet, Iterable, Mapping, Optional, Protocol
+from typing import (
+    Any,
+    Callable,
+    FrozenSet,
+    Iterable,
+    Mapping,
+    Optional,
+    Protocol,
+)
+
+from core.calendar_create import (
+    build_proposed_event,
+    parse_event_request,
+)
 
 
 class CommandKind(Enum):
@@ -443,6 +457,197 @@ def _media_request(
                 tool_name=play,
                 arguments={"query": query},
             )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Calendar event creation routing (opt-in; only active when the create tool
+# exists).
+#
+# Creating an event needs the user's own words (to name it), so this is the
+# second deliberate exception - after research's ``query`` - to "the spoken
+# text is never copied into arguments". The router still never executes: it
+# parses the request with the deterministic extractor in
+# ``core.calendar_create``, and only routes to the tool when a complete,
+# well-typed proposal can be built. A missing required detail becomes a
+# CLARIFY so an incomplete request never reaches the confirmation prompt.
+#
+# Matching is conservative and explicit: a recognised creation verb must open
+# the utterance (or a calendar-ish noun must be present), and the briefing
+# phrases are matched first, so "what's on my calendar" is never mistaken for
+# a creation.
+# ---------------------------------------------------------------------------
+_STRONG_CREATE_VERBS: FrozenSet[str] = frozenset(
+    {"schedule", "book", "arrange"}
+)
+_WEAK_CREATE_VERBS: FrozenSet[str] = frozenset(
+    {"create", "add", "make", "set", "new", "put"}
+)
+_CREATE_NOUNS: FrozenSet[str] = frozenset(
+    {"event", "meeting", "appointment", "calendar", "reminder"}
+)
+
+
+def _has_calendar_noun(normalized: str) -> bool:
+    words = {word.strip(_WORD_EDGE) for word in normalized.split()}
+    return bool(words & _CREATE_NOUNS)
+
+
+def _looks_like_calendar_create(normalized: str) -> bool:
+    """True only for an explicit, unambiguous creation phrase."""
+    words = normalized.split()
+    if not words:
+        return False
+    if words[0] in _STRONG_CREATE_VERBS:
+        return True
+    if words[0] == "set" and len(words) > 1 and words[1] == "up":
+        return True
+    if words[0] in _WEAK_CREATE_VERBS and _has_calendar_noun(normalized):
+        return True
+    return False
+
+
+def _create_clarify(parsed) -> str:
+    needs: "list[str]" = []
+    if parsed.ambiguous.title:
+        needs.append("a title")
+    if parsed.ambiguous.date:
+        needs.append("a date")
+    if parsed.ambiguous.time:
+        needs.append("a start time")
+    if parsed.ambiguous.duration:
+        needs.append("a duration")
+    if not needs:
+        return (
+            "I couldn't work out the details for that event. Could you say "
+            "what it is, when it starts and how long it lasts?"
+        )
+    if len(needs) == 1:
+        joined = needs[0]
+    else:
+        joined = ", ".join(needs[:-1]) + " and " + needs[-1]
+    return f"To schedule that, I still need {joined}."
+
+
+def _calendar_create_request(
+    normalized: str,
+    original: str,
+    create_tool: Optional[str],
+    clock: Callable[[], datetime],
+    timezone: Optional[str],
+) -> Optional[CommandRequest]:
+    """Turn an explicit creation phrase into a tool or clarify request."""
+    if not create_tool:
+        return None
+    if not _looks_like_calendar_create(normalized):
+        return None
+
+    parsed = parse_event_request(
+        original, clock=clock, default_timezone=timezone
+    )
+    if not parsed.is_valid:
+        return CommandRequest(
+            CommandKind.CLARIFY, response=_create_clarify(parsed)
+        )
+
+    proposed = build_proposed_event(
+        parsed, clock=clock, default_timezone=timezone
+    )
+    if proposed is None:
+        return CommandRequest(
+            CommandKind.CLARIFY, response=_create_clarify(parsed)
+        )
+
+    now = clock()
+    if now.tzinfo is None:
+        now = now.astimezone()
+    if proposed.start <= now:
+        return CommandRequest(
+            CommandKind.CLARIFY,
+            response=(
+                "That time is in the past; please give a future date and "
+                "time."
+            ),
+        )
+
+    return CommandRequest(
+        CommandKind.TOOL,
+        tool_name=create_tool,
+        arguments={
+            "title": proposed.title,
+            "start": proposed.start.isoformat(),
+            "end": proposed.end.isoformat(),
+            "timezone": proposed.timezone,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Daily briefing routing (opt-in; only active when the briefing tool exists).
+#
+# The briefing is a single, argumentless read-only tool, so routing is a
+# fixed set of whole phrases with no payload: nothing the user says is
+# copied into arguments. Matching is by exact normalised phrase and only
+# when the tool is registered, so an unregistered (or disabled) briefing
+# leaves this inert. It is matched alongside the other fixed intents, so a
+# briefing phrase never falls through to the research fallback.
+#
+# The phrases are normalised once here (apostrophes dropped, whitespace
+# collapsed) so "what's my schedule today" and "whats my schedule today"
+# both match the same way the incoming text is normalised.
+# ---------------------------------------------------------------------------
+_BRIEFING_PHRASES: FrozenSet[str] = frozenset(
+    normalized
+    for normalized in (
+        _normalize_phrase(phrase)
+        for phrase in (
+            "brief me",
+            "brief me on today",
+            "brief me on my day",
+            "give me a briefing",
+            "give me my briefing",
+            "give me my daily briefing",
+            "daily briefing",
+            "morning briefing",
+            "my briefing",
+            "what's my briefing",
+            "what is my briefing",
+            "what's on my calendar today",
+            "what is on my calendar today",
+            "what's on my calendar",
+            "what is on my calendar",
+            "my calendar today",
+            "what's my schedule today",
+            "what is my schedule today",
+            "what's my schedule",
+            "what is my schedule",
+            "what are my tasks today",
+            "what are my tasks",
+            "what are my tasks for today",
+            "what's on my plate today",
+            "what is on my plate today",
+            "what's on my agenda today",
+            "what is on my agenda today",
+            "what's my agenda today",
+            "what should i prioritize today",
+            "what should i prioritise today",
+            "what should i focus on today",
+            "what do i have today",
+            "what do i have going on today",
+        )
+    )
+    if normalized
+)
+
+
+def _briefing_request(
+    normalized: str, briefing_tool: Optional[str]
+) -> Optional[CommandRequest]:
+    """Turn a fixed briefing phrase into a tool request, or ``None``."""
+    if not briefing_tool:
+        return None
+    if normalized in _BRIEFING_PHRASES:
+        return CommandRequest(CommandKind.TOOL, tool_name=briefing_tool)
     return None
 
 
@@ -881,6 +1086,10 @@ class ToolCommandRouter(PlaceholderRouter):
         research_max_query_chars: int = 400,
         memory_tools: Optional[Mapping[str, str]] = None,
         media_tools: Optional[Mapping[str, str]] = None,
+        briefing_tool: Optional[str] = None,
+        calendar_create_tool: Optional[str] = None,
+        calendar_create_clock: Optional[Callable[[], datetime]] = None,
+        calendar_create_timezone: Optional[str] = None,
         exit_words: FrozenSet[str] = _EXIT_WORDS,
         clarify_response: str = _CLARIFY_RESPONSE,
         unsupported_response: str = _UNSUPPORTED_RESPONSE,
@@ -915,6 +1124,18 @@ class ToolCommandRouter(PlaceholderRouter):
             for operation, tool_name in (media_tools or {}).items()
             if isinstance(tool_name, str) and tool_name in available
         }
+        self._briefing_tool = (
+            briefing_tool if briefing_tool in available else None
+        )
+        self._calendar_create_tool = (
+            calendar_create_tool if calendar_create_tool in available else None
+        )
+        self._calendar_create_clock = (
+            calendar_create_clock
+            if calendar_create_clock is not None
+            else datetime.now
+        )
+        self._calendar_create_timezone = calendar_create_timezone
 
     def _match_intent(
         self, normalized: str, original: str
@@ -927,12 +1148,26 @@ class ToolCommandRouter(PlaceholderRouter):
                 tool_name=tool_name,
                 arguments=dict(arguments),
             )
+        briefing_request = _briefing_request(
+            normalized, self._briefing_tool
+        )
+        if briefing_request is not None:
+            return briefing_request
         memory_request = _memory_request(
             normalized, original, self._memory_tools
         )
         if memory_request is not None:
             return memory_request
-        return _media_request(normalized, original, self._media_tools)
+        media_request = _media_request(normalized, original, self._media_tools)
+        if media_request is not None:
+            return media_request
+        return _calendar_create_request(
+            normalized,
+            original,
+            self._calendar_create_tool,
+            self._calendar_create_clock,
+            self._calendar_create_timezone,
+        )
 
     def _match_fallback(
         self, normalized: str, original: str

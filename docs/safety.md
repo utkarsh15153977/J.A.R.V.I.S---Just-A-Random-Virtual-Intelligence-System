@@ -712,6 +712,132 @@ launch, ambiguous list-without-play, explicit selection, denied approval,
 stale/out-of-range selection, cancel) entirely with temporary directories
 and a fake opener — no real player, no real library, no network.
 
+## Daily briefing (Batch 21)
+
+`core/briefing.py`, `core/briefing_tools.py` and the Google adapters add an
+optional, read-only summary of today's Google Calendar events and incomplete
+Google Tasks. It is off by default and doubly opt-in: it needs **both**
+`--tools` and `--briefing` (or `BriefingConfig.enabled=True`). With
+`--briefing` but no `--tools`, `app.py` reports that it stays disabled and
+no briefing tool is registered. It adds one tool, registered through the
+normal `ToolRegistry` and executed only through the single `ToolExecutor`:
+
+| Tool | Level | Effect |
+| --- | --- | --- |
+| `daily_briefing` | `SAFE` | read today's events and tasks and return a summary |
+
+Properties:
+
+- **Strictly read-only.** The adapters call `events.list` and `tasks.list`
+  only. Nothing creates, edits, moves, completes, reorders or deletes an
+  event or task. The OAuth scopes are `calendar.events.readonly` and
+  `tasks.readonly`; no write scope is ever requested.
+- **User-started authorization only.** The Google libraries are imported
+  lazily and a browser is opened only by the explicit `--briefing-auth`
+  command. A normal run, a `--briefing` run and *importing* `app.py` never
+  start an OAuth flow. The client secret and token live outside tracked
+  source, under a per-user application-data directory, with best-effort
+  owner-only permissions.
+- **No credential leakage.** Tokens, refresh tokens and client secrets are
+  never logged, configured, spoken or placed in an exception message; the
+  briefing text contains only cleaned event/task fields.
+- **Never fabricates.** A provider that fails is reported as failed, never
+  as empty: if the calendar fails Jarvis does not present an empty schedule
+  as fact, and if Tasks fails it never says "you have no tasks". The two
+  providers fail independently, so one working source still answers.
+- **Deterministic priorities, no model.** Incomplete tasks are ordered by
+  fixed rules — overdue, then due today, then upcoming, then tasks with no
+  due date — using the injected clock. A task with no due date is never
+  treated as overdue and no deadline is inferred from a title.
+- **Untrusted text is data.** Event titles, locations and task titles are
+  cleaned of control characters and length-bounded before being shown or
+  spoken, and are never treated as instructions.
+- **Bounded.** Event count, task count and spoken length are capped, and
+  long descriptions or notes are not read aloud.
+- **Independent of voice gates.** The briefing permission does not depend on
+  the wake word or speaker verification; those still only decide *when*
+  Jarvis listens, never what it may read.
+
+**Testing.** `tests/test_briefing.py`, `tests/test_google_calendar.py`,
+`tests/test_google_tasks.py` and `tests/test_google_auth.py` exercise the
+domain, the adapters and the OAuth helper entirely with fake providers,
+fake API clients, fakes for the optional Google libraries and a fixed clock
+— no Google account, credential, network or browser. See
+[docs/briefing.md](briefing.md) for setup and privacy details.
+
+## Calendar event creation (Batch 22)
+
+`core/calendar_create.py`, `core/calendar_write_tools.py`,
+`core/google_calendar_write.py` and `core/google_auth_write.py` add an
+optional **write** capability: creating a Google Calendar event by voice. It
+is Jarvis's first action that changes an external system, so it is fenced
+more tightly than anything before it. It is off by default and doubly
+opt-in: it needs **both** `--tools` and `--calendar-write` (or
+`CalendarWriteConfig.enabled=True`). With `--calendar-write` but no
+`--tools`, `app.py` reports that it stays disabled and no creation tool is
+registered. It adds one tool, registered through the normal `ToolRegistry`
+and executed only through the single `ToolExecutor`:
+
+| Tool | Level | Effect |
+| --- | --- | --- |
+| `create_calendar_event` | `CONFIRM` | create one event after an exact-detail confirmation |
+
+Properties:
+
+- **Confirmed, bound and single-use.** The tool is `CONFIRM`: the handler
+  does not run until the executor has a fresh approval bound to the exact
+  validated proposal. The prompt is built from the trusted, normalised
+  proposal (title, date, start, end, timezone) and never from the raw
+  transcript. An expired, mismatched, reused or revoked approval is refused,
+  and a changed proposal requires a **fresh** confirmation. A spoken "yes"
+  is not an approval source; the confirmation comes from the same console
+  path as every other `CONFIRM` action.
+- **Deterministic, non-guessing parser.** `core/router.py` recognises only an
+  explicit creation phrase (a strong verb, or a weak verb plus a calendar
+  noun) and `core/calendar_create.py` resolves the title, date, start,
+  duration and timezone deterministically. An incomplete, ambiguous or
+  **past** request is never written; Jarvis asks for the missing detail or
+  says the time has passed. A briefing phrase ("what's on my calendar
+  today") is never turned into a creation.
+- **No timezone-data dependency.** The domain resolves the local timezone to
+  a fixed offset when `tzdata`/`ZoneInfo` is unavailable (a default Windows
+  install), so it never raises or silently guesses a zone on that path.
+- **Advisory conflicts only.** Overlap with an existing timed event adds a
+  note to the confirmation. It never blocks and never bypasses confirmation,
+  and a free slot is never guaranteed.
+- **Ambiguous writes are verified, never retried.** If the write fails with a
+  transport/timeout error, the handler reads the day back and reports whether
+  the event appears; it **never** replays the write, so it cannot create a
+  duplicate. A missing/revoked grant (401) is reported plainly with no write.
+- **Narrow write scope, separate token.** The write grant uses only
+  `https://www.googleapis.com/auth/calendar.events` and stores its own
+  `token_calendar_write.json`, kept strictly separate from the briefing's
+  read-only `token.json`. Granting write access never widens the read-only
+  briefing grant, and each fails closed on its own. The libraries are imported
+  lazily and a browser is opened only by the explicit `--calendar-write-auth`
+  command; a normal run never starts an OAuth flow.
+- **No credential leakage.** Tokens, refresh tokens and client secrets are
+  never logged, spoken or placed in an exception message; the only written
+  data is the event the user confirmed, and spoken text contains only cleaned,
+  bounded fields.
+- **Fail closed.** A missing, invalid, expired, revoked or under-scoped write
+  credential means the creation tool is not registered and creation phrases
+  stay unsupported — Jarvis does not fall back to a weaker path.
+- **Independent of voice gates.** Creation permission does not depend on the
+  wake word or speaker verification; those only decide *when* Jarvis listens,
+  never what it may write.
+
+**Testing.** `tests/test_calendar_write.py` and
+`tests/test_google_auth_write.py` exercise the parser, the write adapter and
+its status mapping, argument validation, the past-guard, the unauthorized and
+ambiguous-outcome paths, duplicate prevention, the advisory conflict note,
+routing separation from the briefing, scope separation and the `main`
+opt-in/disabled-by-default paths — entirely with injected fake write/read
+APIs, a fixed clock and fake approvals. No Google account, credential,
+browser or network is used. See
+[docs/briefing.md](briefing.md#calendar-event-creation-opt-in-write) for
+setup and privacy details.
+
 ## Speech output
 
 `voice/speaker.py` produces spoken replies with `pyttsx3` (SAPI5 on
@@ -1249,3 +1375,20 @@ calls a handler directly.
   management/loop paths today.
 - The GitHub Actions workflow (`.github/workflows/ci.yml`, Batch 11) was
   authored but not executed locally; it must be validated by a real push.
+- Calendar event creation (Batch 22) has **no live verification** on the
+  build host: the Google libraries are not installed, so the write adapter
+  and the write OAuth helper are verified only against fakes. A real
+  consent, a real account and a real `events.insert` were **not** performed;
+  the first real run should be treated as a smoke test.
+- Creation is limited to adding a single timed event with a title, start,
+  end and timezone. Attendees, invitations, recurrence rules, reminders,
+  calendar selection in the CLI and any edit or deletion are out of scope.
+- The creation parser is pattern-based, not a general planner: a request
+  worded unusually may be refused and a clarification asked for rather than
+  guessed, and the confirm step exists precisely so an imperfect parse can
+  be caught before anything is written.
+- The ambiguous-write recovery reads the target day back; it compares the
+  title and start time (within a one-minute tolerance) to decide whether the
+  event appears. A concurrent identical event created by another client in
+  the same window could be mistaken for the retried write — an accepted,
+  narrow ambiguity that is reported to the user rather than acted on.

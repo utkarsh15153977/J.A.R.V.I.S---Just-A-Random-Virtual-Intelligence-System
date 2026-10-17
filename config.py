@@ -537,3 +537,119 @@ class MediaConfig:
         if problems:
             raise ConfigError("; ".join(problems))
         return self
+
+
+def _validate_optional_path(name: str, value: Any) -> list[str]:
+    """Return problems for an optional path-style string.
+
+    An empty string is valid: it selects the per-user default location.
+    A non-string is always wrong, and a whitespace-only value or one with
+    control characters would silently resolve to an unintended file.
+    """
+    if not isinstance(value, str):
+        return [f"{name} must be a string"]
+    if value and not value.strip():
+        return [f"{name} must not be whitespace-only"]
+    if any(_is_control(character) for character in value):
+        return [f"{name} must not contain control characters"]
+    return []
+
+
+@dataclass(frozen=True)
+class BriefingConfig:
+    """Settings for the optional, read-only daily briefing.
+
+    The briefing is **off by default** and **requires** :class:`ToolsConfig`
+    to be enabled too. It only ever *reads* a calendar and a task list, using
+    the two read-only scopes ``calendar.events.readonly`` and
+    ``tasks.readonly``; the credentials are stored separately and the
+    one-time authorization is user-started (``--briefing-auth``), never run
+    on startup. The caps below bound how much is read and spoken, so a bad
+    provider cannot produce an unbounded briefing.
+    """
+
+    enabled: bool = False
+    client_secret_path: str = ""
+    token_path: str = ""
+    calendar_id: str = "primary"
+    max_events: int = 10
+    max_tasks: int = 10
+    max_text_chars: int = 600
+    request_timeout: float = 10.0
+
+    def validate(self) -> "BriefingConfig":
+        """Check every value and return self, or raise ConfigError."""
+        problems: list[str] = []
+
+        if not isinstance(self.enabled, bool):
+            problems.append("enabled must be a boolean")
+        problems.extend(
+            _validate_optional_path("client_secret_path", self.client_secret_path)
+        )
+        problems.extend(
+            _validate_optional_path("token_path", self.token_path)
+        )
+        if not isinstance(self.calendar_id, str) or not self.calendar_id.strip():
+            problems.append("calendar_id must be a non-empty string")
+        elif any(_is_control(character) for character in self.calendar_id):
+            problems.append("calendar_id must not contain control characters")
+        problems.extend(_validate_bound("max_events", self.max_events, 1, 50))
+        problems.extend(_validate_bound("max_tasks", self.max_tasks, 1, 50))
+        problems.extend(
+            _validate_bound("max_text_chars", self.max_text_chars, 1, 2000)
+        )
+        if (
+            isinstance(self.request_timeout, bool)
+            or not isinstance(self.request_timeout, (int, float))
+            or not 0.0 < float(self.request_timeout) <= 60.0
+        ):
+            problems.append("request_timeout must be between 0 and 60 seconds")
+
+        if problems:
+            raise ConfigError("; ".join(problems))
+        return self
+
+
+@dataclass(frozen=True)
+class CalendarWriteConfig:
+    """Settings for optional Google Calendar event creation (write).
+
+    Creation is **off by default** and **requires** :class:`ToolsConfig`.
+    It uses a *separate* write scope and a *separate* token file from the
+    read-only briefing, and its one-time authorization is user-started
+    (``--calendar-write-auth``), never run on startup. Validation mirrors
+    :class:`BriefingConfig`.
+    """
+
+    enabled: bool = False
+    client_secret_path: str = ""
+    token_path: str = ""
+    calendar_id: str = "primary"
+    request_timeout: float = 10.0
+
+    def validate(self) -> "CalendarWriteConfig":
+        """Check every value and return self, or raise ConfigError."""
+        problems: list[str] = []
+
+        if not isinstance(self.enabled, bool):
+            problems.append("enabled must be a boolean")
+        problems.extend(
+            _validate_optional_path("client_secret_path", self.client_secret_path)
+        )
+        problems.extend(
+            _validate_optional_path("token_path", self.token_path)
+        )
+        if not isinstance(self.calendar_id, str) or not self.calendar_id.strip():
+            problems.append("calendar_id must be a non-empty string")
+        elif any(_is_control(character) for character in self.calendar_id):
+            problems.append("calendar_id must not contain control characters")
+        if (
+            isinstance(self.request_timeout, bool)
+            or not isinstance(self.request_timeout, (int, float))
+            or not 0.0 < float(self.request_timeout) <= 60.0
+        ):
+            problems.append("request_timeout must be between 0 and 60 seconds")
+
+        if problems:
+            raise ConfigError("; ".join(problems))
+        return self

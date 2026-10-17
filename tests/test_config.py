@@ -4,6 +4,7 @@ import unittest
 
 from config import (
     AppsConfig,
+    BriefingConfig,
     ConfigError,
     MediaConfig,
     MemoryConfig,
@@ -236,6 +237,81 @@ class TestMediaConfig(unittest.TestCase):
         # bool is an int subclass, but True/False are never a file count.
         self.assert_invalid(max_scan_files=True)
         self.assert_invalid(max_scan_files=False)
+
+
+class TestBriefingConfig(unittest.TestCase):
+    def test_defaults_are_disabled_and_valid(self):
+        config = BriefingConfig()
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.client_secret_path, "")
+        self.assertEqual(config.token_path, "")
+        self.assertEqual(config.calendar_id, "primary")
+        self.assertIs(config.validate(), config)
+
+    def test_enabled_with_paths_is_valid(self):
+        config = BriefingConfig(
+            enabled=True,
+            client_secret_path="secret.json",
+            token_path="token.json",
+            calendar_id="work",
+        )
+        self.assertIs(config.validate(), config)
+
+    def assert_invalid(self, **overrides):
+        config = BriefingConfig(**overrides)
+        with self.assertRaises(ConfigError):
+            config.validate()
+
+    def test_non_bool_enabled_rejected(self):
+        self.assert_invalid(enabled="yes")
+
+    def test_non_string_paths_rejected(self):
+        self.assert_invalid(client_secret_path=1)
+        self.assert_invalid(token_path=1)
+
+    def test_whitespace_only_paths_rejected(self):
+        self.assert_invalid(client_secret_path="   ")
+        self.assert_invalid(token_path="\t")
+
+    def test_control_characters_in_paths_rejected(self):
+        for value in ("bad\x00dir", "a\nb", "a\x7fb"):
+            with self.subTest(value=value):
+                self.assert_invalid(client_secret_path=value)
+                self.assert_invalid(token_path=value)
+
+    def test_empty_calendar_id_rejected(self):
+        self.assert_invalid(calendar_id="")
+        self.assert_invalid(calendar_id="   ")
+
+    def test_control_characters_in_calendar_id_rejected(self):
+        self.assert_invalid(calendar_id="work\ncal")
+
+    def test_non_integer_limits_rejected(self):
+        for name in ("max_events", "max_tasks", "max_text_chars"):
+            for value in ("10", None, 10.5, True):
+                with self.subTest(name=name, value=value):
+                    self.assert_invalid(**{name: value})
+
+    def test_limits_must_be_in_range(self):
+        self.assert_invalid(max_events=0)
+        self.assert_invalid(max_events=51)
+        self.assert_invalid(max_tasks=0)
+        self.assert_invalid(max_tasks=51)
+        self.assert_invalid(max_text_chars=0)
+        self.assert_invalid(max_text_chars=2001)
+
+    def test_request_timeout_must_be_in_range(self):
+        self.assert_invalid(request_timeout=0)
+        self.assert_invalid(request_timeout=-1.0)
+        self.assert_invalid(request_timeout=61.0)
+        self.assert_invalid(request_timeout=True)
+
+    def test_multiple_problems_reported_together(self):
+        config = BriefingConfig(max_events=0, calendar_id="")
+        with self.assertRaises(ConfigError) as ctx:
+            config.validate()
+        self.assertIn("max_events", str(ctx.exception))
+        self.assertIn("calendar_id", str(ctx.exception))
 
 
 class TestSpeakerVerificationConfig(unittest.TestCase):

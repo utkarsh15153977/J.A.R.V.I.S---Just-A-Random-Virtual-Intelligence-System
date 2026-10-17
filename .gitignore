@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 logs/
 .idea/
+
+# Google credentials for the optional daily briefing and calendar event
+# creation: never commit these.
+client_secret*.json
+token.json
+token_calendar_write.json
+

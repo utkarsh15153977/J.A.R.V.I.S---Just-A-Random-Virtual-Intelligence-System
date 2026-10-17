@@ -22,8 +22,15 @@ of allowlisted applications (Notepad, Calculator) — each launch requires
 a fresh confirmation and the executable comes only from a trusted
 catalog. Jarvis can
 listen, reply out loud, answer those questions, optionally open one of
-those two apps, and stop — nothing more, and nothing dangerous. See
-[docs/roadmap.md](docs/roadmap.md) for the phase plan.
+those two apps, and stop — nothing more, and nothing dangerous. The
+remaining capabilities are opt-in and off by default: read-only web research
+(with a search-provider API key); a read-only **daily briefing** that
+summarises today's Google Calendar events and incomplete Google Tasks behind
+a one-time `--briefing-auth`; and **Google Calendar event creation**, the
+first *write* capability, behind a one-time `--calendar-write-auth` and
+`--calendar-write`, where every event needs a fresh confirmation of its exact
+details before it is written. See [docs/roadmap.md](docs/roadmap.md) for the
+phase plan and [docs/briefing.md](docs/briefing.md) for the Google setup.
 
 ## Requirements
 
@@ -108,6 +115,28 @@ $env:TAVILY_API_KEY = "tvly-your-key"
 # and waits for "play the first one" / "play the second one", or you can
 # say "cancel".
 .\.venv\Scripts\python app.py --tools --media
+
+# Additionally enable the read-only daily briefing (OFF by default;
+# requires --tools AND a one-time --briefing-auth). Say "brief me on
+# today", "what's my schedule today", "what should I prioritize today"
+# or "what are my tasks today" to hear today's Google Calendar events and
+# incomplete Google Tasks, with overdue and due-today items prioritised.
+# It only ever reads; it never changes your calendar or tasks. See
+# docs/briefing.md for the Google Cloud setup.
+.\.venv\Scripts\python app.py --tools --briefing-auth   # once, opens a browser
+.\.venv\Scripts\python app.py --tools --briefing
+
+# Additionally enable creating Google Calendar events by voice (OFF by
+# default; requires --tools AND a one-time --calendar-write-auth). Say
+# "schedule a meeting with bob tomorrow at 3pm for 30 minutes" or "book a
+# dentist appointment on friday at 9am for 45 minutes"; Jarvis restates
+# the exact title, date, start, end and timezone and writes nothing until
+# you confirm. This is Jarvis's first WRITE capability: it uses a separate
+# token and the narrow calendar.events scope, never changes the briefing's
+# read-only token, and only ever adds events you explicitly confirm. See
+# docs/briefing.md for the Google Cloud setup.
+.\.venv\Scripts\python app.py --tools --calendar-write-auth   # once, opens a browser
+.\.venv\Scripts\python app.py --tools --calendar-write
 
 # Opt in to writing full voice transcripts AND the routing outcome
 # (which tool a command matched, or that it was unsupported) to the log
@@ -237,6 +266,28 @@ memory: it is never written to persistent memory, and an unrelated command or
 `media_cancel` clears it. Media permission is independent of the wake word and
 speaker verification. See [docs/safety.md](docs/safety.md) for the full design,
 the limits and the manual test procedure.
+
+Google Calendar event creation is a sixth opt-in capability and Jarvis's first
+**write** action. It is **off by default** and requires **both** `--tools` and
+`--calendar-write` (or `CalendarWriteConfig.enabled`), plus a one-time
+`--calendar-write-auth` that runs the OAuth flow, stores a **separate** write
+token and exits. It adds a single `create_calendar_event` tool that is
+`CONFIRM`: the deterministic parser resolves the title, date, start, duration
+and timezone up front and, if anything is missing or in the past, asks for the
+missing detail instead of guessing. Every creation then restates the exact
+title, date, start, end and timezone and writes nothing until you confirm that
+exact proposal; a consequential change requires a fresh confirmation, and an
+expired, mismatched or reused approval is refused. Conflicts are advisory only
+(a note in the confirmation) and never bypass it, and a free slot is never
+guaranteed. If the write fails ambiguously (a timeout or transport error),
+Jarvis reads the day back and reports whether the event appears rather than
+retrying — it **never** retries automatically, so it cannot create a duplicate.
+The write path uses the narrow `calendar.events` scope and its own token file
+(`token_calendar_write.json`), kept strictly separate from the briefing's
+read-only token; a missing, invalid, expired or under-scoped write credential
+fails closed so creation phrases stay unsupported. See
+[docs/briefing.md](docs/briefing.md) for the Google Cloud setup and
+[docs/safety.md](docs/safety.md) for the confirmation and write design.
 
 By default Jarvis listens immediately (manual/always-listening mode).
 With `--wake-word` it waits in `IDLE` until a wake-word engine reports
@@ -444,6 +495,40 @@ Tests use temporary directories and fake launchers only — no real player or
 library. The suite is now 961 tests (5 skipped; the extra two skips are
 symlink cases Windows declines to create). See section Z.14 of
 [docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md).
+
+Batch 21 adds the opt-in, read-only daily briefing: a provider-independent
+`DailyBriefingService` with injected `CalendarProvider` / `TaskProvider`
+seams, deterministic task priorities (overdue, then due today, then
+upcoming, then undated), conflict detection, bounded spoken output and
+separate handling of partial provider failures; a read-only Google Calendar
+adapter, a read-only Google Tasks adapter and a lazy, user-started OAuth
+helper that never imports the Google libraries or opens a browser at
+startup; the single `daily_briefing` tool, exact router phrases, the
+`--briefing` / `--briefing-auth` flags and `BriefingConfig`. Tests inject
+fake APIs, fake providers and a fixed clock — no Google account,
+credential or network — and pin that a failed source is never reported as
+empty. The suite is now 1084 tests (4 skipped). See section Z.15 of
+[docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md) and
+[docs/briefing.md](docs/briefing.md).
+
+Batch 22 adds safe, opt-in Google Calendar event creation — Jarvis's first
+write capability: a deterministic, timezone-robust request parser
+(`core/calendar_create.py`) that never depends on `tzdata`/`ZoneInfo`
+succeeding; a separate write OAuth helper (`core/google_auth_write.py`) using
+the narrow `calendar.events` scope and its own `token_calendar_write.json`; a
+write adapter (`core/google_calendar_write.py`) kept apart from the read-only
+calendar; the single `create_calendar_event` `CONFIRM` tool
+(`core/calendar_write_tools.py`) with an exact-detail confirmation, an
+advisory-only conflict note and verify-before-reporting (never
+auto-retry) handling of ambiguous writes; creation-intent routing that stays
+distinct from the briefing phrases; the `--calendar-write` /
+`--calendar-write-auth` flags and `CalendarWriteConfig`. Tests inject fake
+write/read APIs, a fake clock and fake approvals — no Google account,
+credential, browser or network — and pin opt-in/disabled-by-default,
+bound confirmation, duplicate prevention, the tz-free domain, and that write
+credentials stay separate from the briefing. The suite is now 1167 tests
+(4 skipped). See [docs/briefing.md](docs/briefing.md) and
+[docs/safety.md](docs/safety.md).
 
 ## Quality checks
 
@@ -704,7 +789,7 @@ are in [docs/voice-troubleshooting.md](docs/voice-troubleshooting.md).
 ```
 Jarvis/
 ├── app.py                 # main entry point (composition root)
-├── config.py              # validated config (VoiceConfig, SpeechConfig, WakeConfig, SpeakerVerificationConfig, ToolsConfig, AppsConfig, ResearchConfig, MemoryConfig, MediaConfig)
+├── config.py              # validated config (VoiceConfig, SpeechConfig, WakeConfig, SpeakerVerificationConfig, ToolsConfig, AppsConfig, ResearchConfig, MemoryConfig, MediaConfig, BriefingConfig, CalendarWriteConfig)
 ├── requirements.txt
 ├── core/
 │   ├── log.py             # shared console + file logging
@@ -718,6 +803,15 @@ Jarvis/
 │   ├── memory_store.py    # local JSON memory store (atomic write, owner-only)
 │   ├── media.py           # safe local media discovery + file launcher
 │   ├── media_tools.py     # media_play / media_select / media_cancel tools
+│   ├── briefing.py        # daily-briefing domain: providers, priority, render
+│   ├── briefing_tools.py  # daily_briefing tool
+│   ├── google_auth.py     # read-only Google OAuth (lazy; user-started only)
+│   ├── google_calendar.py # read-only Google Calendar adapter
+│   ├── google_tasks.py    # read-only Google Tasks adapter
+│   ├── calendar_create.py # calendar-event request domain (deterministic parser)
+│   ├── google_auth_write.py    # write Google OAuth (narrow calendar.events scope)
+│   ├── google_calendar_write.py # Google Calendar write adapter
+│   ├── calendar_write_tools.py # create_calendar_event tool (CONFIRM)
 │   ├── executor.py        # the single guarded execution gate
 │   └── router.py          # text -> structured command (no execution)
 ├── voice/
@@ -748,5 +842,6 @@ Jarvis/
 - [docs/voice-troubleshooting.md](docs/voice-troubleshooting.md) — microphone / wake-word / speech problems
 - [docs/research-evaluation.md](docs/research-evaluation.md) — deterministic answer-quality + routing evaluation
 - [docs/memory.md](docs/memory.md) — persistent memory: design, safety and limits
-- [docs/safety.md](docs/safety.md) — safety model, including local media playback
+- [docs/briefing.md](docs/briefing.md) — daily briefing: Google setup, OAuth, privacy and limits
+- [docs/safety.md](docs/safety.md) — safety model, including local media playback and calendar event creation
 - [docs/roadmap.md](docs/roadmap.md) — phase-by-phase plan and status

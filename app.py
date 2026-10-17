@@ -89,6 +89,8 @@ from typing import Any, Callable, List, Optional
 
 from config import (
     AppsConfig,
+    BriefingConfig,
+    CalendarWriteConfig,
     ConfigError,
     MediaConfig,
     MemoryConfig,
@@ -99,6 +101,7 @@ from config import (
     VoiceConfig,
     WakeConfig,
 )
+from core import google_auth_write
 from core.app_launcher import (
     APP_LAUNCH_INTENTS,
     AppAllowlist,
@@ -108,8 +111,28 @@ from core.app_launcher import (
     build_allowlist,
     register_launch_tool,
 )
+from core.briefing import (
+    TOOL_DAILY_BRIEFING,
+    DailyBriefingService,
+)
+from core.briefing_tools import register_briefing_tool
 from core.builtin_tools import build_builtin_registry
+from core.calendar_create import TOOL_CREATE_CALENDAR_EVENT
+from core.calendar_write_tools import register_calendar_create_tool
 from core.executor import ExecutionResult, ExecutionStatus, ToolExecutor
+from core.google_auth import (
+    DEFAULT_SCOPES,
+    GoogleAuthError,
+    google_libraries_available,
+    load_credentials,
+    run_authorization,
+)
+from core.google_calendar import GoogleCalendarApi, GoogleCalendarProvider
+from core.google_calendar_write import (
+    CalendarWriteProvider,
+    GoogleCalendarWriteApi,
+)
+from core.google_tasks import GoogleTasksApi, GoogleTasksProvider
 from core.log import setup_logging
 from core.media import MediaDiscovery, SubprocessMediaLauncher
 from core.media_tools import (
@@ -211,6 +234,26 @@ _USAGE = (
     "  --media             Enable safe local media playback from approved\n"
     "                      Windows folders. Requires --tools. OFF by\n"
     "                      default; playing files requires confirmation.\n"
+    "  --briefing          Enable the read-only daily briefing: today's\n"
+    "                      Google Calendar events and Google Tasks, with\n"
+    "                      overdue and due-today items prioritised. Requires\n"
+    "                      --tools AND a one-time --briefing-auth. OFF by\n"
+    "                      default; it only ever reads, never changes,\n"
+    "                      your calendar or tasks.\n"
+    "  --briefing-auth     Run the one-time Google authorization for the\n"
+    "                      briefing (opens a browser), store the token and\n"
+    "                      exit. Read-only scopes only; no command is\n"
+    "                      listened for in this mode.\n"
+    "  --calendar-write    Enable creating Google Calendar events by voice.\n"
+    "                      Requires --tools AND a one-time\n"
+    "                      --calendar-write-auth. OFF by default; every\n"
+    "                      creation asks for confirmation of the exact\n"
+    "                      title, date, time and duration before it is made.\n"
+    "  --calendar-write-auth\n"
+    "                      Run the one-time Google authorization for event\n"
+    "                      creation (opens a browser), store a separate\n"
+    "                      write token and exit. The narrow calendar.events\n"
+    "                      scope only; no command is listened for.\n"
     "  --log-transcripts   Write full voice transcripts AND the routing\n"
     "                      outcome (which tool a command matched, or that\n"
     "                      it was unsupported) to the log file. OFF by\n"
@@ -233,6 +276,10 @@ class _Options:
     research: bool = False
     memory: bool = False
     media: bool = False
+    briefing: bool = False
+    briefing_auth: bool = False
+    calendar_write: bool = False
+    calendar_write_auth: bool = False
     log_transcripts: bool = False
     speak: bool = True
     show_help: bool = False
@@ -250,6 +297,10 @@ def _parse_args(argv: List[str]) -> _Options:
         research="--research" in argv,
         memory="--memory" in argv,
         media="--media" in argv,
+        briefing="--briefing" in argv,
+        briefing_auth="--briefing-auth" in argv,
+        calendar_write="--calendar-write" in argv,
+        calendar_write_auth="--calendar-write-auth" in argv,
         log_transcripts="--log-transcripts" in argv,
         speak="--no-speech" not in argv,
         show_help=any(arg in ("-h", "--help") for arg in argv),
@@ -283,6 +334,11 @@ def _build_registry(
     media_discovery: Optional[MediaDiscovery] = None,
     media_session: Optional[MediaSession] = None,
     media_launcher: Optional[SubprocessMediaLauncher] = None,
+    briefing_config: Optional[BriefingConfig] = None,
+    briefing_service: Optional[DailyBriefingService] = None,
+    calendar_write_config: Optional[CalendarWriteConfig] = None,
+    calendar_write_provider: Optional[CalendarWriteProvider] = None,
+    calendar_create_read_provider: Optional[GoogleCalendarProvider] = None,
 ) -> ToolRegistry:
     """Return the registry of approved tools (empty unless enabled).
 
@@ -342,6 +398,24 @@ def _build_registry(
         register_media_tools(
             registry, media_discovery, media_session, media_launcher
         )
+    if (
+        briefing_config is not None
+        and briefing_config.enabled
+        and briefing_service is not None
+    ):
+        register_briefing_tool(registry, briefing_service)
+    if (
+        calendar_write_config is not None
+        and calendar_write_config.enabled
+        and calendar_write_provider is not None
+    ):
+        register_calendar_create_tool(
+            registry,
+            calendar_write_provider,
+            read_provider=calendar_create_read_provider,
+            clock=clock,
+            timeout=calendar_write_config.request_timeout + 2.0,
+        )
     return registry
 
 
@@ -362,6 +436,9 @@ def _build_router(
     research_max_query_chars: int = 400,
     memory_tools: Optional[Mapping[str, str]] = None,
     media_tools: Optional[Mapping[str, str]] = None,
+    briefing_tool: Optional[str] = None,
+    calendar_create_tool: Optional[str] = None,
+    calendar_create_clock: Optional[Callable[[], datetime]] = None,
 ) -> Router:
     """Build the deterministic router for the registered tools.
 
@@ -379,6 +456,9 @@ def _build_router(
         research_max_query_chars=research_max_query_chars,
         memory_tools=memory_tools,
         media_tools=media_tools,
+        briefing_tool=briefing_tool,
+        calendar_create_tool=calendar_create_tool,
+        calendar_create_clock=calendar_create_clock,
     )
 
 
@@ -954,6 +1034,211 @@ def _handle_speaker_command(
     )
 
 
+def _run_briefing_auth(config: BriefingConfig, output: Callable[[str], None]) -> int:
+    """Run the one-time read-only Google authorization and exit.
+
+    Never starts the listening loop. Failures are reported without a
+    traceback and without a credential; success says only that a token was
+    stored.
+    """
+    if not google_libraries_available():
+        output(
+            "Google authorization is unavailable: the Google API libraries "
+            "are not installed (pip install -r requirements.txt)."
+        )
+        return EXIT_RUNTIME_ERROR
+    try:
+        run_authorization(
+            client_secret_path=config.client_secret_path,
+            token_path=config.token_path,
+            scopes=DEFAULT_SCOPES,
+        )
+    except GoogleAuthError as exc:
+        output(f"Google authorization failed: {exc.message}.")
+        return EXIT_RUNTIME_ERROR
+    output(
+        "Google authorization complete. The daily briefing can now read "
+        "your calendar and tasks with --tools --briefing."
+    )
+    return EXIT_OK
+
+
+def _build_google_http(credentials: Any, timeout: float) -> Any:
+    """Build an authorized HTTP transport with a bounded request timeout.
+
+    Falls back to the credentials object when the optional transport
+    helper is unavailable; the timeout is best-effort and never fatal.
+    """
+    try:
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+    except Exception:  # pragma: no cover - optional transport
+        return credentials
+    http = httplib2.Http(timeout=max(1.0, float(timeout)))
+    return AuthorizedHttp(credentials, http=http)
+
+
+def _build_google_service(
+    api: str, version: str, credentials: Any, timeout: float
+) -> Any:
+    """Build one Google API service lazily (imports stay inside)."""
+    from googleapiclient.discovery import build
+
+    return build(
+        api,
+        version,
+        http=_build_google_http(credentials, timeout),
+        cache_discovery=False,
+    )
+
+
+def _unavailable_briefing_service(status: Any) -> DailyBriefingService:
+    """A briefing service whose two sources report a fixed status.
+
+    Used when the Google libraries or credentials are unavailable, so the
+    ``daily_briefing`` tool still exists and answers "unavailable" instead
+    of the process refusing to start.
+    """
+    from core.briefing import MockCalendarProvider, MockTaskProvider
+
+    return DailyBriefingService(
+        MockCalendarProvider(error=status),
+        MockTaskProvider(error=status),
+    )
+
+
+def _build_briefing_service(
+    config: BriefingConfig, output: Callable[[str], None]
+) -> DailyBriefingService:
+    """Build the Google-backed briefing service, or an "unavailable" one.
+
+    Never prompts for authorization and never fails the process: a missing
+    library, secret or token produces a service that reports the briefing
+    as unavailable, exactly like research without an API key.
+    """
+    try:
+        credentials = load_credentials(
+            config.client_secret_path,
+            config.token_path,
+            scopes=DEFAULT_SCOPES,
+            allow_interactive=False,
+        )
+    except GoogleAuthError as exc:
+        output(
+            "Daily briefing is enabled but unavailable "
+            f"({exc.message}); run --briefing-auth once. Requests will "
+            "report that it is unavailable."
+        )
+        return _unavailable_briefing_service(exc.status)
+
+    try:
+        calendar_api = GoogleCalendarApi(
+            _build_google_service(
+                "calendar", "v3", credentials, config.request_timeout
+            )
+        )
+        tasks_api = GoogleTasksApi(
+            _build_google_service(
+                "tasks", "v1", credentials, config.request_timeout
+            )
+        )
+    except Exception:
+        output(
+            "Daily briefing is enabled but its Google clients could not be "
+            "created; requests will report that it is unavailable."
+        )
+        from core.briefing import BriefingStatus
+
+        return _unavailable_briefing_service(BriefingStatus.ERROR)
+
+    return DailyBriefingService(
+        GoogleCalendarProvider(
+            calendar_api,
+            calendar_id=config.calendar_id,
+            max_events=config.max_events,
+        ),
+        GoogleTasksProvider(tasks_api, max_tasks=config.max_tasks),
+        max_events=config.max_events,
+        max_tasks=config.max_tasks,
+        max_text_chars=config.max_text_chars,
+    )
+
+
+def _run_calendar_write_auth(
+    config: CalendarWriteConfig, output: Callable[[str], None]
+) -> int:
+    """Run the one-time Google write authorization and exit.
+
+    Never starts the listening loop. Requests the narrow ``calendar.events``
+    scope only and stores a *separate* token from the read-only briefing.
+    Failures are reported without a traceback and without a credential.
+    """
+    if not google_libraries_available():
+        output(
+            "Google authorization is unavailable: the Google API libraries "
+            "are not installed (pip install -r requirements.txt)."
+        )
+        return EXIT_RUNTIME_ERROR
+    try:
+        google_auth_write.run_write_authorization(
+            client_secret_path=config.client_secret_path,
+            token_path=config.token_path,
+            scopes=google_auth_write.DEFAULT_WRITE_SCOPES,
+        )
+    except google_auth_write.GoogleAuthError as exc:
+        output(f"Google authorization failed: {exc.message}.")
+        return EXIT_RUNTIME_ERROR
+    output(
+        "Google authorization complete. Calendar event creation can now be "
+        "used with --tools --calendar-write."
+    )
+    return EXIT_OK
+
+
+def _build_calendar_write_service(
+    config: CalendarWriteConfig, output: Callable[[str], None]
+) -> "tuple[Optional[CalendarWriteProvider], Optional[GoogleCalendarProvider]]":
+    """Build the write provider (and a read provider for conflicts).
+
+    Never prompts for authorization and never fails the process: a missing
+    library, secret or write token yields ``(None, None)`` so no creation
+    tool is registered and creation phrases stay unsupported (fail closed).
+    """
+    try:
+        credentials = google_auth_write.load_write_credentials(
+            config.client_secret_path,
+            config.token_path,
+            scopes=google_auth_write.DEFAULT_WRITE_SCOPES,
+            allow_interactive=False,
+        )
+    except google_auth_write.GoogleAuthError as exc:
+        output(
+            "Calendar event creation is enabled but unavailable "
+            f"({exc.message}); run --calendar-write-auth once. Creation "
+            "requests will not be recognized."
+        )
+        return None, None
+
+    try:
+        service = _build_google_service(
+            "calendar", "v3", credentials, config.request_timeout
+        )
+    except Exception:
+        output(
+            "Calendar event creation is enabled but its Google client could "
+            "not be created; creation requests will not be recognized."
+        )
+        return None, None
+
+    write_provider = CalendarWriteProvider(
+        GoogleCalendarWriteApi(service), calendar_id=config.calendar_id
+    )
+    read_provider = GoogleCalendarProvider(
+        GoogleCalendarApi(service), calendar_id=config.calendar_id
+    )
+    return write_provider, read_provider
+
+
 def main(
     argv: Optional[List[str]] = None,
     *,
@@ -989,6 +1274,11 @@ def main(
     media_discovery: Optional[MediaDiscovery] = None,
     media_session: Optional["MediaSession"] = None,
     media_launcher: Optional[SubprocessMediaLauncher] = None,
+    briefing_config: Optional[BriefingConfig] = None,
+    briefing_service: Optional[DailyBriefingService] = None,
+    calendar_write_config: Optional[CalendarWriteConfig] = None,
+    calendar_write_provider: Optional[CalendarWriteProvider] = None,
+    calendar_create_read_provider: Optional[GoogleCalendarProvider] = None,
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
 ) -> int:
@@ -1071,9 +1361,35 @@ def main(
         if options.media and active_tools.enabled:
             active_media = replace(active_media, enabled=True)
         active_media.validate()
+
+        active_briefing = (
+            briefing_config if briefing_config is not None else BriefingConfig()
+        )
+        if options.briefing and active_tools.enabled:
+            active_briefing = replace(active_briefing, enabled=True)
+        active_briefing.validate()
+
+        active_calendar_write = (
+            calendar_write_config
+            if calendar_write_config is not None
+            else CalendarWriteConfig()
+        )
+        if options.calendar_write and active_tools.enabled:
+            active_calendar_write = replace(active_calendar_write, enabled=True)
+        active_calendar_write.validate()
     except ConfigError as exc:
         output(f"Invalid configuration: {exc}")
         return EXIT_CONFIG_ERROR
+
+    # One-shot Google authorization for the daily briefing. It never starts
+    # the listening loop and never asks for anything but read-only scopes.
+    if options.briefing_auth:
+        return _run_briefing_auth(active_briefing, output)
+
+    # One-shot Google authorization for calendar event creation. It never
+    # starts the listening loop and requests only the narrow write scope.
+    if options.calendar_write_auth:
+        return _run_calendar_write_auth(active_calendar_write, output)
 
     # One-shot speaker administration never starts the listening loop.
     if options.enroll_speaker or options.reset_speaker or (
@@ -1114,6 +1430,14 @@ def main(
     if options.media and not active_tools.enabled:
         output(
             "Media playback requires --tools; keeping it disabled."
+        )
+    if options.briefing and not active_tools.enabled:
+        output(
+            "Daily briefing requires --tools; keeping it disabled."
+        )
+    if options.calendar_write and not active_tools.enabled:
+        output(
+            "Calendar event creation requires --tools; keeping it disabled."
         )
 
     allowlist: Optional[AppAllowlist] = None
@@ -1197,6 +1521,27 @@ def main(
             else:
                 active_media_launcher = SubprocessMediaLauncher()
 
+    active_briefing_service: Optional[DailyBriefingService] = None
+    if active_tools.enabled and active_briefing.enabled:
+        if briefing_service is not None:
+            active_briefing_service = briefing_service
+        else:
+            active_briefing_service = _build_briefing_service(
+                active_briefing, output
+            )
+
+    active_write_provider: Optional[CalendarWriteProvider] = None
+    active_create_read_provider: Optional[GoogleCalendarProvider] = None
+    if active_tools.enabled and active_calendar_write.enabled:
+        if calendar_write_provider is not None:
+            active_write_provider = calendar_write_provider
+            active_create_read_provider = calendar_create_read_provider
+        else:
+            (
+                active_write_provider,
+                active_create_read_provider,
+            ) = _build_calendar_write_service(active_calendar_write, output)
+
     registry = _build_registry(
         active_tools,
         clock,
@@ -1219,6 +1564,11 @@ def main(
         media_launcher=(
             active_media_launcher if active_media_session is not None else None
         ),
+        briefing_config=active_briefing,
+        briefing_service=active_briefing_service,
+        calendar_write_config=active_calendar_write,
+        calendar_write_provider=active_write_provider,
+        calendar_create_read_provider=active_create_read_provider,
     )
     memory_tools: Optional[Mapping[str, str]] = None
     if active_memory_service is not None:
@@ -1238,12 +1588,23 @@ def main(
         research_tool = (
             TOOL_WEB_RESEARCH if TOOL_WEB_RESEARCH in registry else None
         )
+        briefing_tool = (
+            TOOL_DAILY_BRIEFING if TOOL_DAILY_BRIEFING in registry else None
+        )
+        calendar_create_tool = (
+            TOOL_CREATE_CALENDAR_EVENT
+            if TOOL_CREATE_CALENDAR_EVENT in registry
+            else None
+        )
         router = _build_router(
             registry,
             research_tool=research_tool,
             research_max_query_chars=active_research.max_query_chars,
             memory_tools=memory_tools,
             media_tools=media_tools,
+            briefing_tool=briefing_tool,
+            calendar_create_tool=calendar_create_tool,
+            calendar_create_clock=clock,
         )
     if executor is None:
         executor = _build_executor(registry)
@@ -1313,6 +1674,19 @@ def main(
                 "Persistent memory is ON. Say 'remember that ...' to save a "
                 "memory and 'list my memories' to review them; deleting or "
                 "clearing memories asks for confirmation."
+            )
+
+        if active_briefing_service is not None:
+            output(
+                "Daily briefing is ON. Say 'what's my schedule today' or "
+                "'brief me on today' for today's calendar events and tasks."
+            )
+
+        if active_write_provider is not None:
+            output(
+                "Calendar event creation is ON. Say 'schedule a meeting "
+                "tomorrow at 3pm for an hour' and confirm the details before "
+                "it is created."
             )
 
         try:
