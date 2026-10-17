@@ -1,9 +1,11 @@
 """Tests for the Google OAuth helper used by calendar event creation.
 
-The optional Google libraries are not installed in the test environment and
-must never be needed: these tests patch the lazy imports with tiny fakes and
-assert the categorised, credential-free failure behaviour. No network call is
-ever made. The write path must stay strictly separate from the read-only
+The optional Google libraries must never be needed: these tests simulate
+their presence and absence deterministically (tiny fakes installed in
+``sys.modules``, or a ``None`` entry that makes the lazy ``import`` fail), so
+the suite passes whether or not the real packages are installed, and asserts
+the categorised, credential-free failure behaviour. No network call is ever
+made. The write path must stay strictly separate from the read-only
 briefing: a different scope and a different token file.
 """
 
@@ -91,6 +93,7 @@ def _install_fake_google():
     flow = module("google_auth_oauthlib.flow")
     flow.InstalledAppFlow = FakeFlow
     module("google_auth_oauthlib")
+    module("googleapiclient")
     module("googleapiclient.discovery")
 
     google.auth = auth
@@ -151,6 +154,27 @@ class TestScopeSeparation(unittest.TestCase):
         self.assertNotIn(CALENDAR_WRITE_SCOPE, DEFAULT_SCOPES)
 
 
+def _hidden_google_modules():
+    """Make every optional Google import fail, deterministically.
+
+    A ``None`` entry in ``sys.modules`` makes ``import`` raise, so the
+    availability check can be exercised without depending on whether the
+    libraries happen to be installed on the host.
+    """
+    return dict.fromkeys(
+        (
+            "google",
+            "google.auth",
+            "google.oauth2",
+            "google.oauth2.credentials",
+            "google_auth_oauthlib",
+            "google_auth_oauthlib.flow",
+            "googleapiclient",
+            "googleapiclient.discovery",
+        )
+    )
+
+
 class TestLibrariesMissing(unittest.TestCase):
     def test_missing_libraries_report_unavailable(self):
         with mock.patch(
@@ -162,8 +186,19 @@ class TestLibrariesMissing(unittest.TestCase):
         self.assertIs(ctx.exception.status, BriefingStatus.UNAVAILABLE)
         self.assertIn("not installed", ctx.exception.message)
 
-    def test_google_libraries_available_is_false_here(self):
-        self.assertFalse(google_libraries_available())
+
+class TestLibrariesAvailability(unittest.TestCase):
+    """The availability check itself, independent of the host environment."""
+
+    def test_returns_false_when_libraries_missing(self):
+        with mock.patch.dict(sys.modules, _hidden_google_modules()):
+            self.assertFalse(google_libraries_available())
+
+    def test_returns_true_when_libraries_present(self):
+        # The fake package tree satisfies the lazy imports, so the real check
+        # reports availability without any real dependency.
+        with mock.patch.dict(sys.modules, _install_fake_google()):
+            self.assertTrue(google_libraries_available())
 
 
 class TestLoadWriteCredentials(GoogleWriteAuthTestCase):
