@@ -1127,6 +1127,58 @@ class TestBriefingMainIntegration(unittest.TestCase):
         self.assertNotIn("created", joined)
         self.assertIn("standup", joined)
 
+    def test_both_schedule_phrases_reach_the_speech_output(self):
+        """Batch 26: the reply reaches ``speaker.speak()``, not just stdout.
+
+        Pins the transcript -> route -> executor -> *speech* leg for the two
+        phrases validated against the live pipeline, so a change that stops
+        passing the reply to the speaker is caught here.
+        """
+        from app import EXIT_OK, main
+
+        speaker = _FakeSpeaker()
+        output = []
+        code = main(
+            ["--tools", "--briefing"],
+            listener_factory=lambda config: _FakeListener(
+                [
+                    "what's my schedule today?",
+                    "what's next?",
+                    "exit",
+                ]
+            ),
+            speaker_factory=lambda config: speaker,
+            output=output.append,
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=self._service(),
+        )
+        self.assertEqual(code, EXIT_OK)
+
+        briefing_replies = [
+            s for s in speaker.spoken if "Here is your briefing for" in s
+        ]
+        self.assertEqual(
+            len(briefing_replies), 1, f"expected one briefing, got {speaker.spoken}"
+        )
+        self.assertIn("standup", briefing_replies[0])
+        self.assertIn("pay bill", briefing_replies[0])
+
+        next_replies = [
+            s
+            for s in speaker.spoken
+            if s.startswith("Your next meeting is")
+            and "Here is your briefing" not in s
+        ]
+        self.assertEqual(len(next_replies), 1, f"got {speaker.spoken}")
+        self.assertIn("standup", next_replies[0])
+
+        # Everything spoken is developer-authored reply text, never a raw
+        # dict, transcript or tool argument.
+        for spoken in speaker.spoken:
+            self.assertIsInstance(spoken, str)
+            self.assertNotIn("what's my schedule", spoken.lower())
+            self.assertNotIn("what's next", spoken.lower())
+
     def test_no_oauth_flow_during_a_normal_run(self):
         from unittest import mock
 

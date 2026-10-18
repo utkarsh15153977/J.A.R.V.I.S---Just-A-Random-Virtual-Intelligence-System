@@ -1176,12 +1176,62 @@ Verification: **1241 tests OK (5 skipped)**, `ruff check` clean,
 **40/40** PASS (19 research + 21 routing cases, confirmed rather than
 assumed). **Live voice was not performed**: no microphone, wake-word model
 or speech output was exercised, so real speech recognition for the two
-schedule phrases remains unverified. **No live Google write, application
+schedule phrases remains unverified (Batch 26 closes that gap for the
+audio and Whisper stages). **No live Google write, application
 launch or OAuth flow was performed**; everything runs against fake
 providers, a fake write API, a fake clock and a fake listener/speaker.
 Platform coverage is **Windows only** - the shell commands, the
 `%LOCALAPPDATA%` credential path and the app-launch catalog are
 Windows-specific and were not validated on Linux or macOS.
+
+## Batch 26 note (live voice workflow validation)
+
+Batch 26 adds **no production code**. It validates the two read-only
+schedule requests, "What's my schedule today?" and "What's next?", against
+the real Windows voice stack, and adds one regression test for the leg
+Batch 25 left uncovered. No defect was found.
+
+**What was exercised against real Windows software.** Audio input devices
+were enumerated (10, Realtek Audio) and the microphone was opened and
+captured for 0.1 s at 16 kHz int16. The real `faster-whisper` `base`/`int8`
+model was loaded from the local HuggingFace cache (no download) and
+transcribed both phrases **verbatim** with `TranscriptionStatus.HEARD`.
+The real router then selected `daily_briefing` (no arguments) for the first
+phrase and `what_next` (`{'when': 'next'}`) for the second. Both ran
+through the real guarded `ToolExecutor` with `status=ok` and needed no
+approval. The real `pyttsx3`/SAPI5 engine initialised (Microsoft David),
+and `Speaker.speak` was invoked four times through the real `main()` loop
+with the engine confirmed live during every utterance; `main()` then
+released the listener, the speaker and the engine. A live Google read with
+the existing read-only token reported `calendar_status=OK` /
+`task_status=OK` and zero events and tasks, and was read-only.
+
+**The audio source, stated plainly.** A human was not present, so the two
+phrases could not be spoken into the microphone. They were rendered by the
+real SAPI5 engine to a 16 kHz WAV and fed through the real Whisper model
+and the real router/executor/speaker. This validates the genuine
+speech-audio → text → intent → tool → reply chain on real audio of the
+exact phrases; it does not validate recognition of a human voice, accent
+or microphone. The microphone itself was verified separately for open and
+capture. **Speech audibility is NOT VERIFIED** - no human was present to
+hear it - and **human speech through the microphone is NOT VERIFIED**.
+Full evidence is in `docs/voice-smoke-test.md`.
+
+**Test coverage added.** `test_both_schedule_phrases_reach_the_speech_output`
+pins the transcript → route → executor → **speech** leg for both phrases
+through `main()`, asserting the speaker receives the briefing and the
+next-meeting reply as plain `str` (never a raw dict, transcript or tool
+argument). The other six Batch 26 coverage requirements were already met:
+schedule and `what's next` transcripts reaching their tools, provider
+errors never reported as an empty schedule (for both tools), write and
+launch paths unreachable, unavailable dependencies failing safe, and
+shutdown releasing resources after normal and interrupted sessions.
+
+Verification: **1242 tests OK (5 skipped)**, `ruff check` clean,
+`compileall` clean, `pip check` clean, the offline evaluation suite
+**40/40** PASS. **No calendar event or task was created, modified or
+deleted, no application was launched, and no OAuth flow was run.** Platform
+coverage remains **Windows only**.
 
 ## Recommended next batches
 

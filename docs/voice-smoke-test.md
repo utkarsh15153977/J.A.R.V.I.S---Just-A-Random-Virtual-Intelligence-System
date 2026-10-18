@@ -147,3 +147,58 @@ shutdown; `tests/test_audio_errors.py`, `tests/test_listener.py` and
 | 18 | Empty / unclear speech | NOT RUN | |
 | 19 | Exactly-once execution | NOT RUN | |
 | 20 | Clean shutdown | NOT RUN | |
+
+## Batch 26 live validation (schedule queries)
+
+Batch 26 ran a narrowly scoped live validation of the two read-only
+schedule requests, "What's my schedule today?" and "What's next?". The
+result log above is untouched — those items cover wake-word, verification
+and error-injection scenarios that were **not** part of this batch.
+
+### Components exercised against real Windows software
+
+| Stage | Component | Result |
+|---|---|---|
+| Audio input devices | `sounddevice` / PortAudio | PASS — 10 input devices enumerated (Realtek Audio default) |
+| Microphone open + capture | `sd.InputStream` @ 16 kHz int16 | PASS — 0.1 s captured, peak 8769, no overflow |
+| Whisper model | `faster-whisper` `base` / `int8` / CPU | PASS — loaded from the local HuggingFace cache, no download |
+| Whisper transcription | `Listener.transcribe_result` | PASS — both phrases returned verbatim, `TranscriptionStatus.HEARD` |
+| Transcript normalisation | `core.router._normalize_phrase` + `_strip_lead_ins` | PASS — routed correctly |
+| Intent routing | `PlaceholderRouter.route` | PASS — see tool names below |
+| Guarded execution | `ToolExecutor` (read-only registry) | PASS — `status=ok`, no approval needed |
+| Reply formatting | `app._describe_result` | PASS — plain `str`, never a raw dict or transcript |
+| Speech engine init | `pyttsx3` / SAPI5 (Microsoft David) | PASS — 2 voices enumerated |
+| Speech invoked | `Speaker.speak` via `main()` | PASS — engine live during all 4 utterances |
+| **Speech audibility** | human observer | **NOT VERIFIED** — no human was present to hear it |
+| **Human voice through the mic** | — | **NOT VERIFIED** — no human was present |
+| Live Google read | `_build_briefing_service` | PASS — `calendar_status=OK`, `task_status=OK`, 0 events / 0 tasks, read-only |
+
+### Routing result for the two phrases
+
+| Phrase | Router tool | Arguments |
+|---|---|---|
+| "What's my schedule today?" | `daily_briefing` | `{}` |
+| "What's next?" | `what_next` | `{'when': 'next'}` |
+
+### How the audio was produced — read this before reusing the result
+
+A human was not present, so the two phrases could not be spoken into the
+microphone. Instead they were **rendered by the real SAPI5 engine**
+(`pyttsx3.save_to_file` → 16 kHz mono WAV) and fed through the **real
+`faster-whisper` model** and the **real** router, executor and speaker.
+This validates the full speech-audio → text → intent → tool → reply chain
+on genuine audio of the exact phrases; it does **not** validate recognition
+of a particular human voice, accent or microphone. The microphone itself
+was exercised separately for open and capture (the table above), which is
+the strongest evidence available without a human operator.
+
+No temporary instrumentation was left in the tree, no transcript logging
+was enabled, and the standard suite stays fully offline.
+
+### Safety
+
+No calendar event or task was created, modified or deleted; no
+application was launched; no OAuth flow was run. The live Google path used
+the existing read-only token for a single `events.list` / `tasks.list`
+read and reported only counts. Calendar-write and application-launch flags
+were **not** passed in any live run.

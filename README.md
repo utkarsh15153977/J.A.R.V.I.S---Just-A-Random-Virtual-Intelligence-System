@@ -580,6 +580,21 @@ word, speech output) was not exercised, no live Google write, application
 launch or OAuth flow was performed, and coverage is Windows-only. See
 [docs/roadmap.md](docs/roadmap.md).
 
+Batch 26 validates the two read-only schedule requests against the real
+Windows voice stack and adds no new capability. On this machine the
+microphone enumerated and captured, the real `faster-whisper` `base` model
+transcribed "What's my schedule today?" and "What's next?" **verbatim**, the
+real router selected `daily_briefing` and `what_next` respectively, both ran
+through the guarded executor, and the real SAPI5 engine was confirmed live
+during every spoken reply. Because no human was present, the phrases were
+rendered by the real SAPI5 engine rather than spoken into the microphone, and
+**speech audibility was not verified** - the microphone itself was exercised
+separately for open and capture. A live Google read used the existing
+read-only token and created, modified and deleted nothing. The suite is now
+1242 tests (5 skipped). See
+[docs/voice-smoke-test.md](docs/voice-smoke-test.md) and
+[docs/roadmap.md](docs/roadmap.md).
+
 ## Quality checks
 
 Linting is configured with [Ruff](https://docs.astral.sh/ruff/) in
