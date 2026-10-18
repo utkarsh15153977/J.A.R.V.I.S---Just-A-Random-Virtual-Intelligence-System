@@ -1134,6 +1134,55 @@ continues; with a stored read-only token the startup briefing performed
 one live `events.list` / `tasks.list` read, spoke today's (empty) result
 once before the listening loop, and created nothing.
 
+## Batch 25 note (stabilization and daily-workflow readiness)
+
+Batch 25 changes **no production code**. It is a stabilization pass: the
+daily-assistant features from Batches 21-24 (briefing, "what's next?",
+startup briefing, calendar event creation) were exercised together and the
+gaps that turned up were **test-coverage gaps, not defects** - every
+behaviour probed was already correct, so the batch adds deterministic
+regression tests around the properties that were previously only implied.
+
+- **Startup briefing, exactly once.** `TestStartupBriefing` now drives
+  several listener iterations (`what's next?`, `what's my schedule today?`,
+  `brief me on today`) and asserts the executor call list is exactly
+  `[daily_briefing, what_next, daily_briefing, daily_briefing]`: one
+  leading startup delivery, then one call per manual query, with no
+  briefing repeated inside the listening loop.
+- **Write and launch tools cannot be reached from startup.** With
+  `launch_application` *and* `create_calendar_event` both registered, the
+  startup briefing still runs only `daily_briefing`, writes nothing, and
+  the approval provider is a stub that **raises** if any confirmation is
+  minted - so "no confirmation" is proven on the approval seam, not by
+  string-matching. Two further tests pin that `--startup-briefing` alone
+  registers neither a write nor a launch tool.
+- **Schedule and creation stay separated.** `TestScheduleAndCreationSeparation`
+  registers all three tools at once and shows every schedule phrase stays
+  on `daily_briefing` / `what_next` (carrying only the bounded `when`
+  argument) while "schedule a meeting with bob tomorrow at 3pm for 30
+  minutes" still reaches `create_calendar_event` and "add a meeting
+  tomorrow at 3pm" is still not hijacked by the tomorrow schedule phrase.
+  "What's my schedule today?" is now covered end to end through `main`.
+- **Shutdown.** Every supported exit word (`exit`, `quit`, `stop`,
+  `goodbye`, `shut down`), with or without punctuation, is now driven
+  end to end through `main` and asserted to return `EXIT_OK`, print
+  "Goodbye." and close the listener. A new test asserts that **no worker
+  thread survives shutdown**: the briefing runs on the executor's worker
+  thread, and `threading.enumerate()` is compared before and after a full
+  startup-briefing session.
+
+Verification: **1241 tests OK (5 skipped)**, `ruff check` clean,
+`compileall` clean, `pip check` clean, the offline evaluation suite
+**40/40** PASS (19 research + 21 routing cases, confirmed rather than
+assumed). **Live voice was not performed**: no microphone, wake-word model
+or speech output was exercised, so real speech recognition for the two
+schedule phrases remains unverified. **No live Google write, application
+launch or OAuth flow was performed**; everything runs against fake
+providers, a fake write API, a fake clock and a fake listener/speaker.
+Platform coverage is **Windows only** - the shell commands, the
+`%LOCALAPPDATA%` credential path and the app-launch catalog are
+Windows-specific and were not validated on Linux or macOS.
+
 ## Recommended next batches
 
 Ordered by user value against risk; each keeps the Batch 9 permission

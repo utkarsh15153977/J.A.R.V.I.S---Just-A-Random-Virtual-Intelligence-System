@@ -353,6 +353,41 @@ class TestStartupAndShutdown(unittest.TestCase):
         self.assertTrue(any("Jarvis is ready" in line for line in output))
         self.assertTrue(any("Goodbye" in line for line in output))
 
+    def test_every_supported_exit_word_terminates_the_session(self):
+        """Batch 25: exit/quit/stop/goodbye/shutdown all end cleanly."""
+        for word in ("exit", "quit", "stop", "goodbye", "shut down"):
+            with self.subTest(word=word):
+                code, output, listener, _ = run_main(
+                    texts=[word], config=VoiceConfig()
+                )
+                self.assertEqual(code, EXIT_OK)
+                self.assertTrue(listener.closed)
+                self.assertTrue(
+                    any("Goodbye" in line for line in output)
+                )
+
+    def test_exit_word_with_punctuation_still_terminates(self):
+        for word in ("stop.", "Quit!", "SHUT DOWN"):
+            with self.subTest(word=word):
+                code, output, listener, _ = run_main(
+                    texts=[word], config=VoiceConfig()
+                )
+                self.assertEqual(code, EXIT_OK)
+                self.assertTrue(listener.closed)
+                self.assertTrue(
+                    any("Goodbye" in line for line in output)
+                )
+
+    def test_a_non_exit_command_does_not_end_the_session(self):
+        code, output, listener, _ = run_main(
+            texts=["open youtube", "exit"], config=VoiceConfig()
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(listener.closed)
+        self.assertFalse(
+            any("Goodbye" in line for line in output[:-1])
+        )
+
     def test_keyboard_interrupt_during_transcribe_exits_zero(self):
         listener = FakeListener(on_transcribe=lambda: KeyboardInterrupt())
         code, output, _, _ = run_main(

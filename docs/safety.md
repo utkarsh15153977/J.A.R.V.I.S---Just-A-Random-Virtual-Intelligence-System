@@ -815,7 +815,15 @@ no new capability and no new data path.
   other tool. It is fully separate from the `create_calendar_event` `CONFIRM`
   path.
 - **At most once.** It runs on the linear startup path, never inside the
-  listening loop, so it cannot repeat or spam.
+  listening loop, so it cannot repeat or spam. Batch 25 pins this explicitly
+  with several listener iterations: the executor call list is exactly one
+  leading `daily_briefing`, then one call per manual query.
+- **Write and launch tools cannot be reached from startup.** Batch 25
+  registers `launch_application` *and* `create_calendar_event` alongside the
+  startup briefing and asserts the briefing still runs only `daily_briefing`,
+  writes nothing, and mints no confirmation — the approval provider in that
+  test raises if it is ever asked, so "no approval" is proven on the approval
+  seam rather than by matching strings.
 - **Fails safe.** If the briefing is unavailable it says so; a failed source
   is reported as failed, never as empty. If delivery itself fails, Jarvis
   logs a warning (no traceback, no credential, no tool arguments) and
@@ -828,7 +836,8 @@ no new capability and no new data path.
 **Testing.** The `TestStartupBriefing` block in `tests/test_briefing.py`
 covers off-by-default, missing prerequisites, exactly-once delivery through a
 recording executor, empty/failed/partial sources, speaker failure,
-failure-continues and the preserved Batch 23 manual queries, all offline with
+failure-continues, resource cleanup, the absence of leftover worker threads
+after shutdown, and the preserved Batch 23 manual queries, all offline with
 fake providers and a fixed clock.
 
 ## Calendar event creation (Batch 22)
@@ -900,7 +909,12 @@ ambiguous-outcome paths, duplicate prevention, the advisory conflict note,
 routing separation from the briefing, scope separation and the `main`
 opt-in/disabled-by-default paths — entirely with injected fake write/read
 APIs, a fixed clock and fake approvals. No Google account, credential,
-browser or network is used. See
+browser or network is used. Batch 25 adds
+`TestScheduleAndCreationSeparation`, which registers all three tools at once
+and proves that schedule phrases stay on `daily_briefing`/`what_next`
+(only the bounded `when` argument) while a creation phrase still reaches
+`create_calendar_event` and a "add a meeting tomorrow at 3pm" phrasing is
+not hijacked by the tomorrow schedule phrase. See
 [docs/briefing.md](briefing.md#calendar-event-creation-opt-in-write) for
 setup and privacy details.
 
@@ -1206,6 +1220,12 @@ Batch 8 adds: end-to-end unknown-tool, malformed-argument and
 permission-denial paths never run a handler and never echo input; a
 router that returns a non-`CommandRequest` is handled without crashing;
 and disk/battery phrases only resolve when those tools are registered.
+Batch 25 adds: every supported exit word (`exit`, `quit`, `stop`,
+`goodbye`, `shut down`), with or without punctuation, is driven end to end
+through `main` and asserted to return `EXIT_OK`, print "Goodbye." and close
+the listener; a non-exit command does not end the session; and a full
+startup-briefing session leaves **no worker thread** running afterwards
+(`threading.enumerate()` compared before and after).
 
 `tests/test_listener.py` — transcript joining, manual-test shutdown
 paths, Whisper import/construction failure → `ModelLoadError`, safe and

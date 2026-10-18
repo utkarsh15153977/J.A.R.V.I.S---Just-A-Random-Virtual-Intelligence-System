@@ -562,9 +562,22 @@ starts, before waiting for a command. It adds no new engine: it reuses
 briefing through the already-registered read-only `daily_briefing` tool and
 the guarded `ToolExecutor` (no handler is called directly). It never writes,
 never launches anything, runs at most once, and a failure is logged safely
-and does not stop the session; with the flag off, startup is unchanged. The
-suite is now 1226 tests (5 skipped). See
+and does not stop the session; with the flag off, startup is unchanged. See
 [docs/briefing.md](docs/briefing.md), [docs/safety.md](docs/safety.md) and
+[docs/roadmap.md](docs/roadmap.md).
+
+Batch 25 adds no new capability; it is a stabilization pass over the
+daily-assistant features above. It pins, with deterministic regression
+tests, the properties that were previously only implied: the startup
+briefing is delivered **exactly once** before the listening loop (and never
+repeated per turn), it is unreachable from the write/launch tools even when
+those are registered, "what's my schedule today?" stays a read-only
+`daily_briefing` query and can never route to event creation, every exit
+word (`exit`/`quit`/`stop`/`goodbye`/`shut down`) shuts down cleanly, and
+no worker thread survives shutdown. The suite is now 1241 tests (5 skipped)
+and the offline evaluation suite is 40/40. Live voice (microphone, wake
+word, speech output) was not exercised, no live Google write, application
+launch or OAuth flow was performed, and coverage is Windows-only. See
 [docs/roadmap.md](docs/roadmap.md).
 
 ## Quality checks

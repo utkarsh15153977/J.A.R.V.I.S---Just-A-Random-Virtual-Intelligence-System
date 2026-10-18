@@ -10,7 +10,14 @@ tests.
 import unittest
 from datetime import date, datetime
 
-from config import BriefingConfig, ToolsConfig
+from config import (
+    AppsConfig,
+    BriefingConfig,
+    CalendarWriteConfig,
+    ToolsConfig,
+    VoiceConfig,
+)
+from core.app_launcher import TOOL_LAUNCH_APPLICATION, build_allowlist
 from core.briefing import (
     MAX_TEXT_CHARS,
     TOOL_DAILY_BRIEFING,
@@ -31,7 +38,9 @@ from core.briefing import (
     task_priority,
 )
 from core.briefing_tools import build_briefing_spec, build_what_next_spec
+from core.calendar_create import TOOL_CREATE_CALENDAR_EVENT
 from core.executor import ToolExecutor
+from core.google_calendar_write import CalendarWriteProvider
 from core.permissions import (
     ConsoleApprovalProvider,
     PermissionLevel,
@@ -1080,6 +1089,44 @@ class TestBriefingMainIntegration(unittest.TestCase):
         self.assertNotIn("confirm", joined)
         self.assertIn("standup", joined)
 
+    def test_schedule_today_phrase_runs_through_the_executor(self):
+        """"What's my schedule today?" is the argumentless daily briefing."""
+        from app import EXIT_OK
+
+        code, output = self._run(
+            ["--tools", "--briefing"],
+            ["what's my schedule today?", "exit"],
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=self._service(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Here is your briefing for", joined)
+        self.assertIn("standup", joined)
+        self.assertIn("pay bill", joined)
+        self.assertNotIn("confirm", joined.lower())
+
+    def test_schedule_phrases_stay_read_only_with_no_write_tool(self):
+        """A schedule question never reaches a creation tool."""
+        from app import EXIT_OK
+
+        code, output = self._run(
+            ["--tools", "--briefing"],
+            [
+                "what's next?",
+                "what's my schedule today?",
+                "do I have any meetings today?",
+                "exit",
+            ],
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=self._service(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output).lower()
+        self.assertNotIn("confirm", joined)
+        self.assertNotIn("created", joined)
+        self.assertIn("standup", joined)
+
     def test_no_oauth_flow_during_a_normal_run(self):
         from unittest import mock
 
@@ -1186,6 +1233,19 @@ class _RecordingExecutor(ToolExecutor):
     def execute(self, name, raw_args=None):
         self.calls.append(name)
         return super().execute(name, raw_args)
+
+
+class _FakeWriteApi:
+    """A calendar write API stand-in that records every insert."""
+
+    def __init__(self):
+        self.calls = []
+
+    def insert_event(self, *, calendar_id, event_resource):
+        self.calls.append(
+            {"calendar_id": calendar_id, "event_resource": dict(event_resource)}
+        )
+        return {"id": "evt-1", "summary": event_resource.get("summary")}
 
 
 class TestStartupBriefing(unittest.TestCase):
@@ -1541,6 +1601,169 @@ class TestStartupBriefing(unittest.TestCase):
         joined = "\n".join(output)
         self.assertIn("Your next meeting is standup", joined)
         self.assertGreaterEqual(joined.count("standup"), 2)
+
+    # -- Batch 25: exactly-once and write/launch separation --------------
+    def test_not_repeated_across_listener_iterations(self):
+        """The briefing is delivered once, before the loop - never per turn."""
+        from app import EXIT_OK, _build_registry
+
+        service = self._service()
+        registry = _build_registry(
+            ToolsConfig(enabled=True),
+            None,
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=service,
+        )
+        executor = _RecordingExecutor(
+            registry, PermissionPolicy(), ConsoleApprovalProvider()
+        )
+        code, _output, _ = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            [
+                "what's next?",
+                "what's my schedule today?",
+                "brief me on today",
+                "exit",
+            ],
+            service,
+            executor=executor,
+        )
+        self.assertEqual(code, EXIT_OK)
+        # Exactly one leading daily_briefing (the startup delivery), then
+        # one call per manual query in order - no briefing is repeated.
+        self.assertEqual(
+            executor.calls,
+            [
+                TOOL_DAILY_BRIEFING,
+                TOOL_WHAT_NEXT,
+                TOOL_DAILY_BRIEFING,
+                TOOL_DAILY_BRIEFING,
+            ],
+        )
+
+    def test_never_invokes_write_or_launch_tools_when_registered(self):
+        """Even with every optional tool present, only the briefing runs."""
+        from app import EXIT_OK, _build_registry
+
+        class _NoApproval:
+            """Fails the test if any confirmation is ever requested."""
+
+            def request(self, request):
+                raise AssertionError(
+                    f"unexpected approval requested for {request.tool_name}"
+                )
+
+        service = self._service()
+        allowlist = build_allowlist(["notepad"])
+        write_api = _FakeWriteApi()
+        registry = _build_registry(
+            ToolsConfig(enabled=True),
+            None,
+            apps_config=AppsConfig(enabled=True),
+            allowlist=allowlist,
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=service,
+            calendar_write_config=CalendarWriteConfig(enabled=True),
+            calendar_write_provider=CalendarWriteProvider(write_api),
+        )
+        self.assertIn(TOOL_LAUNCH_APPLICATION, registry.names())
+        self.assertIn(TOOL_CREATE_CALENDAR_EVENT, registry.names())
+
+        executor = _RecordingExecutor(
+            registry, PermissionPolicy(), _NoApproval()
+        )
+        code, _output, _ = self._run(
+            [
+                "--tools",
+                "--briefing",
+                "--startup-briefing",
+                "--allow-apps",
+                "--calendar-write",
+            ],
+            ["exit"],
+            service,
+            executor=executor,
+            apps_config=AppsConfig(enabled=True),
+            app_allowlist=allowlist,
+            calendar_write_config=CalendarWriteConfig(enabled=True),
+            calendar_write_provider=CalendarWriteProvider(write_api),
+        )
+        self.assertEqual(code, EXIT_OK)
+        # Exactly one tool ran - the read-only briefing. Nothing launched,
+        # nothing was written, and no confirmation was ever minted (the
+        # approval provider above raises if it is asked).
+        self.assertEqual(executor.calls, [TOOL_DAILY_BRIEFING])
+        self.assertEqual(write_api.calls, [])
+
+    def test_startup_briefing_does_not_enable_calendar_writes(self):
+        """The flag alone registers no write or launch tool at all."""
+        from app import _build_registry
+
+        registry = _build_registry(
+            ToolsConfig(enabled=True),
+            None,
+            briefing_config=BriefingConfig(startup_briefing=True),
+        )
+        self.assertNotIn(TOOL_DAILY_BRIEFING, registry.names())
+        self.assertNotIn(TOOL_CREATE_CALENDAR_EVENT, registry.names())
+        self.assertNotIn(TOOL_LAUNCH_APPLICATION, registry.names())
+
+    def test_briefing_plus_startup_still_registers_no_write_tool(self):
+        from app import _build_registry
+
+        registry = _build_registry(
+            ToolsConfig(enabled=True),
+            None,
+            briefing_config=BriefingConfig(
+                enabled=True, startup_briefing=True
+            ),
+            briefing_service=self._service(),
+        )
+        self.assertIn(TOOL_DAILY_BRIEFING, registry.names())
+        self.assertNotIn(TOOL_CREATE_CALENDAR_EVENT, registry.names())
+        self.assertNotIn(TOOL_LAUNCH_APPLICATION, registry.names())
+
+    def test_resources_are_closed_after_a_startup_briefing_session(self):
+        from app import EXIT_OK, main
+
+        listener = _FakeListener(["exit"])
+        output = []
+        code = main(
+            ["--tools", "--briefing", "--startup-briefing"],
+            listener_factory=lambda config: listener,
+            speaker_factory=lambda config: _FakeSpeaker(),
+            output=output.append,
+            briefing_service=self._service(),
+            config=VoiceConfig(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(listener.closed)
+        self.assertIn("standup", "\n".join(output))
+
+    def test_no_worker_thread_is_left_running_after_shutdown(self):
+        """The briefing runs on a worker thread; none may survive exit."""
+        import threading
+
+        from app import EXIT_OK, main
+
+        before = {t.name for t in threading.enumerate()}
+        code = main(
+            ["--tools", "--briefing", "--startup-briefing"],
+            listener_factory=lambda config: _FakeListener(
+                ["what's next?", "exit"]
+            ),
+            speaker_factory=lambda config: _FakeSpeaker(),
+            output=lambda *_: None,
+            briefing_service=self._service(),
+            config=VoiceConfig(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        leftover = {
+            thread.name
+            for thread in threading.enumerate()
+            if thread.name not in before and "jarvis" in thread.name.lower()
+        }
+        self.assertEqual(leftover, set())
 
     def test_help_documents_the_startup_flag(self):
         from app import main

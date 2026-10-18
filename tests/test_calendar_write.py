@@ -28,6 +28,8 @@ from app import (
 )
 from config import CalendarWriteConfig, ToolsConfig, VoiceConfig
 from core.briefing import (
+    TOOL_DAILY_BRIEFING,
+    TOOL_WHAT_NEXT,
     BriefingStatus,
     CalendarEvent,
     MockCalendarProvider,
@@ -646,6 +648,64 @@ class TestRouterCreation(unittest.TestCase):
 
     def test_calendar_question_without_creation_verb_is_not_creation(self):
         request = self._router().route("what's on my calendar today")
+        self.assertIsNot(request.kind, CommandKind.TOOL)
+
+
+class TestScheduleAndCreationSeparation(unittest.TestCase):
+    """Batch 25: read-only schedule queries and creation never cross over.
+
+    All three tools are registered at once, so this pins the routing
+    boundary rather than the registration gate.
+    """
+
+    def _router(self):
+        return ToolCommandRouter(
+            available_tools=(
+                TOOL_DAILY_BRIEFING,
+                TOOL_WHAT_NEXT,
+                TOOL_CREATE_CALENDAR_EVENT,
+            ),
+            briefing_tool=TOOL_DAILY_BRIEFING,
+            what_next_tool=TOOL_WHAT_NEXT,
+            calendar_create_tool=TOOL_CREATE_CALENDAR_EVENT,
+            calendar_create_clock=clock,
+        )
+
+    def test_schedule_phrases_never_route_to_creation(self):
+        router = self._router()
+        for text in (
+            "what's next?",
+            "what's my next meeting?",
+            "do I have any meetings today?",
+            "what's on my schedule tomorrow?",
+            "what's my schedule today?",
+            "brief me on today",
+        ):
+            with self.subTest(text=text):
+                request = router.route(text)
+                self.assertIs(request.kind, CommandKind.TOOL)
+                self.assertIn(
+                    request.tool_name,
+                    (TOOL_DAILY_BRIEFING, TOOL_WHAT_NEXT),
+                )
+
+    def test_schedule_query_carries_only_the_bounded_when_argument(self):
+        router = self._router()
+        request = router.route("what's on my schedule tomorrow")
+        self.assertEqual(request.tool_name, TOOL_WHAT_NEXT)
+        self.assertEqual(dict(request.arguments), {"when": "tomorrow"})
+
+    def test_creation_phrase_still_routes_to_creation(self):
+        router = self._router()
+        request = router.route(
+            "schedule a meeting with bob tomorrow at 3pm for 30 minutes"
+        )
+        self.assertIs(request.kind, CommandKind.TOOL)
+        self.assertEqual(request.tool_name, TOOL_CREATE_CALENDAR_EVENT)
+
+    def test_creation_phrase_is_not_turned_into_a_schedule_question(self):
+        router = self._router()
+        request = router.route("add a meeting tomorrow at 3pm")
         self.assertIsNot(request.kind, CommandKind.TOOL)
 
 

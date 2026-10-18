@@ -419,6 +419,12 @@ optional Google libraries and a fixed clock — no Google account, credential,
 network or browser. See section Z.15 of
 [AUDIT_REPORT.md](AUDIT_REPORT.md).
 
+Batch 25 adds regression tests for the properties that were previously only
+implied: the startup briefing is delivered exactly once across several
+listener iterations, it cannot reach a registered write or launch tool,
+`what's my schedule today?` runs end to end as a read-only `daily_briefing`
+query, and no worker thread survives shutdown.
+
 Calendar event creation is covered by `tests/test_calendar_write.py` (domain
 parsing and building, the `tzdata`-free timezone handling, the write adapter
 and its status mapping, argument validation, the `CONFIRM` handler and its
