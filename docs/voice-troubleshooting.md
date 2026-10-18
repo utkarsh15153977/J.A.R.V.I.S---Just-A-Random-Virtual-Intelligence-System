@@ -33,7 +33,7 @@ voice embedding is ever part of these messages.
 
 The same wording reaches the console for the manual test
 (`python -m voice.test_voice`), the diagnostic run
-(`python -m voice.test_voice --diagnostics`) and the wake-word path.
+(`python -m voice.test_voice --diagnose`) and the wake-word path.
 
 ## Symptom → action
 
@@ -79,12 +79,36 @@ default**; the startup message warns while it is on, and the flag can be
 omitted again to disable it. Only the transcript and the routing outcome
 are added — never raw audio, arguments or handler values.
 
+### `--log-transcripts` does not affect routing
+
+Checked in Batch 27.2 against a live report where one run with
+`--tools --briefing --log-transcripts` routed a schedule command and a
+later run with `--tools --briefing` alone answered "I can't do that yet."
+The flag gates exactly two statements — `voice/listener.py` writing either
+`YOU: <transcript>` or `Transcription captured (N characters)`, and
+`app.py` writing the `Recognized ...; routing outcome:` line. Neither the
+transcript handed to the router nor the registry, router or executor
+differs, and a full `main()` run with and without the flag produces
+byte-identical replies apart from the startup banner.
+
+The actual difference is wording: routing matches an exact normalised
+phrase, so a turn succeeds only when its transcript is a member of a
+declared phrase set. Turning logging on changes only whether that wording
+is **recoverable afterwards** — it cannot make a non-matching phrase
+match, and turning it off cannot make a matching one fail.
+
+**Without `--log-transcripts` there is no record of an unsupported turn
+at all**, so a failing run cannot be diagnosed after the fact: only
+successful turns leave a line (`jarvis.executor: tool=... status=ok`).
+When a command you expect to work fails, reproduce it with the flag on
+before changing anything.
+
 ## Diagnostics
 
 Measure the microphone instead of guessing a threshold:
 
 ```powershell
-.\.venv\Scripts\python -m voice.test_voice --diagnostics
+.\.venv\Scripts\python -m voice.test_voice --diagnose
 ```
 
 It prints the active input device, ambient/normal/loud RMS levels, the

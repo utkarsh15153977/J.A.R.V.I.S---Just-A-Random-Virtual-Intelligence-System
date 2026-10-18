@@ -3060,5 +3060,215 @@ class TestSpeakerAdminCommands(unittest.TestCase):
         self.assertEqual(saved.model_id, "fake")
 
 
+class TestBatch272RoutingParity(unittest.TestCase):
+    """Batch 27.2: ``--log-transcripts`` gates logging, never routing.
+
+    A live run with ``--tools --briefing --log-transcripts`` routed a
+    schedule command, while a later run with ``--tools --briefing`` alone
+    reported the generic unsupported reply for every non-exit segment.
+    These tests pin the facts that answer that report: the flag changes
+    only what is written to the log, and the unsupported reply is produced
+    by exact-match routing in the router — not by the registry, the
+    executor or dependency injection.
+    """
+
+    SCHEDULE = "What is my schedule today?"
+
+    @staticmethod
+    def _listener(texts):
+        return StatusListener(
+            [
+                Transcription(status=TranscriptionStatus.HEARD, text=text)
+                for text in texts
+            ]
+        )
+
+    @staticmethod
+    def _briefing():
+        """A read-only briefing service holding one known event."""
+        from core.briefing import (
+            BriefingTask,
+            CalendarEvent,
+            DailyBriefingService,
+            MockCalendarProvider,
+            MockTaskProvider,
+        )
+
+        return DailyBriefingService(
+            MockCalendarProvider(
+                events=(
+                    CalendarEvent(
+                        "standup",
+                        datetime(2026, 10, 5, 10),
+                        datetime(2026, 10, 5, 10, 30),
+                    ),
+                )
+            ),
+            MockTaskProvider(
+                tasks=(BriefingTask("pay bill", due=datetime(2026, 10, 1)),)
+            ),
+            clock=lambda: datetime(2026, 10, 5, 8),
+        )
+
+    @staticmethod
+    def _router_with_all_tools():
+        from core.router import _BRIEFING_PHRASES, _SCHEDULE_PHRASE_TO_MODE
+
+        available = (
+            *build_builtin_registry(None).names(),
+            "daily_briefing",
+            "what_next",
+        )
+        router = ToolCommandRouter(
+            DEFAULT_TOOL_INTENTS,
+            available_tools=available,
+            briefing_tool="daily_briefing",
+            what_next_tool="what_next",
+        )
+        expected = {}
+        expected.update(dict.fromkeys(_BRIEFING_PHRASES, "daily_briefing"))
+        expected.update(dict.fromkeys(_SCHEDULE_PHRASE_TO_MODE, "what_next"))
+        for rule in DEFAULT_TOOL_INTENTS:
+            expected.update(dict.fromkeys(rule.phrases, rule.tool_name))
+        return router, expected
+
+    def _replies(self, argv, texts):
+        """Run ``main()`` for one session and return everything but the banner.
+
+        The startup banner is dropped: it is the single line
+        ``--log-transcripts`` is *meant* to change.
+        """
+        from config import BriefingConfig
+
+        code, output, _, _ = run_main(
+            argv=argv,
+            listener_factory=lambda config: self._listener(texts),
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=self._briefing(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        return [
+            line for line in output if not line.startswith("Jarvis is ready.")
+        ]
+
+    def test_flag_changes_only_the_startup_banner(self):
+        """Same session, same flag difference: identical routing and replies."""
+        texts = [self.SCHEDULE, "exit"]
+        off = self._replies(["--tools", "--briefing"], texts)
+        on = self._replies(
+            ["--tools", "--briefing", "--log-transcripts"], texts
+        )
+        self.assertEqual(off, on)
+        self.assertTrue(any("standup" in line for line in off))
+
+    def test_schedule_routes_with_transcript_logging_off(self):
+        """The failing run's exact configuration still routes the phrase."""
+        replies = self._replies(
+            ["--tools", "--briefing"], [self.SCHEDULE, "exit"]
+        )
+        joined = "\n".join(replies)
+        self.assertIn("standup", joined)
+        self.assertNotIn("can't do that yet", joined)
+
+    def test_router_sees_the_same_transcript_with_or_without_the_flag(self):
+        """At the dependency-injection seam, the flag never touches text."""
+        seen = []
+
+        class _RecordingRouter:
+            def route(self, text):
+                seen.append(text)
+                if text == "exit":
+                    return CommandRequest(CommandKind.EXIT)
+                return CommandRequest(
+                    CommandKind.UNSUPPORTED, response="skipped"
+                )
+
+        from config import BriefingConfig
+
+        for extra in ([], ["--log-transcripts"]):
+            with self.subTest(flag=extra or ["(none)"]):
+                seen.clear()
+                code, _, _, _ = run_main(
+                    argv=["--tools", "--briefing", *extra],
+                    listener_factory=lambda config: self._listener(
+                        [self.SCHEDULE, "exit"]
+                    ),
+                    router=_RecordingRouter(),
+                    briefing_config=BriefingConfig(enabled=True),
+                    briefing_service=self._briefing(),
+                )
+                self.assertEqual(code, EXIT_OK)
+                self.assertEqual(seen, [self.SCHEDULE, "exit"])
+
+    def test_unsupported_reply_never_reaches_the_executor(self):
+        """A registry/executor/DI failure cannot produce this reply."""
+        from config import BriefingConfig
+
+        calls = []
+
+        class _SpyExecutor:
+            def execute(self, name, arguments):
+                calls.append((name, dict(arguments)))
+                return ExecutionResult(
+                    status=ExecutionStatus.OK,
+                    message="",
+                    value={"text": "ok"},
+                )
+
+            def close(self):
+                pass
+
+        code, output, _, _ = run_main(
+            argv=["--tools", "--briefing"],
+            listener_factory=lambda config: self._listener(
+                ["a sentence that matches no declared phrase", "exit"]
+            ),
+            executor=_SpyExecutor(),
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=self._briefing(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(
+            any("can't do that yet" in line for line in output)
+        )
+        self.assertEqual(calls, [])
+
+    def test_every_declared_phrase_routes_to_its_own_tool(self):
+        """No declared phrase may silently become unreachable.
+
+        An unreachable phrase would produce exactly the reported symptom —
+        a wording Jarvis claims to know that answers with the generic
+        unsupported reply — so every entry is checked end to end.
+        """
+        router, expected = self._router_with_all_tools()
+        for phrase, tool in expected.items():
+            with self.subTest(phrase=phrase):
+                command = router.route(phrase)
+                self.assertIs(command.kind, CommandKind.TOOL)
+                self.assertEqual(command.tool_name, tool)
+
+    def test_near_miss_wordings_stay_unsupported(self):
+        """The reported failure mode must not be 'solved' by fuzzy matching.
+
+        Longer, differently-worded sentences are exactly what the live
+        report described. They stay UNSUPPORTED: widening routing is
+        deliberately out of scope, so this pins exact-match behaviour
+        against a future guess-based phrase pad.
+        """
+        router, _ = self._router_with_all_tools()
+        near_misses = (
+            "what is my schedule for today",
+            "what is on my schedule today",
+            "give me my schedule",
+            "what does my day look like",
+            "what's on the calendar today",
+        )
+        for text in near_misses:
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

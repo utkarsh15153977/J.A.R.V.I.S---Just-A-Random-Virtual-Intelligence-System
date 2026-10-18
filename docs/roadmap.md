@@ -1281,6 +1281,64 @@ credential, token or transcript appears in the documentation.** Platform
 coverage remains **Windows only**. Full evidence and the repeatable human
 procedure are in `docs/voice-smoke-test.md`.
 
+## Batch 27.2 note (routing reply discrepancy)
+
+Batch 27.2 adds **no production code** and found **no defect** in
+transcription, normalization, routing or dependency injection. It
+investigates a live report: one run of
+`python app.py --tools --briefing --log-transcripts` routed "What is my
+schedule today?" to `daily_briefing`, while a later run of
+`python app.py --tools --briefing` answered the generic unsupported reply
+for every non-exit utterance, which looked as though `--log-transcripts`
+changed routing.
+
+**Root cause: wording, not the flag.** Routing matches an exact normalised
+phrase, so a turn succeeds only when its transcript is a member of a
+declared phrase set. The successful turn was a 26-character, 5-word
+transcript with similarity 1.00 to `what is my schedule today`; the
+failing run's segments were longer full sentences (31, 29 and 36
+characters) that are not in any table. The same session proved it: with
+the flag **on** and tools on, the exact phrase succeeded while a longer
+sentence failed.
+
+What the evidence establishes:
+
+- **The flag is provably innocent.** It gates exactly two statements —
+  `voice/listener.py` writing either `YOU: <transcript>` or
+  `Transcription captured (N characters)`, and `app.py` writing the
+  `Recognized ...; routing outcome:` line. Routing never reads
+  `log_transcripts`, and a full `main()` run with and without the flag
+  produced byte-identical replies apart from the startup banner
+  (exit codes 0/0).
+- **Self-consistency of the phrase tables.** Every entry of
+  `DEFAULT_TOOL_INTENTS`, `_BRIEFING_PHRASES` and
+  `_SCHEDULE_PHRASE_TO_MODE` routes to its own tool (0 unreachable), no
+  lead-in token starts a declared phrase, and `raw entries not in set` is
+  empty.
+- **No audio defect.** The failing sessions calibrated at 977 RMS with
+  2.3–2.7 s of captured speech; `--log-transcripts` is logging-only, so
+  audio thresholds and Whisper config were left untouched.
+
+**No production change was made.** Guessing the two unrecoverable
+wordings would mean padding phrase tables with text nobody has evidence
+for, and loosening routing into fuzzy matching is explicitly out of
+scope. Six regression tests were added instead
+(`tests/test_app.py::TestBatch272RoutingParity`): flag parity through
+full `main()`, the same configuration routing the phrase with logging
+off, transcript identity at the DI seam, unsupported turns never reaching
+the executor, every declared phrase reaching its own tool, and five
+near-miss wordings staying `UNSUPPORTED`. `docs/voice-troubleshooting.md`
+documents the finding and its diagnosis procedure (and had two wrong flag
+names corrected: `--diagnostics` → `--diagnose`).
+
+**Remaining manual acceptance step:** re-run the failing phrasing with
+`--log-transcripts` to capture the actual wording, then decide — from
+evidence — whether it belongs in a declared phrase set.
+
+Verification: **1258 tests OK (5 skipped)**, `ruff check` clean,
+`compileall` clean, `pip check` clean, the offline evaluation suite
+**40/40** PASS.
+
 ## Recommended next batches
 
 Ordered by user value against risk; each keeps the Batch 9 permission
