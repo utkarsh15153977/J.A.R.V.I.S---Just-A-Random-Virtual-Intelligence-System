@@ -595,6 +595,21 @@ read-only token and created, modified and deleted nothing. The suite is now
 [docs/voice-smoke-test.md](docs/voice-smoke-test.md) and
 [docs/roadmap.md](docs/roadmap.md).
 
+Batch 27 is the **human** acceptance test for that pipeline and changes no
+production code. The microphone initialization, the Ctrl+C shutdown path
+(real interrupt during a live capture, clean exit, device released) and the
+safety boundary were verified against real hardware. **Human speech through
+the microphone and audible output remain BLOCKED** - they require a person
+to speak and to listen, and the synthetic-audio results from Batch 26 are
+not accepted as a substitute. A repeatable Windows procedure, with the exact
+startup commands and what to look for, is in
+[docs/voice-smoke-test.md](docs/voice-smoke-test.md). One environmental
+finding is documented there: this host's ambient noise is high enough that
+the energy threshold frequently clamps to its ceiling, which can make
+recognition flaky - run `python -m voice.test_voice --diagnose` and lower the
+microphone gain before judging recognition. **Jarvis should not yet be
+described as voice-ready.**
+
 ## Quality checks
 
 Linting is configured with [Ruff](https://docs.astral.sh/ruff/) in

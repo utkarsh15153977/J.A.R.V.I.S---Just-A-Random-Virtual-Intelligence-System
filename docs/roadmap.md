@@ -1233,6 +1233,54 @@ Verification: **1242 tests OK (5 skipped)**, `ruff check` clean,
 deleted, no application was launched, and no OAuth flow was run.** Platform
 coverage remains **Windows only**.
 
+## Batch 27 note (human voice acceptance test)
+
+Batch 27 adds **no production code** and found **no defect**. It is the
+human acceptance counterpart to Batch 26: a person must speak into the
+microphone and hear the reply. A human was not present, so Tests B
+(human speech recognition), C (audible response) and D (three consecutive
+interactions) are recorded **BLOCKED**, and the synthetic-audio evidence
+from Batch 26 is explicitly **not** accepted as a substitute.
+
+What *was* machine-verified against real hardware:
+
+- **Test A (PASS).** The real `Listener` opened the Realtek input device
+  and completed calibration repeatedly without error; Whisper loaded from
+  the local cache in ~2.1–2.6 s.
+- **Test E (PASS, machine half).** With the **real** microphone held open
+  and the **real** Whisper model loaded, a `KeyboardInterrupt` delivered to
+  the main thread mid-capture returned `0` and the input stream reopened
+  immediately afterwards, proving the device was released. An earlier
+  attempt that signalled a child process via
+  `os.kill(pid, CTRL_C_EVENT)` did not stop it within 20 s; that was a
+  harness signal-delivery artefact, **not** a product defect, and is
+  documented as such rather than reported as a failure.
+- **Test F (PASS).** With the registry built exactly as
+  `app.py --tools --briefing` builds it, no `create_calendar_event`,
+  `launch_application`, memory, media or research tool exists, and every
+  creation / launch / memory / media phrase routes to `UNSUPPORTED`. Read-only
+  schedule routing is intact, and manual activation still resolves to
+  `MANUAL` with no wake or verification gate. No sensitive action was
+  executed to prove this.
+
+**The one substantive finding is environmental, not a code defect.** The
+energy threshold is `clamp(ambient_median × 4.0, 50, 4000)`, and this host's
+ambient noise is high and variable (measured 431–2038 RMS). Six consecutive
+1-second calibrations **all clamped to the 4000 ceiling**, so the threshold
+is frequently pinned at the fixed ceiling rather than derived from
+measurement. The code already handles this correctly (it clamps and warns),
+so no change was made; the recommended action is to run
+`python -m voice.test_voice --diagnose` and lower microphone gain or move to
+a quieter room before judging Test B.
+
+Verification: **1242 tests OK (5 skipped)**, `ruff check` clean,
+`compileall` clean, `pip check` clean, the offline evaluation suite
+**40/40** PASS. **No calendar event or task was created, modified or
+deleted, no application was launched, no OAuth flow was run, and no
+credential, token or transcript appears in the documentation.** Platform
+coverage remains **Windows only**. Full evidence and the repeatable human
+procedure are in `docs/voice-smoke-test.md`.
+
 ## Recommended next batches
 
 Ordered by user value against risk; each keeps the Batch 9 permission
