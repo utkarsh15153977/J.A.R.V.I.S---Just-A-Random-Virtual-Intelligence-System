@@ -566,9 +566,15 @@ class BriefingConfig:
     one-time authorization is user-started (``--briefing-auth``), never run
     on startup. The caps below bound how much is read and spoken, so a bad
     provider cannot produce an unbounded briefing.
+
+    ``startup_briefing`` (off by default) additionally reads the briefing
+    aloud exactly once, as Jarvis starts; it still requires ``enabled`` and
+    :class:`ToolsConfig`, runs through the same read-only ``daily_briefing``
+    tool, and never changes anything.
     """
 
     enabled: bool = False
+    startup_briefing: bool = False
     client_secret_path: str = ""
     token_path: str = ""
     calendar_id: str = "primary"
@@ -583,6 +589,8 @@ class BriefingConfig:
 
         if not isinstance(self.enabled, bool):
             problems.append("enabled must be a boolean")
+        if not isinstance(self.startup_briefing, bool):
+            problems.append("startup_briefing must be a boolean")
         problems.extend(
             _validate_optional_path("client_secret_path", self.client_secret_path)
         )

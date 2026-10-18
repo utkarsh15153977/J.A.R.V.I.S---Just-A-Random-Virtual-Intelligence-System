@@ -725,6 +725,7 @@ normal `ToolRegistry` and executed only through the single `ToolExecutor`:
 | Tool | Level | Effect |
 | --- | --- | --- |
 | `daily_briefing` | `SAFE` | read today's events and tasks and return a summary |
+| `what_next` | `SAFE` | read the next upcoming timed event, or a day's schedule |
 
 Properties:
 
@@ -764,6 +765,71 @@ domain, the adapters and the OAuth helper entirely with fake providers,
 fake API clients, fakes for the optional Google libraries and a fixed clock
 — no Google account, credential, network or browser. See
 [docs/briefing.md](briefing.md) for setup and privacy details.
+
+### "What's next?" (Batch 23)
+
+`what_next` is a focused, read-only schedule query building on the same
+`DailyBriefingService` and calendar provider. It is registered with the same
+opt-in as the briefing (`--tools --briefing`) and, like every tool, runs only
+through `ToolExecutor.execute` as a `SAFE` tool - it can never prompt for,
+mint or consume a confirmation.
+
+- **Read-only, never a write.** It only reads the calendar; it never creates,
+  edits or deletes an event, and it is fully separate from the
+  `create_calendar_event` `CONFIRM` path. A schedule question never triggers
+  event creation, no matter how it is phrased.
+- **Fixed phrases, fixed argument.** Routing recognises only the exact
+  normalised schedule phrases, each mapping to one bounded `when` value
+  (`next`, `today` or `tomorrow`); the value is validated again by the tool,
+  so no free text is copied into arguments and there is no fuzzy or broad
+  matching. An ambiguous request falls back to the placeholder's
+  clarify/unsupported behaviour rather than being guessed.
+- **Honest about time.** It uses the injected clock and the local timezone.
+  `next` reports the next *timed* event strictly after now and never invents
+  a time for an all-day event; if only an all-day event is ahead it says so
+  without a clock time. A failed read is reported as a retrieval failure,
+  never as "no events". `next` reads only today and tomorrow.
+- **Bounded and sanitised.** The event count and spoken length are capped and
+  provider text is cleaned before display or speech, exactly as for the
+  briefing.
+
+### Startup briefing (Batch 24)
+
+`--startup-briefing` reads today's briefing aloud **once**, as Jarvis starts,
+before the listening loop begins. It is an output convenience only; it adds
+no new capability and no new data path.
+
+- **Off by default, doubly gated.** It requires **both** `--tools` and
+  `--briefing` (which needs the one-time `--briefing-auth`). A missing
+  prerequisite is printed
+  (`Startup briefing requires --tools; ...` or
+  `Startup briefing requires --briefing; ...`) and the feature stays off. It
+  never silently enables the briefing and a normal run never starts OAuth.
+- **Runs through the guarded executor.** The briefing is produced by the
+  already-registered read-only `daily_briefing` tool and delivered via
+  `ToolExecutor.execute`; no handler is called directly and no permission,
+  approval or confirmation rule is bypassed. The startup path runs only that
+  one tool.
+- **Read-only, like the command.** It never creates, edits, completes or
+  deletes an event or task, never launches an application, and never runs any
+  other tool. It is fully separate from the `create_calendar_event` `CONFIRM`
+  path.
+- **At most once.** It runs on the linear startup path, never inside the
+  listening loop, so it cannot repeat or spam.
+- **Fails safe.** If the briefing is unavailable it says so; a failed source
+  is reported as failed, never as empty. If delivery itself fails, Jarvis
+  logs a warning (no traceback, no credential, no tool arguments) and
+  continues into the normal session. The warning names only the outcome, not
+  any calendar or task content.
+- **No new initialisation.** When the flag is absent, nothing extra is built
+  and startup behaviour is byte-for-byte unchanged; the briefing service is
+  only built when `--briefing` itself is on.
+
+**Testing.** The `TestStartupBriefing` block in `tests/test_briefing.py`
+covers off-by-default, missing prerequisites, exactly-once delivery through a
+recording executor, empty/failed/partial sources, speaker failure,
+failure-continues and the preserved Batch 23 manual queries, all offline with
+fake providers and a fixed clock.
 
 ## Calendar event creation (Batch 22)
 
@@ -1272,12 +1338,16 @@ calls a handler directly.
 - Six fixed read-only tools exist (`get_current_time`,
   `get_current_date`, `get_current_datetime`, `get_system_status`,
   `get_disk_space`, `get_battery_status`); the registry ships **empty by
-  default** and holds those six only when `--tools` is given. A seventh
-  read-only tool, `web_research`, is added only when `--research` is also
-  given and a provider is supplied. The only side-effecting tool is the
-  application launcher (`launch_application`), which is additionally gated
-  behind `--allow-apps` plus a non-empty configured allowlist and always
-  requires a fresh confirmation.
+  default** and holds those six only when `--tools` is given. Further
+  read-only tools are added only with their own opt-in: `web_research`
+  (`--research` plus a provider), the memory tools (`--memory`), the media
+  tools (`--media`), and the briefing tools `daily_briefing` and `what_next`
+  (`--briefing` plus a one-time `--briefing-auth`). The side-effecting tools
+  are the application launcher (`launch_application`), gated behind
+  `--allow-apps` plus a non-empty configured allowlist and a fresh
+  confirmation, and Google Calendar event creation (`create_calendar_event`),
+  gated behind `--calendar-write` plus `--calendar-write-auth` and an
+  exact-detail confirmation.
 - The application catalog is tiny and Windows-only (Notepad and
   Calculator), and its active allowlist is empty by default. Launching is
   fire-and-forget: Jarvis does not know whether the app opened, and it
@@ -1390,5 +1460,18 @@ calls a handler directly.
 - The ambiguous-write recovery reads the target day back; it compares the
   title and start time (within a one-minute tolerance) to decide whether the
   event appears. A concurrent identical event created by another client in
-  the same window could be mistaken for the retried write — an accepted,
+  the same window could be mistaken for the retried write - an accepted,
   narrow ambiguity that is reported to the user rather than acted on.
+- The read-only `what_next` schedule query (Batch 23) has **no live
+  verification**: every test injects fake providers and a fixed clock, and no
+  live run of this query has been performed, so it is exercised only against
+  fakes. `next` reads just today and tomorrow, so an event beyond tomorrow is
+  not reported; and, like the briefing, it recognises only its fixed phrase
+  set.
+- The startup briefing (Batch 24) **contacts Google at startup** when it is
+  enabled and a read-only token is stored: it refreshes the access token and
+  issues the same `events.list` / `tasks.list` reads the command would. That
+  is the feature's normal read path, not a new one, but it does mean an
+  opted-in start is not offline. With no token it fails closed, says the
+  sources could not be read, and the session continues; it never writes,
+  never requests a write scope and never starts an OAuth flow.

@@ -640,6 +640,75 @@ _BRIEFING_PHRASES: FrozenSet[str] = frozenset(
 )
 
 
+# "What's next?" and related schedule queries (read-only).
+# Fixed normalised phrases map to a bounded ``when`` mode. Each phrase maps to
+# exactly one of ``next``, ``today`` or ``tomorrow``; nothing the user says is
+# copied into arguments, and no fuzzy or broad matching is used.
+_SCHEDULE_PHRASE_TO_MODE: "dict[str, str]" = {
+    _normalize_phrase(phrase): mode
+    for mode, phrases in (
+        (
+            "next",
+            (
+                "what's next",
+                "what is next",
+                "what's my next meeting",
+                "what is my next meeting",
+                "what do i have next",
+                "whats my next meeting",
+            ),
+        ),
+        (
+            "today",
+            (
+                "do i have any meetings today",
+                "do i have any meetings",
+            ),
+        ),
+        (
+            "tomorrow",
+            (
+                "what's on my schedule tomorrow",
+                "what is on my schedule tomorrow",
+                "what's my schedule tomorrow",
+                "what is my schedule tomorrow",
+                "tomorrow schedule",
+                "what's on my calendar tomorrow",
+                "what is on my calendar tomorrow",
+            ),
+        ),
+    )
+    for phrase in phrases
+    if _normalize_phrase(phrase)
+}
+
+
+def _schedule_request(
+    normalized: str,
+    what_next_tool: Optional[str],
+    briefing_tool: Optional[str],
+) -> Optional[CommandRequest]:
+    """Turn a fixed schedule phrase into a read-only tool request.
+
+    Only ``what_next_tool`` is used; it is ``None`` unless that tool is
+    actually registered, so this stays inert when the capability is off. The
+    phrase must be an exact normalised match and it carries a fixed, bounded
+    ``when`` argument, so nothing is guessed from free text.
+    """
+    mode = _SCHEDULE_PHRASE_TO_MODE.get(normalized)
+    if mode is None:
+        return None
+    if what_next_tool:
+        return CommandRequest(
+            CommandKind.TOOL, tool_name=what_next_tool, arguments={"when": mode}
+        )
+    # Fall back to the briefing tool only for the "today" schedule view, which
+    # the argumentless briefing already answers; next/tomorrow are not guessed.
+    if briefing_tool and mode == "today":
+        return CommandRequest(CommandKind.TOOL, tool_name=briefing_tool)
+    return None
+
+
 def _briefing_request(
     normalized: str, briefing_tool: Optional[str]
 ) -> Optional[CommandRequest]:
@@ -1087,6 +1156,7 @@ class ToolCommandRouter(PlaceholderRouter):
         memory_tools: Optional[Mapping[str, str]] = None,
         media_tools: Optional[Mapping[str, str]] = None,
         briefing_tool: Optional[str] = None,
+        what_next_tool: Optional[str] = None,
         calendar_create_tool: Optional[str] = None,
         calendar_create_clock: Optional[Callable[[], datetime]] = None,
         calendar_create_timezone: Optional[str] = None,
@@ -1127,6 +1197,9 @@ class ToolCommandRouter(PlaceholderRouter):
         self._briefing_tool = (
             briefing_tool if briefing_tool in available else None
         )
+        self._what_next_tool = (
+            what_next_tool if what_next_tool in available else None
+        )
         self._calendar_create_tool = (
             calendar_create_tool if calendar_create_tool in available else None
         )
@@ -1148,6 +1221,11 @@ class ToolCommandRouter(PlaceholderRouter):
                 tool_name=tool_name,
                 arguments=dict(arguments),
             )
+        schedule_request = _schedule_request(
+            normalized, self._what_next_tool, self._briefing_tool
+        )
+        if schedule_request is not None:
+            return schedule_request
         briefing_request = _briefing_request(
             normalized, self._briefing_tool
         )

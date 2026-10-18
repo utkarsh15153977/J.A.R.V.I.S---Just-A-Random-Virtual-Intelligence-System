@@ -57,6 +57,16 @@ Delete and clear require confirmation. Memory only stores and returns text
 the user chose to keep; it never grants authority and is never treated as
 an instruction.
 
+The daily briefing is an optional, read-only capability (``--briefing``,
+which also requires ``--tools`` and a one-time ``--briefing-auth``). It
+adds the ``daily_briefing`` and ``what_next`` tools, which summarise
+today's calendar events and tasks over read-only scopes and never change
+anything. ``--startup-briefing`` additionally reads today's briefing
+aloud once, as Jarvis starts, through the same read-only ``daily_briefing``
+tool and the guarded executor; it requires ``--tools`` and ``--briefing``,
+is off by default, runs at most once, and a failure there is reported
+safely and never stops the session.
+
 Activation is always one of three explicit modes, decided at startup:
 
     MANUAL          no wake word, no verification: always-listen (default)
@@ -113,6 +123,7 @@ from core.app_launcher import (
 )
 from core.briefing import (
     TOOL_DAILY_BRIEFING,
+    TOOL_WHAT_NEXT,
     DailyBriefingService,
 )
 from core.briefing_tools import register_briefing_tool
@@ -244,6 +255,12 @@ _USAGE = (
     "                      briefing (opens a browser), store the token and\n"
     "                      exit. Read-only scopes only; no command is\n"
     "                      listened for in this mode.\n"
+    "  --startup-briefing  Read today's briefing aloud once, as Jarvis\n"
+    "                      starts: today's calendar events and the tasks\n"
+    "                      needing attention. Requires --tools AND\n"
+    "                      --briefing. OFF by default, so startup is\n"
+    "                      unchanged. Read-only: it never changes your\n"
+    "                      calendar or tasks.\n"
     "  --calendar-write    Enable creating Google Calendar events by voice.\n"
     "                      Requires --tools AND a one-time\n"
     "                      --calendar-write-auth. OFF by default; every\n"
@@ -278,6 +295,7 @@ class _Options:
     media: bool = False
     briefing: bool = False
     briefing_auth: bool = False
+    startup_briefing: bool = False
     calendar_write: bool = False
     calendar_write_auth: bool = False
     log_transcripts: bool = False
@@ -299,6 +317,7 @@ def _parse_args(argv: List[str]) -> _Options:
         media="--media" in argv,
         briefing="--briefing" in argv,
         briefing_auth="--briefing-auth" in argv,
+        startup_briefing="--startup-briefing" in argv,
         calendar_write="--calendar-write" in argv,
         calendar_write_auth="--calendar-write-auth" in argv,
         log_transcripts="--log-transcripts" in argv,
@@ -437,6 +456,7 @@ def _build_router(
     memory_tools: Optional[Mapping[str, str]] = None,
     media_tools: Optional[Mapping[str, str]] = None,
     briefing_tool: Optional[str] = None,
+    what_next_tool: Optional[str] = None,
     calendar_create_tool: Optional[str] = None,
     calendar_create_clock: Optional[Callable[[], datetime]] = None,
 ) -> Router:
@@ -457,6 +477,7 @@ def _build_router(
         memory_tools=memory_tools,
         media_tools=media_tools,
         briefing_tool=briefing_tool,
+        what_next_tool=what_next_tool,
         calendar_create_tool=calendar_create_tool,
         calendar_create_clock=calendar_create_clock,
     )
@@ -546,6 +567,51 @@ def _resolve(
         result = executor.execute(command.tool_name, command.arguments)
         return None, _describe_result(result)
     return None, "Sorry, I didn't understand that."
+
+
+def _deliver_startup_briefing(
+    executor: ToolExecutor,
+    briefing_tool: Optional[str],
+    output: Callable[[str], None],
+    speaker: Any,
+) -> None:
+    """Deliver the one-shot, read-only startup briefing (best effort).
+
+    The briefing is produced by the already-registered read-only
+    ``daily_briefing`` tool, so it runs through the same guarded
+    :class:`ToolExecutor` as every other tool: no handler is ever called
+    directly and no permission, approval or confirmation rule is
+    bypassed. It reads only, never runs any tool other than the briefing,
+    and never creates, edits or deletes anything.
+
+    It runs once, on the startup path, before normal interaction begins.
+    Any failure is reported safely (a logged warning, never a traceback
+    or a credential) and the normal session continues; a best-effort
+    nicety must not stop Jarvis from starting. ``briefing_tool`` is
+    ``None`` when the tool is not registered, in which case nothing is
+    delivered.
+    """
+    if not briefing_tool:
+        return
+    try:
+        result = executor.execute(briefing_tool, {})
+    except Exception:
+        # The executor encapsulates handler failures as statuses; a raise
+        # here is unexpected, so report it safely rather than block the
+        # session. Only the fact of the failure is logged, never any data.
+        logger.warning(
+            "Startup briefing could not be delivered; continuing."
+        )
+        return
+    if result.status is not ExecutionStatus.OK:
+        logger.warning(
+            "Startup briefing was unavailable (%s); continuing.",
+            result.status.value,
+        )
+        return
+    text = _format_tool_reply(result.value)
+    if text:
+        _respond(text, output, speaker)
 
 
 def _release_session(detector: Any) -> None:
@@ -1367,6 +1433,8 @@ def main(
         )
         if options.briefing and active_tools.enabled:
             active_briefing = replace(active_briefing, enabled=True)
+        if options.startup_briefing:
+            active_briefing = replace(active_briefing, startup_briefing=True)
         active_briefing.validate()
 
         active_calendar_write = (
@@ -1439,6 +1507,21 @@ def main(
         output(
             "Calendar event creation requires --tools; keeping it disabled."
         )
+
+    # The startup briefing reuses the daily briefing, so it needs the
+    # briefing (and therefore tools) to be on. A missing prerequisite is
+    # reported and the feature stays off: it is never silently enabled,
+    # and it never turns the briefing on by itself.
+    startup_briefing_requested = active_briefing.startup_briefing
+    startup_briefing_enabled = (
+        startup_briefing_requested
+        and active_tools.enabled
+        and active_briefing.enabled
+    )
+    if startup_briefing_requested and not active_tools.enabled:
+        output("Startup briefing requires --tools; keeping it disabled.")
+    elif startup_briefing_requested and not active_briefing.enabled:
+        output("Startup briefing requires --briefing; keeping it disabled.")
 
     allowlist: Optional[AppAllowlist] = None
     if active_tools.enabled and active_apps.enabled:
@@ -1570,6 +1653,12 @@ def main(
         calendar_write_provider=active_write_provider,
         calendar_create_read_provider=active_create_read_provider,
     )
+    # The startup briefing is delivered through the registered read-only
+    # ``daily_briefing`` tool (never a handler directly). It only exists
+    # when the briefing is enabled, which the startup flag already requires.
+    startup_briefing_tool = (
+        TOOL_DAILY_BRIEFING if TOOL_DAILY_BRIEFING in registry else None
+    )
     memory_tools: Optional[Mapping[str, str]] = None
     if active_memory_service is not None:
         memory_tools = {
@@ -1591,6 +1680,9 @@ def main(
         briefing_tool = (
             TOOL_DAILY_BRIEFING if TOOL_DAILY_BRIEFING in registry else None
         )
+        what_next_tool = (
+            TOOL_WHAT_NEXT if TOOL_WHAT_NEXT in registry else None
+        )
         calendar_create_tool = (
             TOOL_CREATE_CALENDAR_EVENT
             if TOOL_CREATE_CALENDAR_EVENT in registry
@@ -1603,6 +1695,7 @@ def main(
             memory_tools=memory_tools,
             media_tools=media_tools,
             briefing_tool=briefing_tool,
+            what_next_tool=what_next_tool,
             calendar_create_tool=calendar_create_tool,
             calendar_create_clock=clock,
         )
@@ -1682,11 +1775,27 @@ def main(
                 "'brief me on today' for today's calendar events and tasks."
             )
 
+        if startup_briefing_enabled:
+            output(
+                "Startup briefing is ON; reading today's briefing once now."
+            )
+
         if active_write_provider is not None:
             output(
                 "Calendar event creation is ON. Say 'schedule a meeting "
                 "tomorrow at 3pm for an hour' and confirm the details before "
                 "it is created."
+            )
+
+        if startup_briefing_enabled:
+            # One read-only briefing, once, before the listening loop.
+            # Best effort: a failure here is logged and the session goes
+            # on unchanged.
+            _deliver_startup_briefing(
+                executor,
+                startup_briefing_tool,
+                output,
+                speaker,
             )
 
         try:

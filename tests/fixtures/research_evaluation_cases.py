@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
+from core.briefing import TOOL_WHAT_NEXT
 from core.research import (
     TOOL_WEB_RESEARCH,
     ResearchResult,
@@ -32,6 +33,7 @@ from core.router import DEFAULT_TOOL_INTENTS, CommandKind, ToolCommandRouter
 # that is actually registered, so the set is declared once, explicitly.
 _ROUTING_TOOLS = (
     TOOL_WEB_RESEARCH,
+    TOOL_WHAT_NEXT,
     "get_current_time",
     "get_current_date",
     "get_current_datetime",
@@ -70,6 +72,8 @@ class RoutingCase:
     expected_kind: str
     expected_tool: str = ""
     expected_query: str = ""
+    schedule_enabled: bool = False
+    expected_arguments: tuple[tuple[str, str], ...] = ()
 
 
 def _src(
@@ -489,6 +493,62 @@ ROUTING_CASES: tuple[RoutingCase, ...] = (
         research_enabled=True,
         expected_kind=CommandKind.UNSUPPORTED.value,
     ),
+    RoutingCase(
+        id="voice-whats-next",
+        category="voice-schedule",
+        transcript="what's next?",
+        research_enabled=True,
+        schedule_enabled=True,
+        expected_kind=CommandKind.TOOL.value,
+        expected_tool=TOOL_WHAT_NEXT,
+        expected_arguments=(("when", "next"),),
+    ),
+    RoutingCase(
+        id="voice-next-meeting",
+        category="voice-schedule",
+        transcript="what's my next meeting?",
+        research_enabled=True,
+        schedule_enabled=True,
+        expected_kind=CommandKind.TOOL.value,
+        expected_tool=TOOL_WHAT_NEXT,
+        expected_arguments=(("when", "next"),),
+    ),
+    RoutingCase(
+        id="voice-meetings-today",
+        category="voice-schedule",
+        transcript="do I have any meetings today?",
+        research_enabled=True,
+        schedule_enabled=True,
+        expected_kind=CommandKind.TOOL.value,
+        expected_tool=TOOL_WHAT_NEXT,
+        expected_arguments=(("when", "today"),),
+    ),
+    RoutingCase(
+        id="voice-schedule-tomorrow",
+        category="voice-schedule",
+        transcript="what's on my schedule tomorrow?",
+        research_enabled=True,
+        schedule_enabled=True,
+        expected_kind=CommandKind.TOOL.value,
+        expected_tool=TOOL_WHAT_NEXT,
+        expected_arguments=(("when", "tomorrow"),),
+    ),
+    RoutingCase(
+        id="voice-schedule-disabled",
+        category="voice-schedule",
+        transcript="what's next?",
+        research_enabled=False,
+        schedule_enabled=False,
+        expected_kind=CommandKind.UNSUPPORTED.value,
+    ),
+    RoutingCase(
+        id="voice-schedule-not-hijacked-create",
+        category="voice-schedule",
+        transcript="add a meeting tomorrow at 3pm",
+        research_enabled=True,
+        schedule_enabled=True,
+        expected_kind=CommandKind.UNSUPPORTED.value,
+    ),
 )
 
 
@@ -522,6 +582,7 @@ def evaluate_routing_case(case: RoutingCase) -> Optional[str]:
         DEFAULT_TOOL_INTENTS,
         available_tools=_ROUTING_TOOLS,
         research_tool=TOOL_WEB_RESEARCH if case.research_enabled else None,
+        what_next_tool=TOOL_WHAT_NEXT if case.schedule_enabled else None,
     )
     command = router.route(case.transcript)
     if command.kind.value != case.expected_kind:
@@ -532,6 +593,10 @@ def evaluate_routing_case(case: RoutingCase) -> Optional[str]:
         query = dict(command.arguments).get("query")
         if query != case.expected_query:
             return f"query {query!r} != {case.expected_query!r}"
+    for key, value in case.expected_arguments:
+        actual = dict(command.arguments).get(key)
+        if actual != value:
+            return f"argument {key!r} {actual!r} != {value!r}"
     return None
 
 

@@ -1,21 +1,20 @@
 """The ``daily_briefing`` tool for Jarvis.
 
-A single, argumentless, read-only tool that asks the injected
-:class:`~core.briefing.DailyBriefingService` to build today's briefing and
-returns the rendered text. It is ``SAFE`` — it reads nothing but the two
-already-configured providers and never writes — and it runs only through
-``core.executor.ToolExecutor`` like every other tool.
-
-The service captures provider failures itself, so the handler always
-returns a developer-authored ``text`` reply: a working source is reported,
-and a failed one is reported as failed rather than as "nothing today".
+Tools that reuse the injected :class:`~core.briefing.DailyBriefingService` and
+run only through ``core.executor.ToolExecutor`` like every other tool. All are
+read-only.
 """
 
 from __future__ import annotations
 
 from typing import Callable
 
-from core.briefing import TOOL_DAILY_BRIEFING, DailyBriefingService
+from core.briefing import (
+    SCHEDULE_MODES,
+    TOOL_DAILY_BRIEFING,
+    TOOL_WHAT_NEXT,
+    DailyBriefingService,
+)
 from core.permissions import PermissionLevel
 from core.tools import ToolInputError, ToolRegistry, ToolSpec
 
@@ -26,10 +25,30 @@ def _validate_no_args(raw) -> dict:
     return {}
 
 
+def _validate_when(raw) -> dict:
+    """Accept no argument or a bounded ``when`` value; reject everything else."""
+    if not raw:
+        return {}
+    if set(raw) != {"when"}:
+        raise ToolInputError("unknown argument(s)")
+    value = raw["when"]
+    if not isinstance(value, str) or value not in SCHEDULE_MODES:
+        raise ToolInputError("argument 'when' must be one of next/today/tomorrow")
+    return {"when": value}
+
+
 def _make_handler(service: DailyBriefingService) -> Callable[..., dict]:
     def handler() -> dict:
         result = service.build()
         return {"text": result.text}
+
+    return handler
+
+
+def _make_next_handler(service: DailyBriefingService) -> Callable[..., dict]:
+    def handler(*, when: str = "next") -> dict:
+        text, _ = service.build_schedule(when)
+        return {"text": text}
 
     return handler
 
@@ -48,8 +67,23 @@ def build_briefing_spec(service: DailyBriefingService) -> ToolSpec:
     )
 
 
+def build_what_next_spec(service: DailyBriefingService) -> ToolSpec:
+    """Build the read-only ``what_next`` tool spec."""
+    return ToolSpec(
+        name=TOOL_WHAT_NEXT,
+        description=(
+            "Report the next upcoming timed event, or today's/tomorrow's "
+            "schedule (read-only)"
+        ),
+        permission=PermissionLevel.SAFE,
+        validate=_validate_when,
+        handler=_make_next_handler(service),
+    )
+
+
 def register_briefing_tool(
     registry: ToolRegistry, service: DailyBriefingService
 ) -> None:
-    """Register the ``daily_briefing`` tool against ``registry``."""
+    """Register the briefing tools against ``registry``."""
     registry.register(build_briefing_spec(service))
+    registry.register(build_what_next_spec(service))

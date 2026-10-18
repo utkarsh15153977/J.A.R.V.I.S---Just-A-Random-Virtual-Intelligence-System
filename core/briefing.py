@@ -27,20 +27,20 @@ Design rules
   providers; they are cleaned (control characters dropped, whitespace
   collapsed) and shown as text, never as an instruction.
 
-Nothing here executes anything: the briefing is exposed as a single
-argumentless ``SAFE`` tool that runs only through
-``core.executor.ToolExecutor``.
+Nothing here executes anything: the briefing is exposed as safe, read-only
+tools that run only through ``core.executor.ToolExecutor``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Any, Optional, Protocol
 
 TOOL_DAILY_BRIEFING = "daily_briefing"
+TOOL_WHAT_NEXT = "what_next"
 
 # Absolute upper bounds. Neither ``BriefingConfig`` nor
 # ``DailyBriefingService`` can raise a per-run limit above these; they exist
@@ -323,9 +323,9 @@ def calendar_conflicts(
     return tuple(conflicts)
 
 
-def _describe_events(events: Sequence[CalendarEvent]) -> str:
+def _describe_events(events: Sequence[CalendarEvent], day_label: str = "today") -> str:
     if not events:
-        return "You have no events today."
+        return f"You have no events {day_label}."
     listed = "; ".join(_format_event(event) for event in events)
     count = len(events)
     noun = "event" if count == 1 else "events"
@@ -344,10 +344,12 @@ def _describe_band(label: str, band: Sequence[BriefingTask]) -> str:
 _BAND_LABELS = ("Overdue", "Due today", "Upcoming", "No due date")
 
 
-def _describe_tasks(tasks: Sequence[BriefingTask], day: date) -> str:
+def _describe_tasks(
+    tasks: Sequence[BriefingTask], day: date, day_label: str = "today"
+) -> str:
     active = [task for task in tasks if not task.completed]
     if not active:
-        return "You have no tasks needing attention today."
+        return f"You have no tasks needing attention {day_label}."
     bands: "list[list[BriefingTask]]" = [[], [], [], []]
     for task in active:
         bands[task_priority(task, day)].append(task)
@@ -370,21 +372,111 @@ def _truncate(text: str, limit: int) -> str:
     return window.rstrip()
 
 
-def render_briefing(result: BriefingResult, *, max_chars: int) -> str:
+def _day_label_for(day: date, now_day: date) -> str:
+    if day == now_day:
+        return "today"
+    if day == now_day + timedelta(days=1):
+        return "tomorrow"
+    if day == now_day - timedelta(days=1):
+        return "yesterday"
+    return f"on {_format_date(day)}"
+
+
+def find_next_upcoming_timed_event(
+    events: Sequence[CalendarEvent], *, now: datetime
+) -> Optional[CalendarEvent]:
+    """Find the next upcoming timed event after now (strictly in the future)."""
+    for event in sorted(events, key=lambda e: (e.start, e.title.lower())):
+        if event.all_day:
+            continue
+        if event.start > now:
+            return event
+    return None
+
+
+# Valid values for the ``when`` argument of the read-only schedule query.
+SCHEDULE_MODES = ("next", "today", "tomorrow")
+
+
+def render_schedule(
+    events: Sequence[CalendarEvent],
+    *,
+    mode: str,
+    now: datetime,
+    max_chars: int,
+    calendar_ok: bool = True,
+) -> str:
+    """Render a read-only schedule answer for ``mode``.
+
+    ``next`` reports the next upcoming *timed* event (all-day events are
+    never given an invented time); ``today`` and ``tomorrow`` list that
+    day's events and, for today, highlight the next timed one. A failed
+    calendar is reported as a retrieval failure, never as "no events".
+    """
+    if not calendar_ok:
+        return _truncate(
+            "I couldn't retrieve your schedule right now.", max_chars
+        )
+    if mode == "next":
+        next_event = find_next_upcoming_timed_event(events, now=now)
+        if next_event is not None:
+            return _truncate(
+                f"Your next meeting is {next_event.title} at "
+                f"{_format_time(next_event.start)}.",
+                max_chars,
+            )
+        all_day = [
+            event
+            for event in events
+            if event.all_day and event.start.date() >= now.date()
+        ]
+        if all_day:
+            titles = "; ".join(event.title for event in all_day[:MAX_EVENTS])
+            return _truncate(
+                f"You have no timed events coming up. All day: {titles}.",
+                max_chars,
+            )
+        return _truncate("You have no upcoming events.", max_chars)
+
+    if not events:
+        return _truncate(f"You have no events {mode}.", max_chars)
+    listed = "; ".join(_format_event(event) for event in events)
+    count = len(events)
+    noun = "event" if count == 1 else "events"
+    parts = [f"You have {count} {noun} {mode}: {listed}."]
+    if mode == "today":
+        next_event = find_next_upcoming_timed_event(events, now=now)
+        if next_event is not None:
+            parts.append(
+                f"Your next meeting is {next_event.title} at "
+                f"{_format_time(next_event.start)}."
+            )
+    return _truncate(" ".join(parts), max_chars)
+
+
+def render_briefing(
+    result: BriefingResult,
+    *,
+    max_chars: int,
+    now_day: Optional[date] = None,
+    now: Optional[datetime] = None,
+) -> str:
     """Render a spoken-friendly summary, or a fixed note when both fail.
 
     A failed source is reported as failed and never as "empty": the calendar
     sentence only appears when the calendar was read, likewise for tasks.
+    When ``now`` is supplied the next upcoming *timed* event is highlighted.
     """
     if not result.calendar_ok and not result.tasks_ok:
         return _truncate(
             "I couldn't read your calendar or your tasks right now.", max_chars
         )
 
+    day_label = _day_label_for(result.day, now_day or result.day)
     parts = [f"Here is your briefing for {_format_date(result.day)}."]
 
     if result.calendar_ok:
-        parts.append(_describe_events(result.events))
+        parts.append(_describe_events(result.events, day_label=day_label))
         conflicts = calendar_conflicts(result.events)
         if conflicts:
             first, second = conflicts[0]
@@ -397,11 +489,18 @@ def render_briefing(result: BriefingResult, *, max_chars: int) -> str:
                 f"You have {noun}: {first.title} at {_format_time(first.start)} "
                 f"overlaps {second.title} at {_format_time(second.start)}."
             )
+        if now is not None:
+            next_event = find_next_upcoming_timed_event(result.events, now=now)
+            if next_event is not None:
+                parts.append(
+                    f"Your next meeting is {next_event.title} at "
+                    f"{_format_time(next_event.start)}."
+                )
     else:
         parts.append("I couldn't read your calendar right now.")
 
     if result.tasks_ok:
-        parts.append(_describe_tasks(result.tasks, result.day))
+        parts.append(_describe_tasks(result.tasks, result.day, day_label=day_label))
     else:
         parts.append("I couldn't read your tasks right now.")
 
@@ -445,15 +544,15 @@ class DailyBriefingService:
         )
         self._clock = clock if clock is not None else datetime.now
 
-    def build(self) -> BriefingResult:
+    def build(self, *, day: Optional[date] = None) -> BriefingResult:
         now = self._clock()
-        day = now.date()
+        target_day = day if day is not None else now.date()
 
         events: "tuple[CalendarEvent, ...]" = ()
         calendar_status = BriefingStatus.OK
         calendar_message = ""
         try:
-            events = tuple(self._calendar.events_for(day))[: self._max_events]
+            events = tuple(self._calendar.events_for(target_day))[: self._max_events]
         except CalendarProviderError as exc:
             calendar_status = exc.status
             calendar_message = exc.message
@@ -462,7 +561,7 @@ class DailyBriefingService:
         task_status = BriefingStatus.OK
         tasks_message = ""
         try:
-            tasks = prioritize_tasks(self._tasks.tasks(), day=day)[
+            tasks = prioritize_tasks(self._tasks.tasks(), day=target_day)[
                 : self._max_tasks
             ]
         except TaskProviderError as exc:
@@ -470,7 +569,7 @@ class DailyBriefingService:
             tasks_message = exc.message
 
         result = BriefingResult(
-            day=day,
+            day=target_day,
             calendar_status=calendar_status,
             events=events,
             calendar_message=calendar_message,
@@ -478,7 +577,12 @@ class DailyBriefingService:
             tasks=tasks,
             tasks_message=tasks_message,
         )
-        text = render_briefing(result, max_chars=self._max_text_chars)
+        text = render_briefing(
+            result,
+            max_chars=self._max_text_chars,
+            now_day=now.date(),
+            now=now,
+        )
         return BriefingResult(
             day=result.day,
             calendar_status=result.calendar_status,
@@ -489,6 +593,55 @@ class DailyBriefingService:
             tasks_message=result.tasks_message,
             text=text,
         )
+
+    def build_schedule(self, mode: str = "next") -> tuple[str, BriefingStatus]:
+        """Return ``(text, calendar_status)`` for a read-only schedule query.
+
+        ``mode`` selects the day(s) to read: ``next`` looks at today and
+        tomorrow to find the next timed event, ``today`` reads today and
+        ``tomorrow`` reads tomorrow. Only the calendar is read; nothing is
+        ever written. A provider failure is returned as a retrieval failure
+        rather than as "no events".
+        """
+        if mode not in SCHEDULE_MODES:
+            mode = "next"
+        now = self._clock()
+        today = now.date()
+        if mode == "tomorrow":
+            days = (today + timedelta(days=1),)
+        elif mode == "today":
+            days = (today,)
+        else:
+            days = (today, today + timedelta(days=1))
+
+        events_list: "list[CalendarEvent]" = []
+        seen: "set[tuple[str, datetime, Optional[datetime], bool]]" = set()
+        try:
+            for day in days:
+                for event in self._calendar.events_for(day):
+                    key = (event.title, event.start, event.end, event.all_day)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    events_list.append(event)
+        except CalendarProviderError as exc:
+            return (
+                _truncate(
+                    "I couldn't retrieve your schedule right now.",
+                    self._max_text_chars,
+                ),
+                exc.status,
+            )
+
+        events = tuple(events_list)[: self._max_events]
+        text = render_schedule(
+            events,
+            mode=mode,
+            now=now,
+            max_chars=self._max_text_chars,
+            calendar_ok=True,
+        )
+        return text, BriefingStatus.OK
 
     def __call__(self) -> BriefingResult:
         return self.build()

@@ -4,6 +4,10 @@ Jarvis can answer "brief me on today", "what's my schedule today", "what
 should I prioritize today" or "what are my tasks today" with a short,
 read-aloud summary of **today's Google Calendar events** and your
 **incomplete Google Tasks**, ordered so the most urgent work is named first.
+It can also answer a focused read-only **"what's next?"** question about the
+next upcoming timed event, or today's/tomorrow's schedule. With
+`--startup-briefing` it can additionally read today's briefing aloud once,
+as Jarvis starts.
 
 It is deliberately conservative:
 
@@ -17,7 +21,8 @@ It is deliberately conservative:
   empty.
 
 - **Domain:** `core/briefing.py` (records, providers, priorities, rendering).
-- **Tool:** `core/briefing_tools.py` (`daily_briefing`, `SAFE`).
+- **Tools:** `core/briefing_tools.py` (`daily_briefing` and `what_next`, both
+  `SAFE` and read-only).
 - **Google adapters:** `core/google_calendar.py`, `core/google_tasks.py`.
 - **OAuth:** `core/google_auth.py`.
 - **Wiring:** `app.py` (flags, `BriefingConfig`, injected service).
@@ -31,6 +36,9 @@ It is deliberately conservative:
 
 # Then run with the briefing enabled
 .\.venv\Scripts\python app.py --tools --briefing
+
+# Optional: also read today's briefing aloud once, at startup
+.\.venv\Scripts\python app.py --tools --briefing --startup-briefing
 ```
 
 `--briefing` without `--tools` is reported and stays disabled
@@ -58,10 +66,66 @@ recognised only when the briefing is enabled.
 | "what are my tasks today", "what are my tasks", "what are my tasks for today" | `daily_briefing` | `SAFE` |
 | "what should I prioritize today", "what should I prioritise today", "what should I focus on today" | `daily_briefing` | `SAFE` |
 | "what's on my plate today", "what's on my agenda today", "what's my agenda today", "what do I have today" | `daily_briefing` | `SAFE` |
+| "what's next?", "what's my next meeting?", "what do I have next?" | `what_next` (`when=next`) | `SAFE` |
+| "do I have any meetings today?", "do I have any meetings" | `what_next` (`when=today`) | `SAFE` |
+| "what's on my schedule tomorrow?", "what's my schedule tomorrow", "tomorrow schedule" | `what_next` (`when=tomorrow`) | `SAFE` |
 
 A phrase that is not in the list is not hijacked: an unrelated question
 still routes to web research (if enabled) or stays unsupported, and an
-action request ("open chrome") is never turned into a briefing.
+action request ("open chrome") is never turned into a briefing. The
+schedule phrases carry a single fixed, bounded argument (`when` is exactly
+one of `next`, `today`, `tomorrow`); nothing the user says is copied into
+arguments, and there is no fuzzy or broad matching, so "add a meeting
+tomorrow at 3pm" is never mistaken for a schedule question.
+
+## "What's next?" (read-only)
+
+`what_next` is a focused, read-only query built on the same
+`DailyBriefingService` and calendar provider as the briefing:
+
+- **`next`** reports the next upcoming *timed* event strictly after the
+  current time (it looks across today and tomorrow). All-day events are
+  never given an invented time: if only an all-day event is ahead, the reply
+  says so without a clock time. If nothing is ahead it says "You have no
+  upcoming events."
+- **`today`** lists today's events and highlights the next timed one.
+- **`tomorrow`** lists tomorrow's events.
+
+It uses the injected clock and the local timezone, reports a failed
+retrieval as a failure (never as "no events"), and never creates, edits or
+deletes anything. The same opt-in flags as the briefing (`--tools
+--briefing`, plus the one-time `--briefing-auth`) enable it; with the
+briefing disabled the phrases stay unsupported (or, for the "today"
+schedule view only, fall back to the argumentless `daily_briefing`).
+
+## Startup briefing (read-only)
+
+With `--startup-briefing`, Jarvis reads today's briefing aloud **once**, as
+it starts and before it begins listening for commands. It is the same
+briefing as the "brief me on today" command, produced by the same
+`DailyBriefingService` and read-only calendar/task providers.
+
+- **Off by default and doubly gated.** It requires **both** `--tools` and
+  `--briefing` (which in turn needs the one-time `--briefing-auth`). If a
+  prerequisite is missing the reason is printed
+  (`Startup briefing requires --tools; keeping it disabled.` or
+  `Startup briefing requires --briefing; keeping it disabled.`) and the
+  feature stays off — it never silently enables the briefing and it never
+  runs an OAuth flow.
+- **Once per startup.** It runs on the startup path, at most once, and is
+  never repeated inside the listening loop.
+- **Same guarantees as the command.** It never creates, edits, completes
+  or deletes an event or a task, never launches an application, and never
+  runs any tool other than the read-only `daily_briefing` tool. It is
+  delivered through the same guarded executor as every other tool.
+- **Best effort.** If the briefing is unavailable (no token, Google
+  libraries missing) it says so; if reading a source fails it is reported
+  as a failure, never as empty. If delivery itself fails, Jarvis logs a
+  warning and continues into the normal session — a startup nicety never
+  stops Jarvis from starting.
+- **Same output path.** It uses the normal speaker/output mechanism, so
+  `--no-speech` still prints it as text, and a speaker failure falls back
+  to text-only without crashing.
 
 ## What the briefing contains
 
@@ -69,6 +133,8 @@ When both sources are readable, the reply is a short spoken summary:
 
 - The date and the number of events today, each event with its local time
   (or "all day").
+- The next upcoming *timed* event today ("Your next meeting is ... at ..."),
+  when one is still ahead; an all-day event is never given an invented time.
 - A note about overlapping *timed* events (all-day events are never counted
   as conflicts).
 - The count of incomplete tasks needing attention, grouped as **Overdue**,
@@ -190,6 +256,9 @@ honestly:
 | Tasks fails, calendar works | the event summary, plus "I couldn't read your tasks right now." — **never** "you have no tasks" |
 | Both fail | "I couldn't read your calendar or your tasks right now." |
 | Not authorized / libraries missing | the briefing tool reports that it is unavailable; other commands still work |
+| `what_next` `next`, nothing ahead | "You have no upcoming events." |
+| `what_next` `today`/`tomorrow`, nothing on that day | "You have no events today." / "You have no events tomorrow." |
+| `what_next`, calendar read fails | "I couldn't retrieve your schedule right now." - **never** "no events" |
 
 A 401 (revoked / expired authorization) is reported as re-authorization
 required; a 403/429 or transport error is reported as temporarily
@@ -321,15 +390,28 @@ such as "what's on my calendar today" — is never treated as a creation.
   weather, no locations-from-calendar geocoding, and no calendar selection in
   the CLI (set `BriefingConfig`/`CalendarWriteConfig.calendar_id` in code).
 - **Phrase-set routing only.** A casually-worded request that is not in the
-  fixed phrase list is not recognised as a briefing.
+  fixed phrase list is not recognised as a briefing. This also applies to
+  `what_next`: only the fixed schedule phrases above are recognised, each
+  mapping to one bounded `when` value, and an ambiguous request falls back
+  or stays unsupported rather than being guessed.
+- **`what_next` `next` looks only at today and tomorrow.** It reads the
+  calendar for the current day and the next to find the next timed event;
+  an event further out than tomorrow is not reported.
+- **The startup briefing is text, not a conversation.** It reads the
+  briefing once and then returns immediately to waiting for activation
+  (or the wake phrase); it does not start a command session, and it does
+  not speak again until you ask.
 - **The first real run needs a browser** for consent; the token then lives
   in your user profile in plain text.
 
 ## Testing
 
 `tests/test_briefing.py` (domain: cleaning, priority ordering, conflicts,
-rendering, bounded output, partial failures, the tool spec, routing, registry
-wiring and `main` opt-in), `tests/test_google_calendar.py`,
+rendering, bounded output, partial failures, the `what_next` schedule
+rendering and next-event selection, the tool specs, routing, registry wiring,
+`main` opt-in and the Batch 24 startup briefing — off by default, missing
+prerequisites, delivered once through the executor, empty/failed/partial
+sources, speaker failure and failure-continues), `tests/test_google_calendar.py`,
 `tests/test_google_tasks.py` and `tests/test_google_auth.py` (adapters and
 OAuth helper) and the `TestBriefingConfig` block in `tests/test_config.py`
 all run offline with fake providers, fake API clients, fakes for the
@@ -374,26 +456,35 @@ during the automated verification.
    day; rename the token back. *(not run here)*
 6. **No auto-consent.** Start normally (no `--briefing-auth`) and confirm no
    browser opens.
+7. **Startup briefing.** Run
+   `.\.venv\Scripts\python app.py --tools --briefing --startup-briefing` and
+   confirm today's briefing is read once, immediately, before Jarvis waits
+   for a command; asking again with "brief me on today" still works.
+   *(not run here)*
+8. **Startup briefing prerequisites.** Run with `--startup-briefing` but
+   without `--briefing` and confirm it prints
+   `Startup briefing requires --briefing; keeping it disabled.` and starts
+   normally with no briefing.
 
 ### Calendar event creation
 
-7. **Off by default.** Run `.\.venv\Scripts\python app.py --tools`, say
+9. **Off by default.** Run `.\.venv\Scripts\python app.py --tools`, say
    "schedule a meeting with bob tomorrow at 3pm for 30 minutes", and expect
    `I can't do that yet; …`.
-8. **Doubly opt-in.** Run `.\.venv\Scripts\python app.py --calendar-write`
-   (no `--tools`), say the same phrase, and expect
-   `Calendar event creation requires --tools; …`.
-9. **Authorize write.** Run
-   `.\.venv\Scripts\python app.py --tools --calendar-write-auth` and complete
-   the browser consent with your own account. Expect a stored
-   `token_calendar_write.json` and the success message. This is a **separate**
-   grant from `--briefing-auth`. *(not run here)*
-10. **Create.** Run `.\.venv\Scripts\python app.py --tools --calendar-write`,
+10. **Doubly opt-in.** Run `.\.venv\Scripts\python app.py --calendar-write`
+    (no `--tools`), say the same phrase, and expect
+    `Calendar event creation requires --tools; …`.
+11. **Authorize write.** Run
+    `.\.venv\Scripts\python app.py --tools --calendar-write-auth` and complete
+    the browser consent with your own account. Expect a stored
+    `token_calendar_write.json` and the success message. This is a **separate**
+    grant from `--briefing-auth`. *(not run here)*
+12. **Create.** Run `.\.venv\Scripts\python app.py --tools --calendar-write`,
     say "schedule a meeting with bob tomorrow at 3pm for 30 minutes", confirm
     the exact details, and check that a single event appears on your calendar.
     *(not run here)*
-11. **Deny.** Repeat but decline the confirmation and confirm **no** event was
+13. **Deny.** Repeat but decline the confirmation and confirm **no** event was
     created. *(not run here)*
-12. **Ambiguous outcome.** If a write times out, confirm Jarvis says it could
+14. **Ambiguous outcome.** If a write times out, confirm Jarvis says it could
     not confirm and asks you to check your calendar — and that it did **not**
     create a second copy. *(not run here)*

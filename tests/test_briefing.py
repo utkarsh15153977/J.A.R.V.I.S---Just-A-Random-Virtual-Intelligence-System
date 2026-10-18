@@ -14,6 +14,7 @@ from config import BriefingConfig, ToolsConfig
 from core.briefing import (
     MAX_TEXT_CHARS,
     TOOL_DAILY_BRIEFING,
+    TOOL_WHAT_NEXT,
     BriefingResult,
     BriefingStatus,
     BriefingTask,
@@ -23,12 +24,19 @@ from core.briefing import (
     MockTaskProvider,
     calendar_conflicts,
     clean_text,
+    find_next_upcoming_timed_event,
     prioritize_tasks,
     render_briefing,
+    render_schedule,
     task_priority,
 )
-from core.briefing_tools import build_briefing_spec
-from core.permissions import PermissionLevel
+from core.briefing_tools import build_briefing_spec, build_what_next_spec
+from core.executor import ToolExecutor
+from core.permissions import (
+    ConsoleApprovalProvider,
+    PermissionLevel,
+    PermissionPolicy,
+)
 from core.router import CommandKind
 from core.tools import ToolInputError
 
@@ -271,6 +279,300 @@ class TestRenderBriefing(unittest.TestCase):
         )
         self.assertIn("standup", text)
         self.assertIn("couldn't read your tasks", text)
+
+    def test_highlights_next_upcoming_timed_event(self):
+        early = CalendarEvent(
+            "early", datetime(2026, 10, 5, 9), datetime(2026, 10, 5, 9, 30)
+        )
+        late = CalendarEvent(
+            "late", datetime(2026, 10, 5, 14), datetime(2026, 10, 5, 15)
+        )
+        text = render_briefing(
+            self._result(events=(late, early)),
+            max_chars=600,
+            now=datetime(2026, 10, 5, 8),
+        )
+        self.assertIn("Your next meeting is early", text)
+
+    def test_all_day_only_event_gets_no_invented_time_highlight(self):
+        all_day = CalendarEvent(
+            "holiday", datetime(2026, 10, 5), all_day=True
+        )
+        text = render_briefing(
+            self._result(events=(all_day,)),
+            max_chars=600,
+            now=datetime(2026, 10, 5, 8),
+        )
+        self.assertIn("all day", text.lower())
+        self.assertNotIn("Your next meeting", text)
+
+    def test_no_next_highlight_without_a_clock(self):
+        event = CalendarEvent(
+            "standup", datetime(2026, 10, 5, 10), datetime(2026, 10, 5, 10, 30)
+        )
+        text = render_briefing(self._result(events=(event,)), max_chars=600)
+        self.assertNotIn("Your next meeting", text)
+
+    def test_next_day_label_is_relative(self):
+        text = render_briefing(
+            self._result(day=date(2026, 10, 6), events=()),
+            max_chars=600,
+            now_day=date(2026, 10, 5),
+        )
+        self.assertIn("no events tomorrow", text)
+
+
+class TestFindNextUpcomingTimedEvent(unittest.TestCase):
+    def test_picks_earliest_future_timed_event(self):
+        early = CalendarEvent(
+            "early", datetime(2026, 10, 5, 9), datetime(2026, 10, 5, 9, 30)
+        )
+        late = CalendarEvent(
+            "late", datetime(2026, 10, 5, 14), datetime(2026, 10, 5, 15)
+        )
+        event = find_next_upcoming_timed_event(
+            (late, early), now=datetime(2026, 10, 5, 8)
+        )
+        self.assertIs(event, early)
+
+    def test_ignores_all_day_events(self):
+        all_day = CalendarEvent(
+            "holiday", datetime(2026, 10, 5), all_day=True
+        )
+        timed = CalendarEvent(
+            "standup", datetime(2026, 10, 5, 10), datetime(2026, 10, 5, 10, 30)
+        )
+        event = find_next_upcoming_timed_event(
+            (all_day, timed), now=datetime(2026, 10, 5, 8)
+        )
+        self.assertIs(event, timed)
+
+    def test_ignores_past_events(self):
+        past = CalendarEvent(
+            "past", datetime(2026, 10, 5, 7), datetime(2026, 10, 5, 7, 30)
+        )
+        self.assertIsNone(
+            find_next_upcoming_timed_event(
+                (past,), now=datetime(2026, 10, 5, 8)
+            )
+        )
+
+    def test_event_starting_exactly_now_is_not_upcoming(self):
+        event = CalendarEvent(
+            "now", datetime(2026, 10, 5, 8), datetime(2026, 10, 5, 8, 30)
+        )
+        self.assertIsNone(
+            find_next_upcoming_timed_event(
+                (event,), now=datetime(2026, 10, 5, 8)
+            )
+        )
+
+
+class TestRenderSchedule(unittest.TestCase):
+    NOW = datetime(2026, 10, 5, 8)
+
+    def test_next_names_next_timed_event(self):
+        event = CalendarEvent(
+            "standup", datetime(2026, 10, 5, 10), datetime(2026, 10, 5, 10, 30)
+        )
+        text = render_schedule(
+            (event,), mode="next", now=self.NOW, max_chars=600
+        )
+        self.assertIn("next meeting is standup", text)
+        self.assertIn("10:00 AM", text)
+
+    def test_next_with_only_all_day_does_not_invent_a_time(self):
+        all_day = CalendarEvent(
+            "conference", datetime(2026, 10, 5), all_day=True
+        )
+        text = render_schedule(
+            (all_day,), mode="next", now=self.NOW, max_chars=600
+        )
+        self.assertIn("no timed events", text)
+        self.assertIn("conference", text)
+        self.assertIn("all day", text.lower())
+        self.assertNotIn("AM", text)
+        self.assertNotIn("PM", text)
+
+    def test_next_with_nothing_says_no_upcoming_events(self):
+        text = render_schedule((), mode="next", now=self.NOW, max_chars=600)
+        self.assertEqual(text, "You have no upcoming events.")
+
+    def test_today_lists_events_and_highlights_next(self):
+        early = CalendarEvent(
+            "early", datetime(2026, 10, 5, 9), datetime(2026, 10, 5, 9, 30)
+        )
+        late = CalendarEvent(
+            "late", datetime(2026, 10, 5, 14), datetime(2026, 10, 5, 15)
+        )
+        text = render_schedule(
+            (early, late), mode="today", now=self.NOW, max_chars=600
+        )
+        self.assertIn("You have 2 events today", text)
+        self.assertIn("early", text)
+        self.assertIn("late", text)
+        self.assertIn("Your next meeting is early", text)
+
+    def test_today_empty_says_no_events_today(self):
+        text = render_schedule((), mode="today", now=self.NOW, max_chars=600)
+        self.assertEqual(text, "You have no events today.")
+
+    def test_tomorrow_lists_events(self):
+        event = CalendarEvent(
+            "review", datetime(2026, 10, 6, 15), datetime(2026, 10, 6, 16)
+        )
+        text = render_schedule(
+            (event,), mode="tomorrow", now=self.NOW, max_chars=600
+        )
+        self.assertIn("1 event tomorrow", text)
+        self.assertIn("review", text)
+
+    def test_tomorrow_empty_says_no_events_tomorrow(self):
+        text = render_schedule((), mode="tomorrow", now=self.NOW, max_chars=600)
+        self.assertEqual(text, "You have no events tomorrow.")
+
+    def test_failure_is_never_reported_as_empty(self):
+        for mode in ("next", "today", "tomorrow"):
+            with self.subTest(mode=mode):
+                text = render_schedule(
+                    (), mode=mode, now=self.NOW, max_chars=600,
+                    calendar_ok=False,
+                )
+                self.assertIn("couldn't retrieve your schedule", text)
+                self.assertNotIn("no events", text)
+                self.assertNotIn("no upcoming events", text)
+
+    def test_output_is_bounded(self):
+        events = tuple(
+            CalendarEvent(
+                f"event number {index}",
+                datetime(2026, 10, 5, 9),
+                datetime(2026, 10, 5, 10),
+            )
+            for index in range(20)
+        )
+        text = render_schedule(
+            events, mode="today", now=self.NOW, max_chars=80
+        )
+        self.assertLessEqual(len(text), 80)
+
+
+class TestBuildSchedule(unittest.TestCase):
+    def _service(self, **kwargs):
+        defaults = {
+            "clock": fixed_clock(datetime(2026, 10, 5, 8)),
+        }
+        defaults.update(kwargs)
+        return DailyBriefingService(
+            MockCalendarProvider(
+                events=(
+                    CalendarEvent(
+                        "standup",
+                        datetime(2026, 10, 5, 10),
+                        datetime(2026, 10, 5, 10, 30),
+                    ),
+                )
+            ),
+            MockTaskProvider(),
+            **defaults,
+        )
+
+    def test_next_finds_upcoming_event(self):
+        text, status = self._service().build_schedule("next")
+        self.assertIs(status, BriefingStatus.OK)
+        self.assertIn("standup", text)
+
+    def test_next_does_not_duplicate_across_days(self):
+        text, _ = self._service().build_schedule("next")
+        self.assertEqual(text.count("standup"), 1)
+
+    def test_uses_injected_clock_for_today(self):
+        # At 15:00 the 10:00 standup is already past, so "next" is empty.
+        service = self._service(
+            clock=fixed_clock(datetime(2026, 10, 5, 15))
+        )
+        text, _ = service.build_schedule("next")
+        self.assertEqual(text, "You have no upcoming events.")
+
+    def test_provider_failure_reports_retrieval_not_empty(self):
+        service = DailyBriefingService(
+            MockCalendarProvider(error=BriefingStatus.ERROR),
+            MockTaskProvider(),
+            clock=fixed_clock(datetime(2026, 10, 5, 8)),
+        )
+        text, status = service.build_schedule("next")
+        self.assertIn("couldn't retrieve your schedule", text)
+        self.assertNotIn("no upcoming events", text)
+        self.assertIs(status, BriefingStatus.ERROR)
+
+    def test_invalid_mode_defaults_to_next(self):
+        text, _ = self._service().build_schedule("whenever")
+        self.assertIn("standup", text)
+
+    def test_tomorrow_only_reads_tomorrow(self):
+        service = DailyBriefingService(
+            MockCalendarProvider(
+                events=(
+                    CalendarEvent(
+                        "tomorrow review",
+                        datetime(2026, 10, 6, 9),
+                        datetime(2026, 10, 6, 10),
+                    ),
+                )
+            ),
+            MockTaskProvider(),
+            clock=fixed_clock(datetime(2026, 10, 5, 8)),
+        )
+        text, _ = service.build_schedule("tomorrow")
+        self.assertIn("tomorrow review", text)
+        self.assertIn("1 event tomorrow", text)
+
+
+class TestWhatNextToolSpec(unittest.TestCase):
+    def _service(self):
+        return DailyBriefingService(
+            MockCalendarProvider(
+                events=(
+                    CalendarEvent(
+                        "standup",
+                        datetime(2026, 10, 5, 10),
+                        datetime(2026, 10, 5, 10, 30),
+                    ),
+                )
+            ),
+            MockTaskProvider(),
+            clock=fixed_clock(datetime(2026, 10, 5, 8)),
+        )
+
+    def test_spec_is_safe_and_named(self):
+        spec = build_what_next_spec(self._service())
+        self.assertEqual(spec.name, TOOL_WHAT_NEXT)
+        self.assertIs(spec.permission, PermissionLevel.SAFE)
+
+    def test_handler_defaults_to_next(self):
+        spec = build_what_next_spec(self._service())
+        result = spec.handler()
+        self.assertIn("standup", result["text"])
+
+    def test_validate_accepts_modes(self):
+        spec = build_what_next_spec(self._service())
+        self.assertEqual(spec.validate({}), {})
+        for mode in ("next", "today", "tomorrow"):
+            with self.subTest(mode=mode):
+                self.assertEqual(spec.validate({"when": mode}), {"when": mode})
+
+    def test_validate_rejects_unknown_keys_and_values(self):
+        spec = build_what_next_spec(self._service())
+        for raw in (
+            {"when": "whenever"},
+            {"when": 3},
+            {"when": None},
+            {"other": "next"},
+            {"when": "next", "extra": "x"},
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ToolInputError):
+                    spec.validate(raw)
 
 
 class TestDailyBriefingService(unittest.TestCase):
@@ -534,6 +836,90 @@ class TestBriefingRouting(unittest.TestCase):
                 )
 
 
+class TestScheduleRouting(unittest.TestCase):
+    """Fixed "what's next?" phrases route read-only; nothing else is hijacked."""
+
+    def _router(self, tool=TOOL_WHAT_NEXT, briefing=TOOL_DAILY_BRIEFING):
+        from core.router import ToolCommandRouter
+
+        available = ["get_current_time"]
+        if tool:
+            available.append(tool)
+        if briefing:
+            available.append(briefing)
+        return ToolCommandRouter(
+            (),
+            available_tools=tuple(available),
+            what_next_tool=tool,
+            briefing_tool=briefing,
+        )
+
+    def test_next_phrases_route_with_next_mode(self):
+        router = self._router()
+        for text in (
+            "what's next?",
+            "what's my next meeting?",
+            "what do I have next?",
+            "what is my next meeting",
+        ):
+            with self.subTest(text=text):
+                command = router.route(text)
+                self.assertIs(command.kind, CommandKind.TOOL)
+                self.assertEqual(command.tool_name, TOOL_WHAT_NEXT)
+                self.assertEqual(dict(command.arguments), {"when": "next"})
+
+    def test_today_phrases_route_with_today_mode(self):
+        router = self._router()
+        for text in ("do I have any meetings today?", "do i have any meetings"):
+            with self.subTest(text=text):
+                command = router.route(text)
+                self.assertEqual(command.tool_name, TOOL_WHAT_NEXT)
+                self.assertEqual(dict(command.arguments), {"when": "today"})
+
+    def test_tomorrow_phrases_route_with_tomorrow_mode(self):
+        router = self._router()
+        for text in (
+            "what's on my schedule tomorrow?",
+            "what is my schedule tomorrow",
+            "tomorrow schedule",
+        ):
+            with self.subTest(text=text):
+                command = router.route(text)
+                self.assertEqual(command.tool_name, TOOL_WHAT_NEXT)
+                self.assertEqual(dict(command.arguments), {"when": "tomorrow"})
+
+    def test_unregistered_leaves_phrases_unsupported(self):
+        router = self._router(tool=None, briefing=None)
+        self.assertIs(
+            router.route("what's next?").kind, CommandKind.UNSUPPORTED
+        )
+
+    def test_today_falls_back_to_briefing_when_what_next_absent(self):
+        router = self._router(tool=None, briefing=TOOL_DAILY_BRIEFING)
+        command = router.route("do i have any meetings today?")
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_DAILY_BRIEFING)
+
+    def test_next_never_falls_back_to_briefing(self):
+        router = self._router(tool=None, briefing=TOOL_DAILY_BRIEFING)
+        self.assertIs(
+            router.route("what's next?").kind, CommandKind.UNSUPPORTED
+        )
+
+    def test_broad_or_fuzzy_phrases_are_not_hijacked(self):
+        router = self._router()
+        for text in (
+            "meet me next week",
+            "add a meeting tomorrow at 3pm",
+            "what is the meaning of next",
+            "schedule a meeting",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNot(
+                    router.route(text).kind, CommandKind.TOOL
+                )
+
+
 class TestBriefingRegistryWiring(unittest.TestCase):
     def _service(self):
         return DailyBriefingService(
@@ -554,6 +940,10 @@ class TestBriefingRegistryWiring(unittest.TestCase):
         self.assertIs(
             registry.get(TOOL_DAILY_BRIEFING).permission, PermissionLevel.SAFE
         )
+        self.assertIn(TOOL_WHAT_NEXT, registry.names())
+        self.assertIs(
+            registry.get(TOOL_WHAT_NEXT).permission, PermissionLevel.SAFE
+        )
 
     def test_tool_absent_when_disabled(self):
         from app import _build_registry
@@ -565,6 +955,7 @@ class TestBriefingRegistryWiring(unittest.TestCase):
             briefing_service=self._service(),
         )
         self.assertNotIn(TOOL_DAILY_BRIEFING, registry.names())
+        self.assertNotIn(TOOL_WHAT_NEXT, registry.names())
 
     def test_tool_absent_without_tools(self):
         from app import _build_registry
@@ -576,6 +967,7 @@ class TestBriefingRegistryWiring(unittest.TestCase):
             briefing_service=self._service(),
         )
         self.assertNotIn(TOOL_DAILY_BRIEFING, registry.names())
+        self.assertNotIn(TOOL_WHAT_NEXT, registry.names())
 
     def test_tool_absent_without_service(self):
         from app import _build_registry
@@ -587,6 +979,7 @@ class TestBriefingRegistryWiring(unittest.TestCase):
             briefing_service=None,
         )
         self.assertNotIn(TOOL_DAILY_BRIEFING, registry.names())
+        self.assertNotIn(TOOL_WHAT_NEXT, registry.names())
 
 
 class TestBriefingMainIntegration(unittest.TestCase):
@@ -660,6 +1053,33 @@ class TestBriefingMainIntegration(unittest.TestCase):
         self.assertIn("standup", joined)
         self.assertIn("pay bill", joined)
 
+    def test_whats_next_runs_through_the_executor(self):
+        from app import EXIT_OK
+
+        code, output = self._run(
+            ["--tools", "--briefing"],
+            ["what's next?", "exit"],
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=self._service(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("standup", joined)
+
+    def test_schedule_query_is_read_only_and_not_confirmed(self):
+        from app import EXIT_OK
+
+        code, output = self._run(
+            ["--tools", "--briefing"],
+            ["do I have any meetings today?", "exit"],
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=self._service(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output).lower()
+        self.assertNotIn("confirm", joined)
+        self.assertIn("standup", joined)
+
     def test_no_oauth_flow_during_a_normal_run(self):
         from unittest import mock
 
@@ -725,6 +1145,410 @@ class TestBriefingMainIntegration(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class _FailingSpeaker:
+    """A speaker whose every utterance fails, like a lost audio device."""
+
+    def __init__(self):
+        self.spoken = []
+
+    def speak(self, text):
+        self.spoken.append(text)
+        raise RuntimeError("audio device lost")
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _CountingBriefingService(DailyBriefingService):
+    """A service that records how many times ``build`` was called."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.build_calls = 0
+
+    def build(self, *, day=None):
+        self.build_calls += 1
+        return super().build(day=day)
+
+
+class _RecordingExecutor(ToolExecutor):
+    """An executor that records every tool id it is asked to run."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.calls = []
+
+    def execute(self, name, raw_args=None):
+        self.calls.append(name)
+        return super().execute(name, raw_args)
+
+
+class TestStartupBriefing(unittest.TestCase):
+    """Batch 24: the optional one-shot read-only startup briefing.
+
+    Everything is offline: injected providers, a fixed clock, a fake
+    listener/speaker and an injected service. No Google library, network,
+    microphone or OAuth flow is touched.
+    """
+
+    def _service(self, clock=None):
+        return DailyBriefingService(
+            MockCalendarProvider(
+                events=(
+                    CalendarEvent(
+                        "standup",
+                        datetime(2026, 10, 5, 10),
+                        datetime(2026, 10, 5, 10, 30),
+                    ),
+                )
+            ),
+            MockTaskProvider(
+                tasks=(BriefingTask("pay bill", due=datetime(2026, 10, 1)),)
+            ),
+            clock=clock or fixed_clock(datetime(2026, 10, 5, 8)),
+        )
+
+    def _run(self, argv, texts, service, speaker=None, **kwargs):
+        from app import main
+
+        output = []
+        speaker = speaker if speaker is not None else _FakeSpeaker()
+        code = main(
+            argv,
+            listener_factory=lambda config: _FakeListener(texts),
+            speaker_factory=lambda config: speaker,
+            output=output.append,
+            briefing_service=service,
+            **kwargs,
+        )
+        return code, output, speaker
+
+    # -- Off by default / prerequisites ---------------------------------
+    def test_off_by_default(self):
+        from app import EXIT_OK
+
+        code, output, _ = self._run(
+            ["--tools", "--briefing"], ["exit"], self._service()
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Jarvis is ready", joined)
+        self.assertNotIn("Startup briefing", joined)
+        self.assertNotIn("standup", joined)
+
+    def test_existing_startup_path_unchanged_when_disabled(self):
+        from app import EXIT_OK
+
+        code, output, _ = self._run(
+            ["--tools"], ["exit"], self._service()
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Jarvis is ready", joined)
+        self.assertIn("Read-only tools are ON", joined)
+        self.assertNotIn("Startup briefing", joined)
+
+    def test_requires_tools(self):
+        from app import EXIT_OK
+
+        code, output, _ = self._run(
+            ["--startup-briefing"], ["exit"], self._service()
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Startup briefing requires --tools", joined)
+        self.assertNotIn("standup", joined)
+
+    def test_requires_briefing(self):
+        from app import EXIT_OK
+
+        code, output, _ = self._run(
+            ["--tools", "--startup-briefing"], ["exit"], self._service()
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Startup briefing requires --briefing", joined)
+        self.assertNotIn("standup", joined)
+
+    def test_config_can_enable_startup_briefing_without_the_flag(self):
+        from app import EXIT_OK
+
+        code, output, _ = self._run(
+            ["--tools", "--briefing"],
+            ["exit"],
+            self._service(),
+            briefing_config=BriefingConfig(
+                enabled=True, startup_briefing=True
+            ),
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Startup briefing is ON", joined)
+        self.assertIn("standup", joined)
+
+    def test_config_startup_briefing_without_enabled_is_reported(self):
+        from app import EXIT_OK
+
+        code, output, _ = self._run(
+            ["--tools"],
+            ["exit"],
+            self._service(),
+            briefing_config=BriefingConfig(startup_briefing=True),
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Startup briefing requires --briefing", joined)
+        self.assertNotIn("standup", joined)
+
+    def test_flag_does_not_silently_enable_the_briefing(self):
+        # With --startup-briefing alone, the briefing phrases stay inert
+        # and nothing is read: the prerequisite is reported, not bypassed.
+        from app import EXIT_OK
+
+        code, output, _ = self._run(
+            ["--startup-briefing"], ["brief me on today", "exit"],
+            self._service(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Startup briefing requires --tools", joined)
+        self.assertIn("can't do that yet", joined)
+
+    # -- Enabled: delivered once, via the executor ----------------------
+    def test_enabled_delivers_the_briefing_once(self):
+        from app import EXIT_OK
+
+        service = _CountingBriefingService(
+            MockCalendarProvider(
+                events=(
+                    CalendarEvent(
+                        "standup",
+                        datetime(2026, 10, 5, 10),
+                        datetime(2026, 10, 5, 10, 30),
+                    ),
+                )
+            ),
+            MockTaskProvider(
+                tasks=(BriefingTask("pay bill", due=datetime(2026, 10, 1)),)
+            ),
+            clock=fixed_clock(datetime(2026, 10, 5, 8)),
+        )
+        code, output, speaker = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["exit"],
+            service,
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(service.build_calls, 1)
+        joined = "\n".join(output)
+        self.assertIn("standup", joined)
+        self.assertIn("pay bill", joined)
+        self.assertTrue(any("standup" in s for s in speaker.spoken))
+
+    def test_runs_only_the_read_only_briefing_tool(self):
+        from app import EXIT_OK, _build_registry
+
+        service = self._service()
+        registry = _build_registry(
+            ToolsConfig(enabled=True),
+            None,
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=service,
+        )
+        executor = _RecordingExecutor(
+            registry, PermissionPolicy(), ConsoleApprovalProvider()
+        )
+        code, _output, _ = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["exit"],
+            service,
+            executor=executor,
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(executor.calls, [TOOL_DAILY_BRIEFING])
+
+    def test_no_confirmation_is_requested(self):
+        from app import EXIT_OK
+
+        code, output, _ = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["exit"],
+            self._service(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertNotIn("confirm", "\n".join(output).lower())
+
+    # -- Source outcomes -------------------------------------------------
+    def test_events_and_urgent_tasks_are_briefed(self):
+        from app import EXIT_OK
+
+        code, output, _ = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["exit"],
+            self._service(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("standup", joined)
+        self.assertIn("pay bill", joined)
+        self.assertIn("Overdue", joined)
+
+    def test_empty_sources_report_empty(self):
+        from app import EXIT_OK
+
+        service = DailyBriefingService(
+            MockCalendarProvider(),
+            MockTaskProvider(),
+            clock=fixed_clock(datetime(2026, 10, 5, 8)),
+        )
+        code, output, _ = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["exit"],
+            service,
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("no events today", joined)
+        self.assertIn("no tasks needing attention", joined)
+
+    def test_calendar_failure_is_not_reported_as_empty(self):
+        from app import EXIT_OK
+
+        service = DailyBriefingService(
+            MockCalendarProvider(error=BriefingStatus.ERROR),
+            MockTaskProvider(tasks=(BriefingTask("pay bill"),)),
+            clock=fixed_clock(datetime(2026, 10, 5, 8)),
+        )
+        code, output, _ = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["exit"],
+            service,
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("couldn't read your calendar", joined)
+        self.assertNotIn("no events today", joined)
+
+    def test_task_failure_is_not_reported_as_empty(self):
+        from app import EXIT_OK
+
+        service = DailyBriefingService(
+            MockCalendarProvider(),
+            MockTaskProvider(error=BriefingStatus.ERROR),
+            clock=fixed_clock(datetime(2026, 10, 5, 8)),
+        )
+        code, output, _ = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["exit"],
+            service,
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("couldn't read your tasks", joined)
+        self.assertNotIn("no tasks needing attention", joined)
+
+    def test_partial_failure_still_briefs_the_working_source(self):
+        from app import EXIT_OK
+
+        service = DailyBriefingService(
+            MockCalendarProvider(
+                events=(
+                    CalendarEvent(
+                        "standup",
+                        datetime(2026, 10, 5, 10),
+                        datetime(2026, 10, 5, 10, 30),
+                    ),
+                )
+            ),
+            MockTaskProvider(error=BriefingStatus.ERROR),
+            clock=fixed_clock(datetime(2026, 10, 5, 8)),
+        )
+        code, output, _ = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["exit"],
+            service,
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("standup", joined)
+        self.assertIn("couldn't read your tasks", joined)
+
+    # -- Failure handling ------------------------------------------------
+    def test_speaker_failure_does_not_crash(self):
+        from app import EXIT_OK
+
+        code, output, speaker = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["exit"],
+            self._service(),
+            speaker=_FailingSpeaker(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Jarvis is ready", joined)
+        self.assertIn("Goodbye", joined)
+        self.assertTrue(any("standup" in s for s in speaker.spoken))
+
+    def test_no_speech_still_prints_the_briefing(self):
+        from app import EXIT_OK, main
+
+        def factory(config):
+            raise AssertionError("speaker must not be created")
+
+        output = []
+        code = main(
+            ["--tools", "--briefing", "--startup-briefing", "--no-speech"],
+            listener_factory=lambda config: _FakeListener(["exit"]),
+            speaker_factory=factory,
+            output=output.append,
+            briefing_service=self._service(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("standup", "\n".join(output))
+
+    def test_briefing_failure_does_not_stop_the_session(self):
+        from app import EXIT_OK
+
+        class _BoomService(DailyBriefingService):
+            def build(self, *, day=None):
+                raise RuntimeError("boom")
+
+        service = _BoomService(MockCalendarProvider(), MockTaskProvider())
+        code, output, _ = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["exit"],
+            service,
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Goodbye", joined)
+
+    # -- Manual Batch 23 queries remain functional ----------------------
+    def test_manual_schedule_queries_still_work_with_startup_on(self):
+        from app import EXIT_OK
+
+        code, output, _ = self._run(
+            ["--tools", "--briefing", "--startup-briefing"],
+            ["what's next?", "brief me on today", "exit"],
+            self._service(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        joined = "\n".join(output)
+        self.assertIn("Your next meeting is standup", joined)
+        self.assertGreaterEqual(joined.count("standup"), 2)
+
+    def test_help_documents_the_startup_flag(self):
+        from app import main
+
+        output = []
+        code = main(["--help"], output=output.append)
+        self.assertEqual(code, 0)
+        self.assertIn("--startup-briefing", "\n".join(output))
 
 
 if __name__ == "__main__":

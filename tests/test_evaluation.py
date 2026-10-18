@@ -107,6 +107,7 @@ class TestEvaluationSuite(unittest.TestCase):
             "voice-research",
             "voice-normalization",
             "voice-security",
+            "voice-schedule",
         ):
             with self.subTest(category=expected):
                 self.assertIn(expected, routing)

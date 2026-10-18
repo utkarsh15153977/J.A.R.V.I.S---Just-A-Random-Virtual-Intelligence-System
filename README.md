@@ -25,8 +25,10 @@ listen, reply out loud, answer those questions, optionally open one of
 those two apps, and stop — nothing more, and nothing dangerous. The
 remaining capabilities are opt-in and off by default: read-only web research
 (with a search-provider API key); a read-only **daily briefing** that
-summarises today's Google Calendar events and incomplete Google Tasks behind
-a one-time `--briefing-auth`; and **Google Calendar event creation**, the
+summarises today's Google Calendar events and incomplete Google Tasks -
+and answers a focused **"what's next?"** about the next timed event or
+today's/tomorrow's schedule - behind a one-time `--briefing-auth`; and
+**Google Calendar event creation**, the
 first *write* capability, behind a one-time `--calendar-write-auth` and
 `--calendar-write`, where every event needs a fresh confirmation of its exact
 details before it is written. See [docs/roadmap.md](docs/roadmap.md) for the
@@ -121,10 +123,18 @@ $env:TAVILY_API_KEY = "tvly-your-key"
 # today", "what's my schedule today", "what should I prioritize today"
 # or "what are my tasks today" to hear today's Google Calendar events and
 # incomplete Google Tasks, with overdue and due-today items prioritised.
+# You can also ask "what's next?", "what's my next meeting?",
+# "do I have any meetings today?" or "what's on my schedule tomorrow?"
+# for a focused read-only schedule answer.
 # It only ever reads; it never changes your calendar or tasks. See
 # docs/briefing.md for the Google Cloud setup.
 .\.venv\Scripts\python app.py --tools --briefing-auth   # once, opens a browser
 .\.venv\Scripts\python app.py --tools --briefing
+
+# Additionally read today's briefing aloud once, when Jarvis starts (OFF by
+# default; requires --tools AND --briefing). It is read-only, runs at most
+# once, and a failure there is reported safely and never stops the session.
+.\.venv\Scripts\python app.py --tools --briefing --startup-briefing
 
 # Additionally enable creating Google Calendar events by voice (OFF by
 # default; requires --tools AND a one-time --calendar-write-auth). Say
@@ -526,9 +536,36 @@ distinct from the briefing phrases; the `--calendar-write` /
 write/read APIs, a fake clock and fake approvals — no Google account,
 credential, browser or network — and pin opt-in/disabled-by-default,
 bound confirmation, duplicate prevention, the tz-free domain, and that write
-credentials stay separate from the briefing. The suite is now 1167 tests
-(4 skipped). See [docs/briefing.md](docs/briefing.md) and
+credentials stay separate from the briefing. See
+[docs/briefing.md](docs/briefing.md) and
 [docs/safety.md](docs/safety.md).
+
+Batch 23 improves the daily-assistant experience. The briefing renderer now
+names the day relative to the injected clock ("today"/"tomorrow"), reports a
+failed source as a failure rather than an empty day, and stays bounded and
+sanitised. A new read-only `what_next` `SAFE` tool reuses the same
+`DailyBriefingService` and calendar provider to answer a focused "what's
+next?" - the next upcoming *timed* event (all-day events are never given an
+invented time), or today's/tomorrow's schedule - behind the fixed schedule
+phrases (`when` is exactly `next`/`today`/`tomorrow`). It never creates or
+edits anything, reports a retrieval failure instead of "no events", and never
+falls back to event creation. Routing/evaluation cases and docs were updated;
+the suite is now 1205 tests (5 skipped). See
+[docs/briefing.md](docs/briefing.md), [docs/safety.md](docs/safety.md) and
+[docs/roadmap.md](docs/roadmap.md).
+
+Batch 24 adds an optional startup briefing. With `--startup-briefing` (off by
+default; requires `--tools` and `--briefing`, so it reuses the one-time
+`--briefing-auth`), Jarvis reads today's briefing aloud **once**, as it
+starts, before waiting for a command. It adds no new engine: it reuses
+`DailyBriefingService` and the same read-only providers, and delivers the
+briefing through the already-registered read-only `daily_briefing` tool and
+the guarded `ToolExecutor` (no handler is called directly). It never writes,
+never launches anything, runs at most once, and a failure is logged safely
+and does not stop the session; with the flag off, startup is unchanged. The
+suite is now 1226 tests (5 skipped). See
+[docs/briefing.md](docs/briefing.md), [docs/safety.md](docs/safety.md) and
+[docs/roadmap.md](docs/roadmap.md).
 
 ## Quality checks
 
@@ -804,7 +841,7 @@ Jarvis/
 │   ├── media.py           # safe local media discovery + file launcher
 │   ├── media_tools.py     # media_play / media_select / media_cancel tools
 │   ├── briefing.py        # daily-briefing domain: providers, priority, render
-│   ├── briefing_tools.py  # daily_briefing tool
+│   ├── briefing_tools.py  # daily_briefing and what_next tools
 │   ├── google_auth.py     # read-only Google OAuth (lazy; user-started only)
 │   ├── google_calendar.py # read-only Google Calendar adapter
 │   ├── google_tasks.py    # read-only Google Tasks adapter

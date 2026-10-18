@@ -243,6 +243,7 @@ class TestBriefingConfig(unittest.TestCase):
     def test_defaults_are_disabled_and_valid(self):
         config = BriefingConfig()
         self.assertFalse(config.enabled)
+        self.assertFalse(config.startup_briefing)
         self.assertEqual(config.client_secret_path, "")
         self.assertEqual(config.token_path, "")
         self.assertEqual(config.calendar_id, "primary")
@@ -264,6 +265,10 @@ class TestBriefingConfig(unittest.TestCase):
 
     def test_non_bool_enabled_rejected(self):
         self.assert_invalid(enabled="yes")
+
+    def test_non_bool_startup_briefing_rejected(self):
+        self.assert_invalid(startup_briefing="yes")
+        self.assert_invalid(startup_briefing=1)
 
     def test_non_string_paths_rejected(self):
         self.assert_invalid(client_secret_path=1)

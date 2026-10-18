@@ -1045,21 +1045,111 @@ verified only against fakes. The real Google Cloud setup and consent are
 manual steps documented in
 [docs/briefing.md](briefing.md#calendar-event-creation-opt-in-write).
 
+## Batch 23 note (daily-assistant experience: briefing polish + "what's next?")
+
+Batch 23 improves the daily-assistant experience without adding any write
+risk. It keeps the Batch 9 permission model, the Batch 16 phrase-set routing
+and the Batch 19 composition-root style; both tools below are `SAFE` and
+read-only, and neither can be turned into a write.
+
+- **Clearer, honest briefing.** `core/briefing.py` now renders the day
+  relative to the injected clock ("today"/"tomorrow"/"yesterday"/a dated
+  label) via `_day_label_for`, so a differently-targeted briefing reads
+  naturally. A failed source is still reported as a failure, never as an
+  empty day; output stays bounded and sanitised.
+- **Read-only "what's next?".** A new `what_next` `SAFE` tool in
+  `core/briefing_tools.py` reuses the same `DailyBriefingService` and
+  calendar provider. It answers the next upcoming *timed* event (looking at
+  today and tomorrow), or today's/tomorrow's schedule, using the injected
+  clock and the local timezone. All-day events are never given an invented
+  time; a failed read is reported as a retrieval failure, not "no events";
+  and it never creates or edits anything.
+- **Fixed schedule phrases, bounded argument.** `core/router.py` gained a
+  fixed normalised phrase set, each mapping to exactly one of `next`,
+  `today` or `tomorrow` (validated again by the tool via `_validate_when`).
+  There is no fuzzy or broad matching, nothing the user says is copied into
+  arguments, and creation phrases ("add a meeting tomorrow at 3pm") are
+  never mistaken for a schedule question. The tool is registered and the
+  phrases recognised only with the briefing opt-in (`--tools --briefing`).
+- **Tests and evaluation.** `tests/test_briefing.py` adds
+  `TestFindNextUpcomingTimedEvent`, `TestRenderSchedule`, `TestBuildSchedule`
+  and `TestWhatNextToolSpec` plus routing/registry/`main` coverage;
+  `tests/fixtures/research_evaluation_cases.py` adds a `voice-schedule`
+  routing category. Everything is offline with fake providers and a fixed
+  clock. Docs updated in `README.md`, `docs/briefing.md` and
+  `docs/safety.md`.
+
+Verification: **1205 tests OK (5 skipped)**, `ruff check` clean,
+`compileall` clean, the offline evaluation suite **40/40** PASS. All of
+that verification is offline - every test injects fake providers, fake API
+clients and a fixed clock, so the schedule query is exercised without a
+Google account, credential, network or browser.
+
+## Batch 24 note (optional startup briefing + session lifecycle)
+
+Batch 24 adds an optional startup briefing: with `--startup-briefing`,
+Jarvis reads today's briefing aloud **once**, as it starts and before it
+begins listening. It adds no new capability and no new data path - it reuses
+the Batch 21/23 briefing and provider logic - so it keeps the Batch 9
+permission model, the Batch 16 phrase-set routing and the Batch 19
+composition-root style.
+
+- **Explicit, doubly-gated opt-in.** `--startup-briefing` (the
+  `BriefingConfig.startup_briefing` field) is off by default and requires
+  **both** `--tools` and `--briefing` (and therefore the one-time
+  `--briefing-auth`). A missing prerequisite is reported
+  (`Startup briefing requires --tools/--briefing; keeping it disabled.`) and
+  the feature stays off; it never silently enables the briefing and never
+  runs OAuth. With the flag absent, `app.py`'s startup path is unchanged.
+- **One briefing, through the guarded executor.** `app.py` computes whether
+  the feature is on and, on the linear startup path, calls the
+  already-registered read-only `daily_briefing` tool via
+  `ToolExecutor.execute` - never a handler directly, never a second TTS
+  system (it speaks through the injected speaker/`_respond`). It runs at
+  most once and never inside the listening loop.
+- **Read-only and honest.** It never creates, edits, completes or deletes an
+  event or task and never launches anything; it is fully separate from the
+  `create_calendar_event` `CONFIRM` path. A failed source is reported as
+  failed, never as empty, and an unavailable briefing says so. A delivery
+  failure is logged safely (no traceback, credential or tool arguments) and
+  the normal session continues.
+- **Tests.** `tests/test_briefing.py` adds `TestStartupBriefing`: off by
+  default, missing prerequisites, delivered exactly once through a recording
+  executor, `--no-speech` prints it, empty/failed/partial sources, speaker
+  failure, a raising service continuing the session, no confirmation/writes,
+  and the preserved Batch 23 manual queries. All offline with fake providers,
+  a fake listener/speaker and a fixed clock. Docs updated in `README.md`,
+  `docs/briefing.md` and `docs/safety.md`.
+
+Verification: **1226 tests OK (5 skipped)**, `ruff check` clean,
+`compileall` clean, `pip check` clean, the offline evaluation suite
+**40/40** PASS. Every automated test is offline - fake providers, a fake
+listener/speaker and a fixed clock - so the suite never needs a Google
+account. The optional Google libraries **are** installed on this host
+(they are listed in `requirements.txt`), so the wiring was additionally
+smoke-checked both ways: with absent credentials the real
+`_build_briefing_service` path reports the briefing unavailable, speaks
+"I couldn't read your calendar or your tasks right now." and the session
+continues; with a stored read-only token the startup briefing performed
+one live `events.list` / `tasks.list` read, spoke today's (empty) result
+once before the listening loop, and created nothing.
+
 ## Recommended next batches
 
 Ordered by user value against risk; each keeps the Batch 9 permission
 model, the Batch 16 phrase-set routing and the Batch 19 fail-closed
 composition-root style. (Batch 20, local media playback; Batch 21, the
-daily briefing; and Batch 22, calendar event creation, are now
-implemented — see the notes above.) The batches below keep their original
-ordering idea; the numbers are advisory.
+daily briefing; Batch 22, calendar event creation; Batch 23, the
+daily-assistant experience; and Batch 24, the optional startup briefing,
+are now implemented — see the notes above.) The batches below keep their
+original ordering idea; the numbers are advisory.
 
-- **Batch 23 — wake-word / voice activation reliability.**
+- **Next — wake-word / voice activation reliability.**
   No new capability, a hardening pass: activation lifecycle regressions,
   false-trigger and missed-trigger behaviour, and explicit states for
   "microphone lost" / "model not loaded", following the Batch 14 and 15
   audit style. Low risk, high daily value.
-- **Batch 24 — desktop assistance (search, open, typed input).** The
+- **Then — desktop assistance (search, open, typed input).** The
   highest-risk batch: Playwright/DOM first, GUI automation only where
   unavoidable, every action behind the existing permission layer with an
   explicit allowlist, and `CONFIRM` for anything that types, clicks or
