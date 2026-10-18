@@ -97,6 +97,35 @@ def describe_input_device(device: dict, configured_rate: int) -> List[str]:
     return lines
 
 
+def production_threshold(
+    ambient_levels: Sequence[float], config: VoiceConfig
+) -> "tuple[float, float, int]":
+    """Threshold exactly as :meth:`voice.listener.Listener.calibrate` derives it.
+
+    ``Listener.calibrate`` reads only ``config.calibration_seconds`` of
+    ambient audio, so the diagnostic must report — and judge speech against —
+    that same window. Deriving it from the whole ambient phase instead makes
+    the printed number differ from the one production actually applies,
+    including whether the result clamps to the ceiling: a quiet first second
+    followed by a noise burst yields a low production threshold while the
+    full-phase median clamps at the ceiling.
+
+    Returns ``(threshold, raw_unclamped, blocks_used)``.
+    """
+    blocks = max(1, round(config.calibration_seconds / config.block_duration))
+    window = list(ambient_levels[:blocks])
+    if not window:
+        raise ValueError("ambient_levels must contain at least one value")
+    threshold = compute_energy_threshold(
+        window,
+        multiplier=config.threshold_multiplier,
+        floor=config.threshold_floor,
+        ceiling=config.threshold_ceiling,
+    )
+    raw = statistics.median(window) * config.threshold_multiplier
+    return threshold, raw, len(window)
+
+
 def interpret(
     ambient: LevelSummary,
     normal: LevelSummary,
@@ -236,18 +265,14 @@ def run_diagnostics(config: VoiceConfig) -> int:
         return 1
 
     ambient_levels = levels_by_phase[PHASE_AMBIENT]
-    threshold = compute_energy_threshold(
-        ambient_levels,
-        multiplier=config.threshold_multiplier,
-        floor=config.threshold_floor,
-        ceiling=config.threshold_ceiling,
-    )
-    raw = statistics.median(ambient_levels) * config.threshold_multiplier
+    threshold, raw, blocks_used = production_threshold(ambient_levels, config)
     clamped = " (clamped)" if abs(raw - threshold) > 0.5 else ""
     print(
         f"\nThreshold production calibration would use: {threshold:.0f}{clamped} "
         f"(raw {raw:.0f}, floor {config.threshold_floor:.0f}, "
-        f"ceiling {config.threshold_ceiling:.0f})"
+        f"ceiling {config.threshold_ceiling:.0f}, derived from the first "
+        f"{blocks_used} blocks = {config.calibration_seconds:g}s of ambient, "
+        f"matching Listener.calibrate)"
     )
 
     summaries = {

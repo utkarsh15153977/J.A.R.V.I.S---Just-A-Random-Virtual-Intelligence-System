@@ -2,6 +2,7 @@
 
 import unittest
 
+from voice.detection import compute_energy_threshold
 from voice.diagnostics import (
     PHASE_AMBIENT,
     PHASE_LOUD,
@@ -9,6 +10,7 @@ from voice.diagnostics import (
     describe_input_device,
     format_summary,
     interpret,
+    production_threshold,
     summarize_levels,
     wants_diagnostics,
 )
@@ -153,6 +155,250 @@ class TestInterpret(unittest.TestCase):
     def test_phase_labels_are_distinct(self):
         self.assertNotEqual(PHASE_AMBIENT, PHASE_NORMAL)
         self.assertNotEqual(PHASE_NORMAL, PHASE_LOUD)
+
+
+class TestProductionThreshold(unittest.TestCase):
+    """The diagnostic must report the threshold production actually applies.
+
+    ``Listener.calibrate`` reads only ``config.calibration_seconds`` of
+    ambient audio; deriving the printed number from the whole ambient phase
+    made it disagree with production, including whether it clamps.
+    """
+
+    def _config(self):
+        from config import VoiceConfig
+
+        return VoiceConfig().validate()
+
+    def test_uses_only_the_calibration_window(self):
+        config = self._config()
+        production_blocks = max(
+            1, round(config.calibration_seconds / config.block_duration)
+        )
+        # Quiet first second, loud afterwards: the two windows disagree.
+        ambient = [150.0] * production_blocks + [1900.0] * 40
+
+        threshold, raw, blocks_used = production_threshold(ambient, config)
+
+        self.assertEqual(blocks_used, production_blocks)
+        self.assertEqual(raw, 150.0 * config.threshold_multiplier)
+        self.assertEqual(threshold, raw)
+        # The old full-phase derivation is a different number.
+        full = compute_energy_threshold(
+            ambient,
+            multiplier=config.threshold_multiplier,
+            floor=config.threshold_floor,
+            ceiling=config.threshold_ceiling,
+        )
+        self.assertNotEqual(threshold, full)
+
+    def test_reports_the_clamp_production_would_apply(self):
+        config = self._config()
+        production_blocks = max(
+            1, round(config.calibration_seconds / config.block_duration)
+        )
+        # The Run 2 shape: quiet first second, noisy for the rest of the
+        # phase. Production applies an unclamped low threshold; deriving it
+        # from the whole phase reported a clamped 4000 instead.
+        ambient = [200.0] * production_blocks + [1750.0] * 40
+
+        threshold, raw, _ = production_threshold(ambient, config)
+
+        full = compute_energy_threshold(
+            ambient,
+            multiplier=config.threshold_multiplier,
+            floor=config.threshold_floor,
+            ceiling=config.threshold_ceiling,
+        )
+        self.assertEqual(raw, 200.0 * config.threshold_multiplier)
+        self.assertEqual(threshold, raw)
+        self.assertEqual(full, config.threshold_ceiling)
+        self.assertNotEqual(threshold, full)
+
+    def test_block_count_matches_the_listener_calibration_window(self):
+        """``Listener.calibrate`` reads exactly the window we report on.
+
+        Drives the real production calibration against a fake stream and
+        asserts it consumed ``production_threshold``'s block count and
+        derived the same number from those blocks.
+        """
+        import contextlib
+        import io
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import numpy as np
+        import sounddevice as sd
+
+        from config import VoiceConfig
+        from voice.listener import Listener
+
+        config = VoiceConfig().validate()
+        expected_blocks = max(
+            1, round(config.calibration_seconds / config.block_duration)
+        )
+        self.assertEqual(expected_blocks, 10)
+
+        level = 500
+        block = np.full((config.block_size, 1), level, dtype=np.int16)
+
+        class _CountingStream:
+            def __init__(self):
+                self.reads = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, size):
+                self.reads += 1
+                return block[:size], False
+
+        stream = _CountingStream()
+        fake_model = SimpleNamespace(WhisperModel=lambda *a, **k: object())
+        with patch.dict(sys.modules, {"faster_whisper": fake_model}):
+            listener = Listener(config)
+        with patch.object(sd, "InputStream", return_value=stream):
+            with contextlib.redirect_stdout(io.StringIO()):
+                applied_threshold = listener.calibrate()
+
+        self.assertEqual(stream.reads, expected_blocks)
+        self.assertEqual(applied_threshold, listener.energy_threshold)
+
+        # The diagnostic must therefore judge speech against the same
+        # number production just applied.
+        threshold, raw, blocks_used = production_threshold(
+            [float(level)] * expected_blocks, config
+        )
+        self.assertEqual(blocks_used, stream.reads)
+        self.assertEqual(raw, float(level) * config.threshold_multiplier)
+        self.assertEqual(threshold, raw)
+        self.assertEqual(threshold, applied_threshold)
+
+    def test_defaults_produce_the_expected_window(self):
+        config = self._config()
+        threshold, raw, blocks = production_threshold([100.0] * 60, config)
+        self.assertEqual(blocks, 10)
+        self.assertEqual(raw, 100.0 * config.threshold_multiplier)
+        self.assertEqual(threshold, raw)
+
+    def test_clamping_still_applies_within_the_window(self):
+        config = self._config()
+        noisy = [2000.0] * 10  # median x 4 = 8000 -> ceiling
+        threshold, raw, _ = production_threshold(noisy, config)
+        self.assertEqual(raw, 8000.0)
+        self.assertEqual(threshold, config.threshold_ceiling)
+
+    def test_empty_levels_raise(self):
+        with self.assertRaises(ValueError):
+            production_threshold([], self._config())
+
+    def test_window_shorter_than_configured_uses_what_exists(self):
+        config = self._config()
+        threshold, raw, blocks = production_threshold([300.0, 400.0], config)
+        self.assertEqual(blocks, 2)
+        self.assertEqual(raw, 350.0 * config.threshold_multiplier)
+        self.assertEqual(threshold, raw)
+
+
+class TestCaptureParity(unittest.TestCase):
+    """The diagnostic must open the microphone exactly as production does.
+
+    Same samplerate, channel count, sample format and block size, so a
+    level measured by ``--diagnose`` is the same kind of signal the
+    production listener compares against its threshold.
+    """
+
+    def _record_streams(self, calls):
+        import numpy as np
+        import sounddevice as sd
+
+        class _RecordingStream:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+                self._block = np.zeros(
+                    (kwargs["blocksize"], kwargs["channels"]),
+                    dtype=kwargs["dtype"],
+                )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, size):
+                return self._block[:size], False
+
+        return sd, _RecordingStream
+
+    def _make_listener(self, config):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from voice.listener import Listener
+
+        fake = SimpleNamespace(WhisperModel=lambda *a, **k: object())
+        with patch.dict(sys.modules, {"faster_whisper": fake}):
+            return Listener(config)
+
+    def test_both_paths_open_the_stream_identically(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        from config import VoiceConfig
+
+        config = VoiceConfig().validate()
+
+        calls = []
+        sd, stream_class = self._record_streams(calls)
+
+        with patch.object(sd, "InputStream", stream_class):
+            from voice.diagnostics import measure_phase
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                measure_phase(config, 0.5)
+
+            listener = self._make_listener(config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                listener.calibrate()
+
+        self.assertEqual(len(calls), 2, calls)
+        diagnostic, production = calls
+        self.assertEqual(
+            diagnostic,
+            production,
+            "diagnostic and production must open the microphone identically",
+        )
+        self.assertEqual(production["samplerate"], config.sample_rate)
+        self.assertEqual(production["channels"], 1)
+        self.assertEqual(production["dtype"], "int16")
+        self.assertEqual(production["blocksize"], config.block_size)
+
+    def test_rms_is_computed_over_one_block_of_samples(self):
+        import numpy as np
+
+        from voice.detection import rms
+
+        # 1600 samples = 0.1 s at 16 kHz, matching the configured block.
+        config_block = 1600
+        block = np.full((config_block, 1), 1000, dtype=np.int16)
+        self.assertEqual(rms(block[:, 0]), 1000.0)
+        # Same value regardless of the trailing singleton channel axis.
+        self.assertEqual(rms(np.full(config_block, 1000, dtype=np.int16)), 1000.0)
+
+    def test_diagnostic_uses_the_same_rms_as_production(self):
+        import numpy as np
+
+        from voice.detection import rms
+
+        block = np.array([[100], [200], [300], [400]], dtype=np.int16)
+        self.assertEqual(rms(block[:, 0]), rms(block.ravel()))
 
 
 if __name__ == "__main__":
