@@ -42,6 +42,60 @@ def make_speaker(engine, config=None):
     return Speaker(config, engine_factory=lambda driver: engine)
 
 
+class FakeProxy:
+    def __init__(self):
+        self._busy = True
+        self.busy_sets = 0
+
+    def isBusy(self):
+        return self._busy
+
+    def setBusy(self, busy):
+        self._busy = busy
+        self.busy_sets += 1
+
+
+class QueueingFakeEngine:
+    """Fake that reproduces the pyttsx3 proxy contract.
+
+    ``say`` queues the utterance while the proxy is busy and starts it on
+    the driver immediately when the proxy is idle. An utterance started
+    outside the run loop is purged by the ``endLoop`` that ``runAndWait``
+    queues first, which is the silent-playback failure mode.
+    """
+
+    def __init__(self):
+        self.spoken = []
+        self.purged = []
+        self.queue = []
+        self.properties = {}
+        self.stop_calls = 0
+        self.run_calls = 0
+        self.proxy = FakeProxy()
+
+    def setProperty(self, name, value):
+        self.properties[name] = value
+
+    def say(self, text):
+        if self.proxy.isBusy():
+            self.queue.append(text)
+        else:
+            self.purged.append(text)
+
+    def runAndWait(self):
+        self.run_calls += 1
+        self.proxy.setBusy(False)
+        while self.queue:
+            self.spoken.append(self.queue.pop(0))
+        self.proxy.setBusy(False)
+
+    def stop(self):
+        self.stop_calls += 1
+        if self.queue:
+            self.purged.extend(self.queue)
+            self.queue = []
+
+
 class TestSpeakerInit(unittest.TestCase):
     def test_empty_driver_is_passed_as_none(self):
         seen = {}
@@ -151,6 +205,52 @@ class TestSpeakerSpeak(unittest.TestCase):
         speaker.close()
         speaker.speak("hello")
         self.assertEqual(engine.spoken, [])
+
+
+class TestSpeakerQueuesEveryUtterance(unittest.TestCase):
+    def test_first_speak_is_spoken(self):
+        engine = QueueingFakeEngine()
+        make_speaker(engine).speak("first response")
+        self.assertEqual(engine.spoken, ["first response"])
+        self.assertEqual(engine.purged, [])
+        self.assertEqual(engine.run_calls, 1)
+
+    def test_every_later_speak_is_spoken_too(self):
+        engine = QueueingFakeEngine()
+        speaker = make_speaker(engine)
+        for text in ("first response", "second response", "third response"):
+            speaker.speak(text)
+        self.assertEqual(
+            engine.spoken,
+            ["first response", "second response", "third response"],
+        )
+        self.assertEqual(engine.purged, [])
+        self.assertEqual(engine.run_calls, 3)
+
+    def test_speak_marks_the_proxy_busy_before_say(self):
+        engine = QueueingFakeEngine()
+        speaker = make_speaker(engine)
+        engine.proxy.setBusy(False)
+        speaker.speak("hello")
+        self.assertGreaterEqual(engine.proxy.busy_sets, 1)
+        self.assertEqual(engine.spoken, ["hello"])
+        self.assertEqual(engine.purged, [])
+
+    def test_queued_text_is_stripped_and_truncated_intact(self):
+        engine = QueueingFakeEngine()
+        speaker = make_speaker(engine, SpeechConfig(max_chars=5))
+        with self.assertLogs("jarvis.speaker", level="WARNING"):
+            speaker.speak("  one two three  ")
+        speaker.speak("next")
+        self.assertEqual(engine.spoken, ["one t", "next"])
+        self.assertEqual(engine.purged, [])
+
+    def test_engines_without_a_proxy_are_untouched(self):
+        engine = FakeEngine()
+        speaker = make_speaker(engine)
+        speaker.speak("hello")
+        self.assertEqual(engine.spoken, ["hello"])
+        self.assertFalse(hasattr(engine, "proxy"))
 
 
 class TestSpeakerStopClose(unittest.TestCase):

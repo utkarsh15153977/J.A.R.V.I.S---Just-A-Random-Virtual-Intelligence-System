@@ -1339,6 +1339,62 @@ Verification: **1258 tests OK (5 skipped)**, `ruff check` clean,
 `compileall` clean, `pip check` clean, the offline evaluation suite
 **40/40** PASS.
 
+## Batch 27.3 note (evidence-based schedule phrase coverage)
+
+**This is the follow-up Batch 27.2 asked for.** The remaining manual step
+— capture the actual wording — was done with `--log-transcripts` on real
+hardware, and the two missing schedule transcripts were recovered:
+
+- `what is my schedule for today?` → was `UNSUPPORTED`
+- `what is my next schedule?` → was `UNSUPPORTED`
+- `what is the time?` → `get_current_time`, executor `status=ok` (control)
+- `how is today's weather?`, `who is changes khan?`, `where is mongolia?`
+  → stayed `UNSUPPORTED`
+
+**Root cause.** Not a defect in normalisation, registration or the
+executor: the read-only `daily_briefing` and `what_next` tools were
+already registered and reachable, but neither observed wording was a
+member of the declared phrase sets, and exact-match routing is
+intentional. Two words of coverage were missing, nothing more.
+
+**Fix (`core/router.py`, data only).** `"what is my schedule for today"`
+added to `_BRIEFING_PHRASES` (routes to `daily_briefing`, no arguments);
+`"what is my next schedule"` added to `_SCHEDULE_PHRASE_TO_MODE` under
+mode `next` (routes to `what_next` with `{"when": "next"}`). Both are
+verified against the tools' own validators (`_validate_no_args`,
+`_validate_when`). Matching is still exact normalised equality: no fuzzy
+matching, no LLM fallback, no new API call, no new dependency, and
+nothing outside these two observed strings was added — the broader
+wordings Batch 27.2 pinned as near misses remain `UNSUPPORTED`.
+
+**Nothing else changed.** Weather, person and location requests stay
+unsupported because no such feature exists (`get_current_weather` is not
+a registered tool). Calendar creation was re-pinned in both directions:
+strong creation verbs (`schedule`, `book`, `arrange`, `set up`) and weak
+verbs with a calendar noun still reach `create_calendar_event` or a
+clarify, and the two new phrases never do. Permissions, confirmations,
+executor-only execution, dependency injection and opt-in defaults are
+untouched; microphone thresholds and Whisper settings were not modified.
+
+Coverage tests added (12):
+
+- `tests/test_briefing.py::TestBatch273ObservedSchedulePhrases` (7): the
+  two transcripts with and without trailing punctuation, argument
+  validation through the real tool specs, inertness without the opt-in,
+  weather/person/location staying unsupported, and the broader wordings
+  staying unsupported.
+- `tests/test_calendar_write.py::TestScheduleAndCreationSeparation` (2):
+  the new phrases never route to creation; six creation requests never
+  route to the read-only schedule tools.
+- `tests/test_app.py::TestBatch273ObservedScheduleEndToEnd` (3): both
+  transcripts replayed through the real `main()` (`--tools --briefing`)
+  produce the real replies instead of the unsupported text, and the three
+  unrelated utterances still answer with it.
+
+Verification: **1270 tests OK (5 skipped)**, `ruff check` clean,
+`compileall` clean, `pip check` clean, the offline evaluation suite
+**40/40** PASS.
+
 ## Recommended next batches
 
 Ordered by user value against risk; each keeps the Batch 9 permission

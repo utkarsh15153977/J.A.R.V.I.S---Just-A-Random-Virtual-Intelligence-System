@@ -62,11 +62,11 @@ recognised only when the briefing is enabled.
 | --- | --- | --- |
 | "brief me on today", "brief me", "give me my daily briefing", "daily briefing", "morning briefing", "what's my briefing" | `daily_briefing` | `SAFE` |
 | "what's on my calendar today", "my calendar today", "what is on my calendar" | `daily_briefing` | `SAFE` |
-| "what's my schedule today", "what is my schedule" | `daily_briefing` | `SAFE` |
+| "what's my schedule today", "what is my schedule for today", "what is my schedule" | `daily_briefing` | `SAFE` |
 | "what are my tasks today", "what are my tasks", "what are my tasks for today" | `daily_briefing` | `SAFE` |
 | "what should I prioritize today", "what should I prioritise today", "what should I focus on today" | `daily_briefing` | `SAFE` |
 | "what's on my plate today", "what's on my agenda today", "what's my agenda today", "what do I have today" | `daily_briefing` | `SAFE` |
-| "what's next?", "what's my next meeting?", "what do I have next?" | `what_next` (`when=next`) | `SAFE` |
+| "what's next?", "what's my next meeting?", "what do I have next?", "what is my next schedule" | `what_next` (`when=next`) | `SAFE` |
 | "do I have any meetings today?", "do I have any meetings" | `what_next` (`when=today`) | `SAFE` |
 | "what's on my schedule tomorrow?", "what's my schedule tomorrow", "tomorrow schedule" | `what_next` (`when=tomorrow`) | `SAFE` |
 
@@ -77,6 +77,12 @@ schedule phrases carry a single fixed, bounded argument (`when` is exactly
 one of `next`, `today`, `tomorrow`); nothing the user says is copied into
 arguments, and there is no fuzzy or broad matching, so "add a meeting
 tomorrow at 3pm" is never mistaken for a schedule question.
+
+Entries are added only from transcripts captured through the real
+microphone with `--log-transcripts`, so coverage grows on evidence rather
+than on guesses: Batch 27.3 added "what is my schedule for today" and
+"what is my next schedule" this way, and rewordings that were never
+captured stay unsupported until they are.
 
 ## "What's next?" (read-only)
 

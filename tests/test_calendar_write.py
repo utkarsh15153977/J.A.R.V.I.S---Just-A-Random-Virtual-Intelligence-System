@@ -708,6 +708,44 @@ class TestScheduleAndCreationSeparation(unittest.TestCase):
         request = router.route("add a meeting tomorrow at 3pm")
         self.assertIsNot(request.kind, CommandKind.TOOL)
 
+    def test_observed_schedule_phrases_route_to_the_read_only_tools(self):
+        """Batch 27.3: the two live transcripts must not reach creation."""
+        router = self._router()
+        for text, tool, arguments in (
+            ("what is my schedule for today", TOOL_DAILY_BRIEFING, {}),
+            ("what is my next schedule", TOOL_WHAT_NEXT, {"when": "next"}),
+        ):
+            with self.subTest(text=text):
+                request = router.route(text)
+                self.assertIs(request.kind, CommandKind.TOOL)
+                self.assertEqual(request.tool_name, tool)
+                self.assertNotEqual(request.tool_name, TOOL_CREATE_CALENDAR_EVENT)
+                self.assertEqual(dict(request.arguments), arguments)
+
+    def test_creation_requests_are_not_hijacked_by_schedule_routing(self):
+        """A creation verb still wins: the read-only tools never answer it."""
+        router = self._router()
+        for text in (
+            "schedule a meeting with bob tomorrow at 3pm for 30 minutes",
+            "book a call friday at 5pm for 15 minutes",
+            "arrange a dentist appointment next monday at 9am for 1 hour",
+            "set up a standup tomorrow at 10am for 30 minutes",
+            "create a calendar event for tomorrow at 3pm",
+            "add a meeting to my calendar tomorrow at 3pm",
+        ):
+            with self.subTest(text=text):
+                request = router.route(text)
+                self.assertNotIn(
+                    request.tool_name, (TOOL_DAILY_BRIEFING, TOOL_WHAT_NEXT)
+                )
+                self.assertIn(
+                    request.kind, (CommandKind.TOOL, CommandKind.CLARIFY)
+                )
+                if request.kind is CommandKind.TOOL:
+                    self.assertEqual(
+                        request.tool_name, TOOL_CREATE_CALENDAR_EVENT
+                    )
+
 
 # ---------------------------------------------------------------------------
 # Composition root

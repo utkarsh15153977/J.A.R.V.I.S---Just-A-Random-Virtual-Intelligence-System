@@ -87,6 +87,35 @@ class Speaker:
                 "Could not apply speech settings; using engine defaults."
             )
 
+    def _prime_queue(self) -> None:
+        """Keep ``say`` queued until ``runAndWait`` pumps the event loop.
+
+        pyttsx3 drives its event proxy from ``runAndWait``. While the proxy
+        is idle a ``say`` call starts the utterance on the driver
+        immediately, and the ``endLoop`` command ``runAndWait`` then queues
+        is pumped on the very first loop pass: the driver stops the
+        utterance it has only just started, so ``runAndWait`` returns after
+        a word or two and nothing is audible. Only the utterance spoken
+        while the proxy is still busy - the first one after the engine was
+        created - survives, which is why every later response fell silent.
+
+        Marking the proxy busy first keeps ``say`` queued until the loop
+        runs it, matching the contract ``say`` documents. Engines without a
+        pyttsx3-style proxy are left alone.
+        """
+        proxy = getattr(self._engine, "proxy", None)
+        if proxy is None:
+            return
+        is_busy = getattr(proxy, "isBusy", None)
+        set_busy = getattr(proxy, "setBusy", None)
+        if not callable(is_busy) or not callable(set_busy):
+            return
+        try:
+            if not is_busy():
+                set_busy(True)
+        except Exception:
+            return
+
     def speak(self, text: str) -> None:
         """Speak ``text``, blocking until it finishes.
 
@@ -110,6 +139,7 @@ class Speaker:
 
         with self._lock:
             try:
+                self._prime_queue()
                 self._engine.say(clean)
                 self._engine.runAndWait()
             except Exception:

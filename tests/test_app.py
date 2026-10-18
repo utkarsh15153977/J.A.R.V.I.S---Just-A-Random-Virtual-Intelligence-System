@@ -3253,11 +3253,13 @@ class TestBatch272RoutingParity(unittest.TestCase):
         Longer, differently-worded sentences are exactly what the live
         report described. They stay UNSUPPORTED: widening routing is
         deliberately out of scope, so this pins exact-match behaviour
-        against a future guess-based phrase pad.
+        against a future guess-based phrase pad. The two wordings that
+        were later captured verbatim through the microphone and adopted
+        with evidence are covered by
+        ``tests/test_briefing.py::TestBatch273ObservedSchedulePhrases``.
         """
         router, _ = self._router_with_all_tools()
         near_misses = (
-            "what is my schedule for today",
             "what is on my schedule today",
             "give me my schedule",
             "what does my day look like",
@@ -3268,6 +3270,51 @@ class TestBatch272RoutingParity(unittest.TestCase):
                 self.assertIs(
                     router.route(text).kind, CommandKind.UNSUPPORTED
                 )
+
+
+class TestBatch273ObservedScheduleEndToEnd(unittest.TestCase):
+    """Batch 27.3: the two captured transcripts through the real ``main()``.
+
+    The exact utterances that answered with the generic unsupported reply
+    are replayed through the full composition root (tools + briefing, no
+    transcript logging needed) and must now reach their read-only tools.
+    Nothing is executed outside the executor and no capability is
+    newly enabled.
+    """
+
+    _briefing = staticmethod(TestBatch272RoutingParity._briefing)
+    _listener = staticmethod(TestBatch272RoutingParity._listener)
+
+    def _run(self, text):
+        from config import BriefingConfig
+
+        code, output, _, _ = run_main(
+            argv=["--tools", "--briefing"],
+            listener_factory=lambda config: self._listener([text, "exit"]),
+            briefing_config=BriefingConfig(enabled=True),
+            briefing_service=self._briefing(),
+        )
+        self.assertEqual(code, EXIT_OK)
+        return "\n".join(output)
+
+    def test_schedule_for_today_gives_the_briefing(self):
+        joined = self._run("What is my schedule for today?")
+        self.assertNotIn("can't do that yet", joined)
+        self.assertIn("standup", joined)
+
+    def test_next_schedule_gives_the_next_event(self):
+        joined = self._run("What is my next schedule?")
+        self.assertNotIn("can't do that yet", joined)
+        self.assertIn("standup", joined)
+
+    def test_unrelated_queries_still_answer_unsupported(self):
+        for text in (
+            "How is today's weather?",
+            "Who is changes Khan?",
+            "Where is Mongolia?",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("can't do that yet", self._run(text))
 
 
 if __name__ == "__main__":

@@ -595,6 +595,11 @@ def _calendar_create_request(
 # The phrases are normalised once here (apostrophes dropped, whitespace
 # collapsed) so "what's my schedule today" and "whats my schedule today"
 # both match the same way the incoming text is normalised.
+#
+# Batch 27.3 added "what is my schedule for today" from a transcript
+# captured through the real microphone, where it had been answered with
+# the unsupported reply. Entries are added only from observed transcripts;
+# longer rewordings stay unsupported rather than being guessed at.
 # ---------------------------------------------------------------------------
 _BRIEFING_PHRASES: FrozenSet[str] = frozenset(
     normalized
@@ -619,6 +624,7 @@ _BRIEFING_PHRASES: FrozenSet[str] = frozenset(
             "my calendar today",
             "what's my schedule today",
             "what is my schedule today",
+            "what is my schedule for today",
             "what's my schedule",
             "what is my schedule",
             "what are my tasks today",
@@ -644,6 +650,8 @@ _BRIEFING_PHRASES: FrozenSet[str] = frozenset(
 # Fixed normalised phrases map to a bounded ``when`` mode. Each phrase maps to
 # exactly one of ``next``, ``today`` or ``tomorrow``; nothing the user says is
 # copied into arguments, and no fuzzy or broad matching is used.
+# Batch 27.3 added "what is my next schedule" from a real-microphone
+# transcript that had been answered with the unsupported reply.
 _SCHEDULE_PHRASE_TO_MODE: "dict[str, str]" = {
     _normalize_phrase(phrase): mode
     for mode, phrases in (
@@ -655,6 +663,7 @@ _SCHEDULE_PHRASE_TO_MODE: "dict[str, str]" = {
                 "what's my next meeting",
                 "what is my next meeting",
                 "what do i have next",
+                "what is my next schedule",
                 "whats my next meeting",
             ),
         ),

@@ -1826,5 +1826,114 @@ class TestStartupBriefing(unittest.TestCase):
         self.assertIn("--startup-briefing", "\n".join(output))
 
 
+class TestBatch273ObservedSchedulePhrases(unittest.TestCase):
+    """Batch 27.3: the two schedule transcripts captured from a real microphone.
+
+    Both strings are the transcripts of live ``--tools --briefing
+    --log-transcripts`` utterances after the router's own normalisation,
+    and both were answered with the generic unsupported reply even though
+    the read-only schedule tools already exist. Exactly these two observed
+    wordings are added to the existing phrase maps; matching stays exact
+    and nothing else is widened.
+    """
+
+    OBSERVED_FOR_TODAY = "what is my schedule for today"
+    OBSERVED_NEXT = "what is my next schedule"
+
+    def _router(self, *, what_next=True, briefing=True, extras=False):
+        from core.router import ToolCommandRouter
+
+        available = ["get_current_time"]
+        if briefing:
+            available.append(TOOL_DAILY_BRIEFING)
+        if what_next:
+            available.append(TOOL_WHAT_NEXT)
+        if extras:
+            from core.builtin_tools import build_builtin_registry
+
+            available.extend(build_builtin_registry(None).names())
+        return ToolCommandRouter(
+            (),
+            available_tools=tuple(available),
+            briefing_tool=TOOL_DAILY_BRIEFING if briefing else None,
+            what_next_tool=TOOL_WHAT_NEXT if what_next else None,
+        )
+
+    def _service(self):
+        return DailyBriefingService(
+            MockCalendarProvider(), MockTaskProvider(),
+            clock=fixed_clock(datetime(2026, 10, 5, 8)),
+        )
+
+    def test_observed_schedule_for_today_routes_to_daily_briefing(self):
+        command = self._router().route(self.OBSERVED_FOR_TODAY)
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_DAILY_BRIEFING)
+        self.assertEqual(dict(command.arguments), {})
+
+    def test_observed_next_schedule_routes_to_what_next(self):
+        command = self._router().route(self.OBSERVED_NEXT)
+        self.assertIs(command.kind, CommandKind.TOOL)
+        self.assertEqual(command.tool_name, TOOL_WHAT_NEXT)
+        self.assertEqual(dict(command.arguments), {"when": "next"})
+
+    def test_observed_transcripts_with_trailing_punctuation_route_the_same(self):
+        for text in ("What is my schedule for today?", "What is my next schedule?"):
+            with self.subTest(text=text):
+                self.assertIs(
+                    self._router().route(text).kind, CommandKind.TOOL
+                )
+
+    def test_observed_arguments_pass_the_tools_own_validators(self):
+        router = self._router()
+        cases = (
+            (self.OBSERVED_FOR_TODAY, build_briefing_spec(self._service())),
+            (self.OBSERVED_NEXT, build_what_next_spec(self._service())),
+        )
+        for text, spec in cases:
+            with self.subTest(text=text):
+                command = router.route(text)
+                self.assertIs(command.kind, CommandKind.TOOL)
+                self.assertEqual(command.tool_name, spec.name)
+                self.assertEqual(
+                    spec.validate(dict(command.arguments)),
+                    dict(command.arguments),
+                )
+
+    def test_observed_phrases_stay_inert_without_the_capability(self):
+        router = self._router(what_next=False, briefing=False)
+        for text in (self.OBSERVED_FOR_TODAY, self.OBSERVED_NEXT):
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+    def test_weather_person_and_location_queries_stay_unsupported(self):
+        """No weather, person or location feature exists, so nothing is added."""
+        router = self._router(extras=True)
+        for text in (
+            "how is today's weather?",
+            "who is changes khan?",
+            "where is mongolia?",
+        ):
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+    def test_broader_schedule_wordings_stay_unsupported(self):
+        """Only the two observed transcripts are added, nothing is guessed."""
+        router = self._router()
+        for text in (
+            "what is on my schedule today",
+            "give me my schedule",
+            "what does my day look like",
+        ):
+            with self.subTest(text=text):
+                self.assertIs(
+                    router.route(text).kind, CommandKind.UNSUPPORTED
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
