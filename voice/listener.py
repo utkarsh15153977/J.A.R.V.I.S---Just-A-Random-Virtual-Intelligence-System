@@ -23,12 +23,18 @@ import sounddevice as sd
 from config import VoiceConfig
 from voice.audio_errors import describe_audio_error
 from voice.detection import (
+    CAPTURE_MAX_DURATION,
+    CAPTURE_REJECTED,
+    CAPTURE_SILENCE,
+    CAPTURE_WAIT_TIMEOUT,
     SPEECH_END,
     SPEECH_START,
     SpeechSegmenter,
+    capture_peak_level,
     compute_energy_threshold,
     rms,
     should_transcribe,
+    summarize_capture,
 )
 
 logger = logging.getLogger("jarvis.voice")
@@ -225,9 +231,10 @@ class Listener:
         logger.info("Listening...")
         audio_blocks = []
         pre_roll: deque = deque(maxlen=max(0, pre_roll_blocks))
-        levels = []
         recording_seconds = 0.0
         waited_seconds = 0.0
+        # How the attempt ended, so diagnostics never need the audio.
+        reason = CAPTURE_SILENCE
 
         try:
             with sd.InputStream(
@@ -243,16 +250,22 @@ class Listener:
 
                     block = data[:, 0].copy()
                     level = rms(block)
-                    levels.append(level)
 
                     event = segmenter.process(level)
 
                     if event == SPEECH_START:
-                        # Pre-roll keeps the first word from being clipped.
+                        # The segmenter has just consumed
+                        # sustained_start_blocks - 1 of the retained
+                        # pre-roll, so whatever remains is the head start
+                        # kept in front of the speech it waited for. It is
+                        # part of the recording and must be counted in the
+                        # reported duration too.
+                        recording_seconds += cfg.block_duration * len(pre_roll)
                         audio_blocks.extend(pre_roll)
                         pre_roll.clear()
                         audio_blocks.append(block)
                         recording_seconds += cfg.block_duration
+                        reason = CAPTURE_SILENCE
                         logger.info(
                             "Speech started (level %.0f, threshold %.0f).",
                             level,
@@ -268,6 +281,7 @@ class Listener:
                         audio_blocks.append(block)
                         recording_seconds += cfg.block_duration
                         if recording_seconds + 1e-9 >= max_seconds:
+                            reason = CAPTURE_MAX_DURATION
                             logger.info(
                                 "Maximum recording duration reached (%.1f s).",
                                 max_seconds,
@@ -277,10 +291,12 @@ class Listener:
                         pre_roll.append(block)
                         waited_seconds += cfg.block_duration
                         if waited_seconds + 1e-9 >= cfg.max_wait_seconds:
+                            reason = CAPTURE_WAIT_TIMEOUT
                             logger.info(
                                 "No speech detected within %.1f s.",
                                 cfg.max_wait_seconds,
                             )
+                            self._emit_capture_stats(reason, None)
                             return None
 
         except (sd.PortAudioError, OSError) as exc:
@@ -291,9 +307,14 @@ class Listener:
             ) from exc
 
         if not audio_blocks:
+            self._emit_capture_stats(reason, None)
             return None
 
-        peak_level = max(levels) if levels else 0.0
+        audio = np.concatenate(audio_blocks)
+        # Peak over the recording only: ambient blocks heard while
+        # waiting for speech are not in this audio and must not be able
+        # to satisfy the speech-content gate.
+        peak_level = capture_peak_level(audio, block_size=cfg.block_size)
         if not should_transcribe(
             duration_seconds=recording_seconds,
             peak_level=peak_level,
@@ -305,9 +326,33 @@ class Listener:
                 recording_seconds,
                 peak_level,
             )
+            self._emit_capture_stats(CAPTURE_REJECTED, audio)
             return None
 
-        return np.concatenate(audio_blocks)
+        self._emit_capture_stats(reason, audio)
+        return audio
+
+    def _emit_capture_stats(
+        self, reason: str, audio: Optional[np.ndarray]
+    ) -> None:
+        """Log one content-free summary of a capture attempt.
+
+        Off unless ``VoiceConfig.log_capture_stats`` is enabled. The line
+        carries only counts, durations, levels and the termination
+        reason: never audio samples, never transcript text.
+        """
+        if not self.config.log_capture_stats:
+            return
+        stats = summarize_capture(
+            audio,
+            reason=reason,
+            block_size=self.block_size,
+            sample_rate=self.sample_rate,
+            channels=1,
+            dtype="int16",
+            threshold=self.energy_threshold or 0.0,
+        )
+        logger.info(stats.log_line())
 
     # ------------------------------------------------------------------
     # Transcription

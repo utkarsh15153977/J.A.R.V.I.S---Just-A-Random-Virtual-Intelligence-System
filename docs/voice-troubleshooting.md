@@ -47,6 +47,7 @@ The same wording reaches the console for the manual test
 | Every phrase is "I can't do that yet." | Tools are off | Run with `--tools` (and `--allow-apps` plus an allowlist for launching). |
 | A phrase you expect to work still says "I can't do that yet." with `--tools` on | The recognised wording did not match a known phrase (routing matches an exact normalised phrase) | Re-run with `--log-transcripts` and read the `Recognized ...; routing outcome:` line (see below); the tool set is fixed and off-by-default, and unknown wording stays unsupported by design. |
 | "I had a problem hearing you." then a clean shutdown | Capture/transcription provider failed unexpectedly | Re-run; if it repeats, include `logs/jarvis.log`. |
+| The opening words of an utterance are always missing, worst when speaking quickly | The recording started at the first above-threshold block, so the quieter opening was never captured | Fixed in Batch 27.5: `pre_roll_blocks` now defaults to 9 and `VoiceConfig.validate()` requires `min_speech_seconds` + 0.5 s of headroom. Reproduce with `--log-capture-stats` and check `duration=` / `reason=`. |
 | Microphone stays busy after exit | A previous process did not release the device | Confirm no other Jarvis is running; the mic is released on every shutdown path (including Ctrl+C). |
 
 ## Diagnosing a command that falls through
@@ -120,6 +121,26 @@ Run the plain manual test to see the classified microphone messages:
 ```powershell
 .\.venv\Scripts\python -m voice.test_voice
 ```
+
+### Capture statistics
+
+To see how a capture ended without recording any content:
+
+```powershell
+.\.venv\Scripts\python app.py --log-capture-stats
+```
+
+Each attempt adds one line to `logs/jarvis.log` **before** transcription:
+
+```
+Capture stats: reason=silence samples=41600 duration=2.60s peak=1830 mean=412 clipped=0.00% silent_blocks=15% format=16000Hz/1ch/int16
+```
+
+`reason` is one of `silence` (speech ended), `maximum duration`,
+`wait timeout` (no speech within `max_wait_seconds`) or `rejection`
+(capture discarded by the acceptance gate). Values are counts, levels
+and percentages only — never audio samples and never transcript text —
+so the line is safe to paste into a bug report.
 
 ## Logs
 

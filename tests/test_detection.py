@@ -1,16 +1,24 @@
 """Unit tests for voice.detection (pure logic, no microphone needed)."""
 
+import re
 import unittest
 
 import numpy as np
 
 from voice.detection import (
+    CAPTURE_MAX_DURATION,
+    CAPTURE_REJECTED,
+    CAPTURE_SILENCE,
+    CAPTURE_WAIT_TIMEOUT,
     SPEECH_END,
     SPEECH_START,
     SpeechSegmenter,
+    block_levels,
+    capture_peak_level,
     compute_energy_threshold,
     rms,
     should_transcribe,
+    summarize_capture,
 )
 
 BLOCK = 0.1
@@ -184,6 +192,103 @@ class TestShouldTranscribe(unittest.TestCase):
                 threshold=500.0,
             )
         )
+
+
+class TestBlockLevels(unittest.TestCase):
+    def test_empty_audio_yields_no_levels(self):
+        levels = block_levels(np.zeros(0, dtype=np.int16), block_size=1600)
+        self.assertEqual(levels.size, 0)
+
+    def test_partial_final_block_is_measured_too(self):
+        audio = np.zeros(4000, dtype=np.int16)
+        audio[3200:] = 1000
+        levels = block_levels(audio, block_size=1600)
+        self.assertEqual(levels.size, 3)
+        self.assertEqual(levels[0], 0.0)
+        self.assertAlmostEqual(levels[2], 1000.0)
+
+    def test_non_positive_block_size_rejected(self):
+        with self.assertRaises(ValueError):
+            block_levels(np.zeros(10, dtype=np.int16), block_size=0)
+
+
+class TestCapturePeakLevel(unittest.TestCase):
+    def test_peak_is_the_loudest_block_of_the_audio(self):
+        audio = np.zeros(3200, dtype=np.int16)
+        audio[1600:] = 3000
+        self.assertAlmostEqual(
+            capture_peak_level(audio, block_size=1600), 3000.0
+        )
+
+    def test_quiet_opening_does_not_raise_the_peak(self):
+        audio = np.zeros(3200, dtype=np.int16)
+        audio[1600:] = 900
+        self.assertAlmostEqual(
+            capture_peak_level(audio, block_size=1600), 900.0
+        )
+
+    def test_empty_capture_has_no_peak(self):
+        empty = np.zeros(0, dtype=np.int16)
+        self.assertEqual(capture_peak_level(empty, block_size=1600), 0.0)
+
+
+class TestSummarizeCapture(unittest.TestCase):
+    def _audio(self):
+        audio = np.zeros(3200, dtype=np.int16)
+        audio[1600:] = 2000
+        return audio
+
+    def _stats(self, audio, reason=CAPTURE_SILENCE, threshold=500.0):
+        return summarize_capture(
+            audio,
+            reason=reason,
+            block_size=1600,
+            sample_rate=16000,
+            threshold=threshold,
+        )
+
+    def test_none_audio_reports_an_empty_capture(self):
+        stats = self._stats(None, reason=CAPTURE_WAIT_TIMEOUT)
+        self.assertEqual(stats.samples, 0)
+        self.assertEqual(stats.duration_seconds, 0.0)
+        self.assertEqual(stats.peak_level, 0.0)
+        self.assertIn("reason=wait timeout", stats.log_line())
+
+    def test_measurements_cover_the_recording_only(self):
+        stats = self._stats(self._audio())
+        self.assertEqual(stats.samples, 3200)
+        self.assertAlmostEqual(stats.duration_seconds, 0.2)
+        self.assertAlmostEqual(stats.peak_level, 2000.0)
+        self.assertAlmostEqual(stats.mean_level, 1000.0)
+        self.assertEqual(stats.silent_block_percent, 50.0)
+        self.assertEqual(stats.clipped_percent, 0.0)
+        self.assertEqual(stats.sample_rate, 16000)
+        self.assertEqual(stats.channels, 1)
+        self.assertEqual(stats.dtype, "int16")
+
+    def test_saturated_samples_are_reported_as_clipping(self):
+        stats = self._stats(np.full(1600, 32767, dtype=np.int16))
+        self.assertEqual(stats.clipped_percent, 100.0)
+        self.assertEqual(stats.silent_block_percent, 0.0)
+
+    def test_log_line_carries_only_numbers_and_enums(self):
+        line = self._stats(self._audio()).log_line()
+        self.assertRegex(
+            line,
+            re.compile(
+                r"^Capture stats: reason=(silence|maximum duration|"
+                r"wait timeout|rejection) samples=\d+ duration=\d+\.\d{2}s "
+                r"peak=\d+ mean=\d+ clipped=\d+\.\d{2}% "
+                r"silent_blocks=\d+% format=\d+Hz/\d+ch/\w+$"
+            ),
+        )
+
+    def test_reason_vocabulary_is_fixed(self):
+        self.assertEqual(
+            {CAPTURE_SILENCE, CAPTURE_MAX_DURATION, CAPTURE_WAIT_TIMEOUT},
+            {"silence", "maximum duration", "wait timeout"},
+        )
+        self.assertEqual(CAPTURE_REJECTED, "rejection")
 
 
 if __name__ == "__main__":

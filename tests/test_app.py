@@ -751,6 +751,56 @@ class TestTranscriptPrivacy(unittest.TestCase):
         )
 
 
+class TestCaptureStatsPrivacy(unittest.TestCase):
+    """Batch 27.5: capture statistics stay off unless explicitly enabled."""
+
+    def _run(self, argv):
+        captured = {}
+        output = []
+
+        def factory(config):
+            captured["config"] = config
+            return FakeListener(texts=["exit"])
+
+        code = main(
+            argv,
+            listener_factory=factory,
+            speaker_factory=lambda config: FakeSpeaker(),
+            output=output.append,
+        )
+        return code, captured["config"], output
+
+    def test_capture_stats_are_off_by_default(self):
+        code, config, output = self._run([])
+        self.assertEqual(code, EXIT_OK)
+        self.assertFalse(config.log_capture_stats)
+        self.assertFalse(
+            any("Capture statistics logging is ON" in line for line in output)
+        )
+
+    def test_log_capture_stats_flag_opts_in(self):
+        code, config, output = self._run(["--log-capture-stats"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(config.log_capture_stats)
+        self.assertTrue(
+            any("Capture statistics logging is ON" in line for line in output)
+        )
+        # Content-free statistics must never turn transcripts on.
+        self.assertFalse(config.log_transcripts)
+        self.assertFalse(any("Transcript logging is ON" in line for line in output))
+
+    def test_usage_documents_the_flag(self):
+        def factory(config):
+            raise AssertionError("listener must not be created")
+
+        output = []
+        code = main(["--help"], listener_factory=factory, output=output.append)
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(
+            any("--log-capture-stats" in line for line in output)
+        )
+
+
 class TestSpeechIntegration(unittest.TestCase):
     def test_startup_and_goodbye_are_spoken(self):
         code, _, _, speaker = run_main(texts=["exit"])

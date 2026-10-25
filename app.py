@@ -276,6 +276,10 @@ _USAGE = (
     "                      it was unsupported) to the log file. OFF by\n"
     "                      default: spoken commands may contain\n"
     "                      sensitive information.\n"
+    "  --log-capture-stats Write one content-free line per capture to the\n"
+    "                      log file: duration, levels, clipping, sample\n"
+    "                      format and how the capture ended. No audio and\n"
+    "                      no transcript text. OFF by default.\n"
     "  --no-speech         Text-only mode: never produce speech output.\n"
     "  -h, --help          Show this message and exit.\n"
 )
@@ -299,6 +303,7 @@ class _Options:
     calendar_write: bool = False
     calendar_write_auth: bool = False
     log_transcripts: bool = False
+    log_capture_stats: bool = False
     speak: bool = True
     show_help: bool = False
 
@@ -321,6 +326,7 @@ def _parse_args(argv: List[str]) -> _Options:
         calendar_write="--calendar-write" in argv,
         calendar_write_auth="--calendar-write-auth" in argv,
         log_transcripts="--log-transcripts" in argv,
+        log_capture_stats="--log-capture-stats" in argv,
         speak="--no-speech" not in argv,
         show_help=any(arg in ("-h", "--help") for arg in argv),
     )
@@ -332,6 +338,11 @@ def _startup_message(config: VoiceConfig) -> str:
         message += (
             " Transcript logging is ON: spoken commands will be written "
             "to the log file."
+        )
+    if config.log_capture_stats:
+        message += (
+            " Capture statistics logging is ON: one content-free line "
+            "(durations and levels, never audio or text) per capture."
         )
     return message
 
@@ -1368,6 +1379,8 @@ def main(
         active_config = config if config is not None else VoiceConfig()
         if options.log_transcripts:
             active_config = replace(active_config, log_transcripts=True)
+        if options.log_capture_stats:
+            active_config = replace(active_config, log_capture_stats=True)
         active_config.validate()
 
         active_speech = (

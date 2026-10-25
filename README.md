@@ -153,6 +153,10 @@ $env:TAVILY_API_KEY = "tvly-your-key"
 # (OFF by default, because spoken commands may contain sensitive info)
 .\.venv\Scripts\python app.py --log-transcripts
 
+# Opt in to content-free capture statistics (duration, levels, clipping,
+# sample format and how the capture ended - never audio or transcript text)
+.\.venv\Scripts\python app.py --log-capture-stats
+
 # Manual microphone test (hardware test)
 .\.venv\Scripts\python -m voice.test_voice
 

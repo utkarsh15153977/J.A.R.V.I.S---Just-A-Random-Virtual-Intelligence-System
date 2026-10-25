@@ -12,10 +12,11 @@ microphone (16 kHz, int16, 100 ms blocks)
 noise calibration (once, ~1 s) ──► dynamic energy threshold
     │
     ▼
-wait for speech (pre-roll buffer keeps last 3 blocks)
-    │  block RMS >= threshold for 0.4 s  ──► speech starts
+wait for speech (pre-roll buffer keeps the last 9 blocks = 0.9 s)
+    │  block RMS >= threshold for 0.4 s (4 blocks)  ──► speech starts
     ▼
-record (pre-roll prepended so the first word is not clipped)
+record (pre-roll prepended, so the quiet opening of the sentence
+        starts 0.6 s before the first above-threshold block)
     │  RMS < threshold for 1.0 s  ──► speech ends
     │  recording reaches 10 s     ──► forced stop
     │  no speech within 30 s      ──► attempt abandoned
@@ -53,6 +54,26 @@ A block above threshold is not enough. The level must stay above the
 threshold for `min_speech_seconds` (0.4 s); any gap resets progress.
 This rejects clicks, keyboard clatter and other short spikes.
 
+### Pre-roll must cover that window, plus headroom
+
+`SpeechSegmenter` only emits `SPEECH_START` once `min_speech_seconds` of
+consecutive above-threshold audio have been accumulated, so the first
+`sustained_start_blocks - 1` blocks of the retained pre-roll are already
+consumed by the time the recording starts. Whatever is left is the real
+head start.
+
+A pre-roll of 3 blocks left `3 - (4 - 1) = 0` blocks of head start: the
+recording began exactly at the first above-threshold block, so anything
+quieter that opened the sentence was discarded. Fast speech was hit
+hardest, because its shorter utterances amplify a lost opening.
+
+`VoiceConfig.required_pre_roll_blocks` derives the minimum from the same
+settings — `sustained_start_blocks - 1` plus
+`PRE_ROLL_HEADROOM_SECONDS` (0.5 s) of margin — and `validate()` rejects
+any configuration below it. The default is 9 blocks (0.9 s), leaving
+0.6 s of headroom with the default detection settings. Pre-roll audio is
+part of the recording, so it is also counted in the reported duration.
+
 ### Silence detection uses audio time, not wall clock
 
 The segmenter accumulates block durations, so timing is deterministic
@@ -87,7 +108,7 @@ startup (`ConfigError` collects every problem in one message):
 | `silence_stop_seconds` | 1.0 | silence that ends recording |
 | `max_recording_seconds` | 10.0 | hard cap per utterance |
 | `max_wait_seconds` | 30.0 | give up waiting for speech |
-| `pre_roll_blocks` | 3 | audio kept before speech start |
+| `pre_roll_blocks` | 9 | audio retained before speech start; validated to cover `min_speech_seconds` + 0.5 s headroom |
 
 ## Speaker verification (optional)
 
@@ -191,6 +212,14 @@ Console: short format. File: `logs/jarvis.log` with timestamps.
 Logged events: calibration baseline/threshold, speech start (with
 levels), speech end (with duration), discarded captures, wait timeouts,
 transcription duration, final transcription. Raw audio is never logged.
+
+`--log-capture-stats` (`VoiceConfig.log_capture_stats`, off by default)
+adds one line per capture attempt describing only numbers: sample count
+and duration, the termination reason (`silence`, `maximum duration`,
+`wait timeout` or `rejection`), peak and mean block RMS, the percentage
+of clipped samples and silent blocks, and the sample format (rate,
+channels, dtype) — logged before transcription. It never records audio
+samples or transcript text.
 
 ## Testing
 

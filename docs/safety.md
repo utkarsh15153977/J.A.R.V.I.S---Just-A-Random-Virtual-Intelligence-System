@@ -242,6 +242,11 @@ those tools).
   matched tool id, or that the turn was `unsupported`); it is off unless
   explicitly enabled, and the startup message warns when it is on. The
   routing outcome contains no arguments and no transcript text of its own.
+- `app.py --log-capture-stats` (or `VoiceConfig(log_capture_stats=True)`)
+  opts in to one **content-free** line per capture: sample count, duration,
+  termination reason, peak/mean RMS, clipped and silent percentages, and
+  the sample format. It records no audio samples and no transcript text,
+  and is off unless explicitly enabled.
 - Raw arguments and handler return values are never logged.
 - Handler failures log the tool name and the exception **class** only;
   the exception message (which may embed data) is not logged.

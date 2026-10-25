@@ -6,6 +6,7 @@ Whisper, so every function here is unit testable with synthetic data.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 import numpy as np
@@ -13,6 +14,13 @@ import numpy as np
 # Events emitted by SpeechSegmenter.process().
 SPEECH_START = "speech_start"
 SPEECH_END = "speech_end"
+
+# Why one capture attempt ended. Content-free enums so a diagnostic line
+# never has to quote anything the user said.
+CAPTURE_SILENCE = "silence"
+CAPTURE_MAX_DURATION = "maximum duration"
+CAPTURE_WAIT_TIMEOUT = "wait timeout"
+CAPTURE_REJECTED = "rejection"
 
 # Internal segmenter states.
 _STATE_WAITING = "waiting"
@@ -154,3 +162,113 @@ def should_transcribe(
     if peak_level < threshold:
         return False
     return True
+
+
+def block_levels(audio: np.ndarray, *, block_size: int) -> np.ndarray:
+    """RMS level of every (possibly partial) block of ``audio``."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if audio.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    levels = [
+        rms(audio[index : index + block_size])
+        for index in range(0, audio.size, block_size)
+    ]
+    return np.asarray(levels, dtype=np.float64)
+
+
+def capture_peak_level(audio: np.ndarray, *, block_size: int) -> float:
+    """Peak per-block RMS over the *recording* only.
+
+    Ambient blocks heard while waiting for speech are not part of the
+    recording, so they must never be able to satisfy the speech-content
+    gate in :func:`should_transcribe`.
+    """
+    levels = block_levels(audio, block_size=block_size)
+    return float(levels.max()) if levels.size else 0.0
+
+
+@dataclass(frozen=True)
+class CaptureStats:
+    """Measurements of one capture attempt, with no audio and no text."""
+
+    reason: str
+    samples: int
+    duration_seconds: float
+    peak_level: float
+    mean_level: float
+    clipped_percent: float
+    silent_block_percent: float
+    sample_rate: int
+    channels: int
+    dtype: str
+
+    def log_line(self) -> str:
+        """One content-free line: numbers and enum values only."""
+        return (
+            f"Capture stats: reason={self.reason} samples={self.samples} "
+            f"duration={self.duration_seconds:.2f}s peak={self.peak_level:.0f} "
+            f"mean={self.mean_level:.0f} clipped={self.clipped_percent:.2f}% "
+            f"silent_blocks={self.silent_block_percent:.0f}% "
+            f"format={self.sample_rate}Hz/{self.channels}ch/{self.dtype}"
+        )
+
+
+def summarize_capture(
+    audio: Optional[np.ndarray],
+    *,
+    reason: str,
+    block_size: int,
+    sample_rate: int,
+    threshold: float,
+    channels: int = 1,
+    dtype: str = "int16",
+) -> CaptureStats:
+    """Measure one capture attempt without ever reading its content.
+
+    ``audio`` may be None when the attempt produced nothing (e.g. the
+    wait timed out); the stats then report an empty capture.
+    """
+    if audio is None or audio.size == 0:
+        return CaptureStats(
+            reason=reason,
+            samples=0,
+            duration_seconds=0.0,
+            peak_level=0.0,
+            mean_level=0.0,
+            clipped_percent=0.0,
+            silent_block_percent=0.0,
+            sample_rate=sample_rate,
+            channels=channels,
+            dtype=dtype,
+        )
+
+    samples = int(audio.size)
+    levels = block_levels(audio, block_size=block_size)
+    if np.issubdtype(audio.dtype, np.integer):
+        # Full-scale amplitude for a signed integer of this width.
+        full_scale = float(2 ** (audio.dtype.itemsize * 8 - 1) - 1)
+        clipped = int(
+            np.count_nonzero(np.abs(audio.astype(np.int64)) >= full_scale)
+        )
+    else:
+        clipped = int(np.count_nonzero(np.abs(audio) >= 0.99))
+    silence_limit = threshold if threshold > 0 else 0.0
+    silent = int(
+        np.count_nonzero(levels < silence_limit)
+        if silence_limit > 0
+        else np.count_nonzero(levels == 0.0)
+    )
+
+    return CaptureStats(
+        reason=reason,
+        samples=samples,
+        duration_seconds=samples / float(sample_rate) if sample_rate > 0 else 0.0,
+        peak_level=float(levels.max()) if levels.size else 0.0,
+        mean_level=float(levels.mean()) if levels.size else 0.0,
+        clipped_percent=clipped * 100.0 / samples,
+        silent_block_percent=silent * 100.0 / levels.size if levels.size else 0.0,
+        sample_rate=sample_rate,
+        channels=channels,
+        dtype=dtype,
+    )

@@ -3,6 +3,7 @@
 These avoid the microphone entirely by faking the Listener.
 """
 
+import re
 import sys
 import unittest
 from types import SimpleNamespace
@@ -19,6 +20,16 @@ from voice.listener import (
     ModelLoadError,
     TranscriptionStatus,
     join_segments,
+)
+
+BLOCK_SIZE = 1600  # 0.1 s at 16 kHz
+THRESHOLD = 500.0
+
+# One capture statistic line: numbers and enums only, never content.
+STATS_PATTERN = re.compile(
+    r"^Capture stats: reason=(silence|maximum duration|wait timeout|rejection) "
+    r"samples=\d+ duration=\d+\.\d{2}s peak=\d+ mean=\d+ "
+    r"clipped=\d+\.\d{2}% silent_blocks=\d+% format=\d+Hz/\d+ch/\w+$"
 )
 
 
@@ -297,6 +308,206 @@ class TestTranscriptionResult(unittest.TestCase):
             listener, "record_until_silence", return_value=audio
         ):
             self.assertEqual(listener.transcribe(), "exit")
+
+
+def _quiet(value=0):
+    """One 100 ms block whose RMS equals ``value``."""
+    return np.full(BLOCK_SIZE, value, dtype=np.int16)
+
+
+def _stats_messages(logged):
+    """Capture-stat lines with the logging prefix removed."""
+    messages = []
+    for entry in logged.splitlines():
+        if "Capture stats:" in entry:
+            messages.append(entry.split("jarvis.voice:", 1)[-1])
+    return messages
+
+
+class ScriptedStream:
+    """Context-manager stream replaying fixed blocks through read()."""
+
+    def __init__(self, blocks):
+        self._blocks = [np.asarray(b, dtype=np.int16).reshape(-1, 1) for b in blocks]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self, _samples):
+        if not self._blocks:
+            raise AssertionError("scripted stream ran out of audio")
+        return self._blocks.pop(0), False
+
+
+class _CaptureHarness:
+    """Builds a Listener with a fake model and replays scripted audio."""
+
+    def _listener(self, **overrides):
+        fake = SimpleNamespace(
+            WhisperModel=lambda *args, **kwargs: _FakeWhisperModel("Secret Plan")
+        )
+        with patch.dict(sys.modules, {"faster_whisper": fake}):
+            listener = Listener(VoiceConfig(**overrides))
+        # Skip calibration: the threshold is part of the scenario.
+        listener.energy_threshold = THRESHOLD
+        return listener
+
+    def _record(self, listener, blocks, **kwargs):
+        stream = ScriptedStream(blocks)
+        with patch.object(sd, "InputStream", return_value=stream):
+            with self.assertLogs("jarvis.voice", level="INFO") as logs:
+                audio = listener.record_until_silence(**kwargs)
+        return audio, "\n".join(logs.output)
+
+    def _leading_blocks(self, audio, value):
+        """Count how many whole leading blocks are exactly ``value``."""
+        count = 0
+        for index in range(0, audio.size, BLOCK_SIZE):
+            if audio[index] != value:
+                break
+            count += 1
+        return count
+
+
+class TestCapturePreRoll(_CaptureHarness, unittest.TestCase):
+    """Batch 27.5: the recording must start before the speech run.
+
+    Before the fix the pre-roll (3 blocks) was exactly consumed by the
+    sustained-start window (4 blocks), so the capture began at the first
+    above-threshold block and the quieter opening was discarded.
+    """
+
+    def _script(self):
+        # Quiet opening, then 0.4 s of speech, then 1.0 s of silence.
+        return [_quiet(50)] * 10 + [_quiet(1000)] * 4 + [_quiet(0)] * 10
+
+    def test_recording_starts_before_the_speech_run(self):
+        listener = self._listener()
+        audio, _ = self._record(listener, self._script())
+        self.assertIsNotNone(audio)
+
+        head = self._leading_blocks(audio, 50) * listener.config.block_duration
+        self.assertGreaterEqual(head, VoiceConfig.PRE_ROLL_HEADROOM_SECONDS)
+        # The speech run follows the head start, then the trailing silence.
+        self.assertEqual(audio.size, (6 + 4 + 9) * BLOCK_SIZE)
+        self.assertEqual(audio[6 * BLOCK_SIZE], 1000)
+
+    def test_zero_head_room_starts_at_the_first_speech_block(self):
+        # Characterisation of the defect: without headroom the quiet
+        # opening is gone, and so are the three sustained-start blocks
+        # that were still inside the (empty) pre-roll.
+        listener = self._listener()
+        audio, _ = self._record(listener, self._script(), pre_roll_blocks=0)
+        self.assertIsNotNone(audio)
+        self.assertEqual(self._leading_blocks(audio, 50), 0)
+        self.assertEqual(audio.size, (1 + 9) * BLOCK_SIZE)
+        self.assertEqual(audio[0], 1000)
+
+    def test_reported_duration_includes_the_pre_roll(self):
+        listener = self._listener()
+        _, logged = self._record(listener, self._script())
+        # 9 pre-roll blocks + the speech run + 9 recorded silence blocks:
+        # 1.9 s, of which 0.9 s is the pre-roll the old code never counted.
+        self.assertIn("Speech ended after 1.90 s of audio.", logged)
+
+    def test_capture_is_accepted_not_discarded(self):
+        listener = self._listener()
+        audio, logged = self._record(listener, self._script())
+        self.assertIsNotNone(audio)
+        self.assertNotIn("Discarding capture", logged)
+
+
+class TestPeakComesFromTheRecording(_CaptureHarness, unittest.TestCase):
+    """Ambient audio heard while waiting never reaches the gate."""
+
+    def test_ambient_outside_the_recording_does_not_set_the_peak(self):
+        listener = self._listener(min_recording_seconds=3.0)
+        blocks = (
+            [_quiet(1000), _quiet(0)] * 5  # loud ambient with gaps: never starts
+            + [_quiet(0)] * 20  # quiet tail; the deque drops the loud blocks
+            + [_quiet(600)] * 4  # sustained start
+            + [_quiet(0)] * 10  # silence ends the capture
+        )
+        audio, logged = self._record(
+            listener, blocks, silence_duration=0.1
+        )
+        # Rejected as too short: the peak it reports is the loudest block
+        # of the recording, never the loud ambient heard before it.
+        self.assertIsNone(audio)
+        self.assertIn("Discarding capture: 1.00 s, peak level 600.", logged)
+        self.assertNotIn("peak level 1000", logged)
+
+
+class TestCaptureStatsLogging(_CaptureHarness, unittest.TestCase):
+    """--log-capture-stats is off by default and never logs content."""
+
+    def _script(self):
+        return [_quiet(50)] * 10 + [_quiet(1000)] * 4 + [_quiet(0)] * 10
+
+    def test_off_by_default(self):
+        listener = self._listener()
+        audio, logged = self._record(listener, self._script())
+        self.assertIsNotNone(audio)
+        self.assertEqual(_stats_messages(logged), [])
+
+    def test_opt_in_logs_exactly_one_content_free_line(self):
+        listener = self._listener(log_capture_stats=True)
+        audio, logged = self._record(listener, self._script())
+        self.assertIsNotNone(audio)
+        messages = _stats_messages(logged)
+        self.assertEqual(len(messages), 1)
+        self.assertRegex(messages[0], STATS_PATTERN)
+        self.assertIn("reason=silence", messages[0])
+        self.assertIn("format=16000Hz/1ch/int16", messages[0])
+
+    def test_stats_are_logged_before_the_audio_reaches_whisper(self):
+        listener = self._listener(log_capture_stats=True)
+        stream = ScriptedStream(self._script())
+        with patch.object(sd, "InputStream", return_value=stream):
+            with self.assertLogs("jarvis.voice", level="INFO") as logs:
+                listener.transcribe()
+        logged = list(logs.output)
+        stats_at = next(
+            index for index, entry in enumerate(logged) if "Capture stats:" in entry
+        )
+        done_at = next(
+            index
+            for index, entry in enumerate(logged)
+            if "Transcription finished" in entry
+        )
+        self.assertLess(stats_at, done_at)
+        self.assertNotIn("Secret Plan", "\n".join(logged))
+
+    def test_wait_timeout_is_reported_as_an_empty_capture(self):
+        listener = self._listener(log_capture_stats=True, max_wait_seconds=0.5)
+        audio, logged = self._record(listener, [_quiet(0)] * 8)
+        self.assertIsNone(audio)
+        messages = _stats_messages(logged)
+        self.assertEqual(len(messages), 1)
+        self.assertRegex(messages[0], STATS_PATTERN)
+        self.assertIn("reason=wait timeout", messages[0])
+        self.assertIn("samples=0", messages[0])
+
+    def test_rejection_reports_its_own_reason(self):
+        listener = self._listener(
+            log_capture_stats=True, min_recording_seconds=3.0
+        )
+        blocks = (
+            [_quiet(1000), _quiet(0)] * 5
+            + [_quiet(0)] * 20
+            + [_quiet(600)] * 4
+            + [_quiet(0)] * 10
+        )
+        audio, logged = self._record(listener, blocks, silence_duration=0.1)
+        self.assertIsNone(audio)
+        messages = _stats_messages(logged)
+        self.assertEqual(len(messages), 1)
+        self.assertRegex(messages[0], STATS_PATTERN)
+        self.assertIn("reason=rejection", messages[0])
+        self.assertIn("peak=600", messages[0])
 
 
 if __name__ == "__main__":

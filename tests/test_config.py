@@ -1,6 +1,7 @@
 """Unit tests for config validation."""
 
 import unittest
+from dataclasses import replace
 
 from config import (
     AppsConfig,
@@ -78,6 +79,101 @@ class TestVoiceConfigValidation(unittest.TestCase):
             config.validate()
         self.assertIn("sample_rate", str(ctx.exception))
         self.assertIn("beam_size", str(ctx.exception))
+
+
+class TestVoiceConfigPreRoll(unittest.TestCase):
+    """Pre-roll must cover the sustained-start window plus headroom.
+
+    Batch 27.5: a 3-block pre-roll left 3 - (4 - 1) = 0 blocks of head
+    start, so recording began at the first above-threshold block and the
+    quieter opening of an utterance was discarded.
+    """
+
+    def test_default_is_large_enough(self):
+        config = VoiceConfig()
+        self.assertEqual(config.pre_roll_blocks, 9)
+        self.assertEqual(config.sustained_start_blocks, 4)
+        self.assertEqual(config.required_pre_roll_blocks, 8)
+        self.assertIs(config.validate(), config)
+
+    def test_default_keeps_at_least_half_a_second_of_headroom(self):
+        config = VoiceConfig()
+        headroom_blocks = (
+            config.pre_roll_blocks - (config.sustained_start_blocks - 1)
+        )
+        self.assertGreaterEqual(
+            headroom_blocks * config.block_duration,
+            VoiceConfig.PRE_ROLL_HEADROOM_SECONDS,
+        )
+
+    def test_pre_roll_covering_only_the_window_is_rejected(self):
+        # Exactly the sustained-start window: zero headroom, the defect.
+        with self.assertRaises(ConfigError) as ctx:
+            VoiceConfig(pre_roll_blocks=4).validate()
+        self.assertIn("pre_roll_blocks", str(ctx.exception))
+        self.assertIn("headroom", str(ctx.exception))
+
+    def test_minimum_accepted_value_is_valid(self):
+        minimum = VoiceConfig().required_pre_roll_blocks
+        config = VoiceConfig(pre_roll_blocks=minimum)
+        headroom_blocks = minimum - (config.sustained_start_blocks - 1)
+        self.assertGreaterEqual(
+            headroom_blocks * config.block_duration,
+            VoiceConfig.PRE_ROLL_HEADROOM_SECONDS,
+        )
+        self.assertIs(config.validate(), config)
+
+    def test_requirement_grows_with_smaller_blocks(self):
+        config = VoiceConfig(block_duration=0.05, pre_roll_blocks=9)
+        self.assertEqual(config.sustained_start_blocks, 8)
+        self.assertGreater(config.required_pre_roll_blocks, 9)
+        with self.assertRaises(ConfigError):
+            config.validate()
+        larger = VoiceConfig(
+            block_duration=0.05,
+            pre_roll_blocks=config.required_pre_roll_blocks,
+        )
+        self.assertIs(larger.validate(), larger)
+
+    def test_requirement_grows_with_a_longer_start_window(self):
+        config = VoiceConfig(
+            min_speech_seconds=0.8, min_recording_seconds=0.8, pre_roll_blocks=9
+        )
+        self.assertEqual(config.sustained_start_blocks, 8)
+        self.assertEqual(config.required_pre_roll_blocks, 12)
+        with self.assertRaises(ConfigError) as ctx:
+            config.validate()
+        self.assertIn("pre_roll_blocks", str(ctx.exception))
+        larger = VoiceConfig(
+            min_speech_seconds=0.8,
+            min_recording_seconds=0.8,
+            pre_roll_blocks=config.required_pre_roll_blocks,
+        )
+        self.assertIs(larger.validate(), larger)
+
+    def test_broken_detection_settings_do_not_invent_a_requirement(self):
+        config = VoiceConfig(block_duration=0, pre_roll_blocks=0)
+        self.assertEqual(config.required_pre_roll_blocks, 0)
+        with self.assertRaises(ConfigError) as ctx:
+            config.validate()
+        self.assertIn("block_duration", str(ctx.exception))
+        self.assertNotIn("pre_roll_blocks", str(ctx.exception))
+
+
+class TestVoiceConfigCaptureStats(unittest.TestCase):
+    def test_capture_stats_are_off_by_default(self):
+        self.assertFalse(VoiceConfig().log_capture_stats)
+
+    def test_capture_stats_can_be_enabled(self):
+        config = VoiceConfig(log_capture_stats=True)
+        self.assertTrue(config.log_capture_stats)
+        self.assertIs(config.validate(), config)
+
+    def test_capture_stats_is_not_a_constructor_field(self):
+        # Off-by-default switches still have to round-trip through
+        # dataclasses.replace() used by app.main().
+        enabled = replace(VoiceConfig(), log_capture_stats=True)
+        self.assertTrue(enabled.log_capture_stats)
 
 
 class TestWakeConfig(unittest.TestCase):

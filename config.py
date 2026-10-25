@@ -4,8 +4,22 @@ Every tunable value lives here so pipeline code stays free of magic
 numbers and tests can inject their own configuration.
 """
 
+import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
+
+
+def _blocks_for(seconds: float, block_duration: float) -> int:
+    """Blocks of ``block_duration`` needed to cover ``seconds``.
+
+    SpeechSegmenter fires as soon as its accumulated block durations
+    reach the target, so this is a ceiling (rounding down would
+    under-count by one block and lose the guarantee it describes).
+    The epsilon matches the tolerance that accumulator uses.
+    """
+    if seconds <= 0 or block_duration <= 0:
+        return 0
+    return max(1, math.ceil(seconds / block_duration - 1e-9))
 
 
 class ConfigError(ValueError):
@@ -32,7 +46,15 @@ class VoiceConfig:
     silence_stop_seconds: float = 1.0  # silence that ends a recording
     max_recording_seconds: float = 10.0  # hard cap per utterance
     max_wait_seconds: float = 30.0  # give up waiting for speech
-    pre_roll_blocks: int = 3  # audio kept before speech start
+    # Audio blocks kept before SPEECH_START. Must cover the sustained-start
+    # window plus PRE_ROLL_HEADROOM_SECONDS, otherwise the recording starts
+    # exactly at the first above-threshold block and the quieter syllables
+    # that opened the sentence are discarded (see required_pre_roll_blocks).
+    pre_roll_blocks: int = 9
+
+    # Head start the pre-roll must keep in front of the sustained-start
+    # window; quiet openings and fast speech need margin beyond the window.
+    PRE_ROLL_HEADROOM_SECONDS: ClassVar[float] = 0.5
 
     # --- Whisper -------------------------------------------------------
     whisper_model: str = "base"
@@ -45,11 +67,40 @@ class VoiceConfig:
     # Off by default: written/spoken commands can contain sensitive data,
     # so full transcripts are never persisted unless explicitly enabled.
     log_transcripts: bool = False
+    # Off by default: content-free capture statistics only (durations,
+    # levels, sample format, termination reason) - never audio and never
+    # transcript text.
+    log_capture_stats: bool = False
 
     @property
     def block_size(self) -> int:
         """Number of samples per audio block."""
         return int(self.sample_rate * self.block_duration)
+
+    @property
+    def sustained_start_blocks(self) -> int:
+        """Blocks the segmenter must see at/above threshold to start."""
+        return _blocks_for(self.min_speech_seconds, self.block_duration)
+
+    @property
+    def pre_roll_headroom_blocks(self) -> int:
+        """Blocks of head start kept in front of the sustained-start run."""
+        return _blocks_for(self.PRE_ROLL_HEADROOM_SECONDS, self.block_duration)
+
+    @property
+    def required_pre_roll_blocks(self) -> int:
+        """Smallest ``pre_roll_blocks`` that keeps the headroom guarantee.
+
+        SpeechSegmenter consumes ``sustained_start_blocks - 1`` of the
+        retained pre-roll before it can emit SPEECH_START, so a shorter
+        buffer leaves the recording starting at the first above-threshold
+        block and drops everything quieter that opened the sentence.
+        Returns 0 when the inputs cannot form a meaningful requirement.
+        """
+        start = self.sustained_start_blocks
+        if start <= 0:
+            return 0
+        return start - 1 + self.pre_roll_headroom_blocks
 
     def validate(self) -> "VoiceConfig":
         """Check every value and return self.
@@ -87,6 +138,15 @@ class VoiceConfig:
             problems.append("max_wait_seconds must be positive")
         if self.pre_roll_blocks < 0:
             problems.append("pre_roll_blocks cannot be negative")
+        required_pre_roll = self.required_pre_roll_blocks
+        if required_pre_roll and self.pre_roll_blocks < required_pre_roll:
+            problems.append(
+                "pre_roll_blocks must be at least "
+                f"{required_pre_roll} to keep "
+                f"{self.PRE_ROLL_HEADROOM_SECONDS:g}s of headroom in front "
+                f"of the {self.min_speech_seconds:g}s sustained-start "
+                f"window ({self.block_duration:g}s blocks)"
+            )
         if self.beam_size < 1:
             problems.append("beam_size must be at least 1")
         if not self.whisper_model:
