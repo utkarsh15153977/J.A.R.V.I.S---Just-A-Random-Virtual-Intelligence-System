@@ -73,6 +73,14 @@ class TestFormatSummary(unittest.TestCase):
         self.assertIn("median=15", text)
         self.assertIn("blocks=2", text)
 
+    def test_median_is_labelled_as_the_whole_phase_statistic(self):
+        # The production threshold derives from the first calibration
+        # window only, so the printed median must announce that it is
+        # the whole-phase statistic and not invite comparing the two
+        # (Batch 28 presentation fix; regression-locked in Batch 29).
+        text = format_summary("Ambient", summarize_levels([10.0, 20.0]))
+        self.assertIn("median=15 (whole phase)", text)
+
 
 class TestDescribeInputDevice(unittest.TestCase):
     def test_matching_rate_has_no_conversion_note(self):

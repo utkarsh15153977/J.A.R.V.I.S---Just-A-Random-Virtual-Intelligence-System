@@ -510,6 +510,88 @@ class TestCaptureStatsLogging(_CaptureHarness, unittest.TestCase):
         self.assertIn("peak=600", messages[0])
 
 
+class TestCalibrationSafetyWarnings(unittest.TestCase):
+    """The floor/ceiling calibration warnings are safety controls.
+
+    A saturated or dead microphone produces a threshold the speech gate
+    can never satisfy (ceiling) or will satisfy for any sound (floor);
+    both cases must warn every time they occur, never go silent.
+    """
+
+    def _calibrate(self, level):
+        fake = SimpleNamespace(
+            WhisperModel=lambda *args, **kwargs: _FakeWhisperModel("ok")
+        )
+        with patch.dict(sys.modules, {"faster_whisper": fake}):
+            listener = Listener(VoiceConfig())
+        stream = ScriptedStream([_quiet(level)] * 10)
+        with patch.object(sd, "InputStream", return_value=stream):
+            with self.assertLogs("jarvis.voice", level="WARNING") as logs:
+                threshold = listener.calibrate()
+        return listener, threshold, logs.output
+
+    def test_saturated_microphone_warns_at_the_ceiling(self):
+        listener, threshold, messages = self._calibrate(2000)
+        self.assertEqual(threshold, 4000.0)
+        self.assertEqual(listener.energy_threshold, 4000.0)
+        self.assertTrue(
+            any("Threshold hit the ceiling" in message for message in messages),
+            messages,
+        )
+
+    def test_silent_microphone_warns_at_the_floor(self):
+        listener, threshold, messages = self._calibrate(0)
+        self.assertEqual(threshold, 50.0)
+        self.assertEqual(listener.energy_threshold, 50.0)
+        self.assertTrue(
+            any("Threshold hit the floor" in message for message in messages),
+            messages,
+        )
+
+
+class TestConsecutiveCaptures(_CaptureHarness, unittest.TestCase):
+    """Every capture attempt opens its own stream.
+
+    Consecutive commands must never share audio: a stream cached (or
+    left open) between utterances would feed blocks from one command
+    into the next. The Batch 28 acceptance session ran five commands
+    back to back; this locks the fresh-open property underneath it.
+    """
+
+    def test_each_attempt_opens_a_fresh_stream(self):
+        # Three silent blocks = 0.3 s, then the bounded wait timeout.
+        listener = self._listener(max_wait_seconds=0.3)
+        opens = []
+
+        def _open(**kwargs):
+            opens.append(kwargs)
+            return ScriptedStream([_quiet(0)] * 3)
+
+        with patch.object(sd, "InputStream", _open):
+            with self.assertLogs("jarvis.voice", level="INFO") as first_logs:
+                first = listener.record_until_silence()
+            with self.assertLogs("jarvis.voice", level="INFO") as second_logs:
+                second = listener.record_until_silence()
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        # Both attempts ran their own bounded wait, independently.
+        self.assertTrue(
+            any("No speech detected" in m for m in first_logs.output)
+        )
+        self.assertTrue(
+            any("No speech detected" in m for m in second_logs.output)
+        )
+        # A distinct InputStream per attempt, with identical settings.
+        self.assertEqual(len(opens), 2)
+        self.assertEqual(opens[0], opens[1])
+        config = listener.config
+        self.assertEqual(opens[0]["samplerate"], config.sample_rate)
+        self.assertEqual(opens[0]["channels"], 1)
+        self.assertEqual(opens[0]["dtype"], "int16")
+        self.assertEqual(opens[0]["blocksize"], config.block_size)
+
+
 if __name__ == "__main__":
     unittest.main()
 
