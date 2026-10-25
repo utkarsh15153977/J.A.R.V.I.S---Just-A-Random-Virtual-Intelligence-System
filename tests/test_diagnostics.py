@@ -122,6 +122,23 @@ class TestInterpret(unittest.TestCase):
             any("false speech triggers are likely" in line for line in lines)
         )
 
+    def test_transient_peak_warns_even_when_median_is_quiet(self):
+        # A single brief spike above the threshold trips the
+        # maximum-based ambient warning although nothing sustained is
+        # loud: the median stays far below the threshold. Covered
+        # deliberately so the current behaviour stays a conscious
+        # choice rather than a surprise (Batch 28 audit).
+        ambient = summary(100, 150, 160, 4500)
+        normal = summary(900, 1000, 1100, 1200)
+        loud = summary(1000, 1300, 1400, 1500)
+        lines = interpret(ambient, normal, loud, threshold=800)
+        text = "\n".join(lines)
+        self.assertIn("PROBLEM: ambient noise reaches the threshold", text)
+        self.assertLess(ambient.median, 800)
+        # Speech itself is fine in this scenario.
+        self.assertNotIn("PROBLEM: normal speech stays BELOW threshold", text)
+        self.assertNotIn("PROBLEM: even loud speech stays below threshold", text)
+
     def test_speech_not_louder_than_ambient_flagged(self):
         ambient = summary(100, 3000, 3000, 3100)
         normal = summary(100, 2500, 2500, 2900)
@@ -292,6 +309,45 @@ class TestProductionThreshold(unittest.TestCase):
         self.assertEqual(raw, 8000.0)
         self.assertEqual(threshold, config.threshold_ceiling)
 
+    def test_loud_first_window_is_not_the_full_phase_statistic(self):
+        """The Batch 28 shape: a loud first second, quiet afterwards.
+
+        The threshold follows the calibration window (raw 7600,
+        applied 4000 at the ceiling). The whole-phase statistic is a
+        different, much lower number and must never be mistaken for
+        the first-window one.
+        """
+        import statistics
+
+        config = self._config()
+        production_blocks = max(
+            1, round(config.calibration_seconds / config.block_duration)
+        )
+        self.assertEqual(production_blocks, 10)
+        ambient = [1900.0] * production_blocks + [150.0] * 40
+
+        threshold, raw, blocks_used = production_threshold(ambient, config)
+
+        self.assertEqual(blocks_used, production_blocks)
+        self.assertEqual(raw, 7600.0)
+        self.assertEqual(raw, 1900.0 * config.threshold_multiplier)
+        self.assertEqual(threshold, config.threshold_ceiling)
+
+        # The whole-phase statistic is a different number both before
+        # and after clamping: the window derives 7600 -> 4000 at the
+        # ceiling, the whole phase only 600 -> 600.
+        full_raw = statistics.median(ambient) * config.threshold_multiplier
+        self.assertEqual(full_raw, 600.0)
+        self.assertNotEqual(raw, full_raw)
+        full = compute_energy_threshold(
+            ambient,
+            multiplier=config.threshold_multiplier,
+            floor=config.threshold_floor,
+            ceiling=config.threshold_ceiling,
+        )
+        self.assertEqual(full, 600.0)
+        self.assertNotEqual(threshold, full)
+
     def test_empty_levels_raise(self):
         with self.assertRaises(ValueError):
             production_threshold([], self._config())
@@ -379,6 +435,52 @@ class TestCaptureParity(unittest.TestCase):
         self.assertEqual(production["channels"], 1)
         self.assertEqual(production["dtype"], "int16")
         self.assertEqual(production["blocksize"], config.block_size)
+
+    def test_record_path_opens_the_stream_identically(self):
+        """``Listener.record_until_silence`` opens the mic like diagnostics.
+
+        Same samplerate, channel count, sample format and block size,
+        so the levels production compares against its threshold are
+        the same kind of signal ``--diagnose`` measures. The fake
+        stream only ever returns silence, so the bounded wait timeout
+        ends the attempt: no physical speech, no hang.
+        """
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        from config import VoiceConfig
+
+        config = VoiceConfig().validate()
+
+        calls = []
+        sd, stream_class = self._record_streams(calls)
+
+        with patch.object(sd, "InputStream", stream_class):
+            from voice.diagnostics import measure_phase
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                measure_phase(config, 0.5)
+
+            listener = self._make_listener(config)
+            # Pre-set the threshold so calibration does not open a
+            # second stream: this asserts the recording path's own
+            # open call only.
+            listener.energy_threshold = 1000.0
+            with contextlib.redirect_stdout(io.StringIO()):
+                listener.record_until_silence()
+
+        self.assertEqual(len(calls), 2, calls)
+        diagnostic, recording = calls
+        self.assertEqual(
+            diagnostic,
+            recording,
+            "production recording must open the microphone like the diagnostic",
+        )
+        self.assertEqual(recording["samplerate"], config.sample_rate)
+        self.assertEqual(recording["channels"], 1)
+        self.assertEqual(recording["dtype"], "int16")
+        self.assertEqual(recording["blocksize"], config.block_size)
 
     def test_rms_is_computed_over_one_block_of_samples(self):
         import numpy as np

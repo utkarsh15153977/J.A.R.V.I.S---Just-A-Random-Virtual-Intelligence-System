@@ -915,6 +915,8 @@ DEFAULT_TOOL_INTENTS: tuple[IntentRule, ...] = (
                 "what time is it right now",
                 "what's the time",
                 "what is the time",
+                "what is the time right now",
+                "what is that time right now",
                 "what's the current time",
                 "what is the current time",
                 "tell me the time",

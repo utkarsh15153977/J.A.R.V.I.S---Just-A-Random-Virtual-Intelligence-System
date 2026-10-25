@@ -70,11 +70,17 @@ def summarize_levels(levels: Iterable[float]) -> LevelSummary:
 
 
 def format_summary(label: str, summary: LevelSummary) -> str:
-    """Human-readable block for one measured phase."""
+    """Human-readable block for one measured phase.
+
+    The median is labelled as the whole-phase statistic: production
+    derives its threshold from the first ``calibration_seconds``
+    window only, so the two numbers are deliberately not comparable
+    and the output must not invite comparing them.
+    """
     return (
         f"{label}:\n"
         f"  min={summary.minimum:.0f}\n"
-        f"  median={summary.median:.0f}\n"
+        f"  median={summary.median:.0f} (whole phase)\n"
         f"  mean={summary.mean:.0f}\n"
         f"  max={summary.maximum:.0f}\n"
         f"  blocks={summary.count}"

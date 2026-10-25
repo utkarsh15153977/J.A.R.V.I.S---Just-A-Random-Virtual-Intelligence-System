@@ -424,6 +424,9 @@ class TestVoicePhraseCoverage(unittest.TestCase):
             (
                 "what time is it",
                 "what's the time",
+                "what is the time",
+                "what is the time right now",
+                "what is that time right now",
                 "what is the current time",
                 "tell me the time",
                 "do you have the time",
@@ -461,6 +464,7 @@ class TestVoicePhraseCoverage(unittest.TestCase):
                 "the date and time",
                 "current date and time",
                 "tell me the date and time",
+                "what is today's date and time",
                 "what's today's date and time",
             ),
             TOOL_GET_CURRENT_DATETIME,
